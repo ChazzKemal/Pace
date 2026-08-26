@@ -28,11 +28,22 @@ on the robot.
 
 ## Install
 
-Requires Python >= 3.12 (upstream LeRobot's floor).
-
 ```bash
-uv sync
+CMAKE_POLICY_VERSION_MINIMUM=3.5 uv sync
 ```
+
+Two things that are not obvious:
+
+**The cmake variable is required.** `lerobot[libero]` pulls `hf-libero` -> `robomimic`
+-> `egl-probe` 1.0.2, whose `CMakeLists.txt` declares a pre-3.5
+`cmake_minimum_required`. CMake >= 4 removed compatibility with that and the build
+fails with *"Compatibility with CMake < 3.5 has been removed from CMake."* The
+variable tells CMake to treat the ancient declaration as 3.5. Drop it once
+`egl-probe` is fixed upstream or `hf-libero` stops depending on it.
+
+**Python is pinned to 3.12** in `.python-version`, not merely `>=3.12`. The robot
+side runs ROS Jazzy on 3.12, and there is no reason for sim and robot to sit on
+different minor versions. (Left unpinned, uv picks 3.13.)
 
 ## The pin
 

@@ -24,6 +24,11 @@ dependencies = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+# Required because the LeRobot dependency above is a direct git+URL reference
+# (we pin by SHA rather than by version range).
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/robot_stack"]
 
