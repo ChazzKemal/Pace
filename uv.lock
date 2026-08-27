@@ -2330,6 +2330,7 @@ name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "iniconfig" },
     { name = "packaging" },
     { name = "pluggy" },
@@ -2582,8 +2583,16 @@ dependencies = [
     { name = "lerobot", extra = ["evaluation", "libero", "training", "xvla"] },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [{ name = "lerobot", extras = ["xvla", "libero", "training", "evaluation"], git = "https://github.com/huggingface/lerobot?rev=bf31dd794ffb4f87380aba3912f64421e8352d3c" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "rpds-py"

@@ -1,0 +1,152 @@
+{
+  "chunk": 32,
+  "dim": 7,
+  "n_action_steps": 16,
+  "seeds": [
+    0,
+    7
+  ],
+  "stats": [
+    "meanstd",
+    "minmax",
+    "none"
+  ],
+  "configs": {
+    "const_1.5": {
+      "max_speed": 1.5,
+      "min_speed": 1.5,
+      "enable_angle": false,
+      "enable_ori": false,
+      "enable_ori_axis": false
+    },
+    "angle_only": {
+      "max_speed": 1.5,
+      "min_speed": 0.75,
+      "clamp_deg": 5.0,
+      "enable_angle": true,
+      "enable_ori": false,
+      "enable_ori_axis": false
+    },
+    "angle_ori": {
+      "max_speed": 1.5,
+      "min_speed": 0.75,
+      "clamp_deg": 5.0,
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "all_three": {
+      "max_speed": 2.0,
+      "min_speed": 1.0,
+      "clamp_deg": 5.0,
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": true
+    },
+    "look4_min": {
+      "max_speed": 1.5,
+      "min_speed": 0.75,
+      "clamp_deg": 5.0,
+      "n_lookahead": 4,
+      "lookahead_agg": "min",
+      "lookahead_target": "angle",
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "look2_mean_all": {
+      "max_speed": 2.0,
+      "min_speed": 1.0,
+      "clamp_deg": 5.0,
+      "n_lookahead": 2,
+      "lookahead_agg": "mean",
+      "lookahead_target": "all",
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": true
+    },
+    "look4_cb": {
+      "max_speed": 1.5,
+      "min_speed": 0.75,
+      "clamp_deg": 5.0,
+      "n_lookahead": 4,
+      "lookahead_agg": "cumulative_bending",
+      "lookahead_target": "angle",
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "look8_cb_oriaxis": {
+      "max_speed": 3.0,
+      "min_speed": 1.5,
+      "clamp_deg": 5.0,
+      "n_lookahead": 8,
+      "lookahead_agg": "cumulative_bending",
+      "lookahead_target": "ori_axis",
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": true
+    },
+    "headline_look4cb_skip2": {
+      "max_speed": 1.5,
+      "min_speed": 0.75,
+      "clamp_deg": 5.0,
+      "action_stride": 2,
+      "n_lookahead": 4,
+      "lookahead_agg": "cumulative_bending",
+      "lookahead_target": "angle",
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "skip3_only": {
+      "max_speed": 1.5,
+      "min_speed": 1.5,
+      "action_stride": 3,
+      "enable_angle": false,
+      "enable_ori": false,
+      "enable_ori_axis": false
+    },
+    "adaptive_stride2": {
+      "max_speed": 1.5,
+      "min_speed": 0.75,
+      "clamp_deg": 5.0,
+      "action_stride": 2,
+      "adaptive_stride": true,
+      "quantize_angle_thr": 22.5,
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "quantize": {
+      "max_speed": 2.0,
+      "min_speed": 1.0,
+      "clamp_deg": 5.0,
+      "speed_quantize": true,
+      "quantize_angle_thr": 22.5,
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "clamp_deg_zero": {
+      "max_speed": 2.0,
+      "min_speed": 1.0,
+      "clamp_deg": 0.0,
+      "enable_angle": true,
+      "enable_ori": true,
+      "enable_ori_axis": false
+    },
+    "all_disabled": {
+      "max_speed": 2.5,
+      "min_speed": 1.0,
+      "enable_angle": false,
+      "enable_ori": false,
+      "enable_ori_axis": false
+    },
+    "defaults_only": {
+      "max_speed": 1.5
+    }
+  },
+  "source": "fork lerobot_uncertainty XVLAPolicy.select_action",
+  "torch": "2.7.1+cu126"
+}
