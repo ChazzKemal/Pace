@@ -18,6 +18,22 @@ dependencies = [
   # Bumping this pin is a deliberate, reviewed change: it is the one place the
   # whole stack's LeRobot version is decided, for sim and robot alike.
   "lerobot[xvla,libero,training,evaluation] @ git+https://github.com/huggingface/lerobot@bf31dd794ffb4f87380aba3912f64421e8352d3c",
+
+  # Patched robosuite, pinned by SHA for the same reason as LeRobot above.
+  #
+  # PACE's *actuation* half needs simulator hooks that stock robosuite 1.4.0 does
+  # not expose: `set_action_exhaust_speed` (run fewer, larger control substeps) and
+  # `update_kp_scale` / `update_kd_scale` (bump OSC gains to track the faster action
+  # stream). The fork adds those plus the raised Panda velocity limits and OSC config
+  # they require -- 309 lines over 11 files, including robot.xml and JSON assets, so
+  # it cannot be reduced to a runtime monkeypatch.
+  #
+  # This is the simulator, not one of our methods: we depend on it, we do not vendor
+  # it. Overrides the stock robosuite that hf-libero would otherwise pull in.
+  #
+  # SSH rather than HTTPS because the repo is private: installing needs a GitHub key
+  # in the agent. Worth revisiting if the fork is ever made public or upstreamed.
+  "robosuite @ git+ssh://git@github.com/ChazzKemal/robosuite@71ee4f30c3032fbb0afa716f20be656ee48bfa16",
 ]
 
 [dependency-groups]
