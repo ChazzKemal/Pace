@@ -1,43 +1,79 @@
-"""Evaluate a PACE-paced policy on LIBERO, one task per run.
+"""Evaluate a policy on LIBERO, one task per output directory.
 
-Mirrors upstream's ``eval_main`` -- same env factory, same policy loader, same
-processors, same ``eval_policy_all`` and the same ``eval_info.json`` schema -- with
-two additions: PACE is attached to the policy by :func:`attach_pace`, and the policy
-is introduced to the vector env so its actuator can reach the simulator.
+Mirrors upstream's ``eval_main`` -- same env factory, policy loader, processors,
+``eval_policy_all`` and ``eval_info.json`` schema -- with two additions: the method's
+pipeline steps are attached to the policy, and the policy is introduced to the vector
+env so its actuator can reach the simulator.
 
-One task per invocation, writing ``<output_dir>/task_<id>/eval_info.json``, because
-that is the layout the recorded results use and comparing against them is the point.
+One task per output directory, matching the layout of the recorded results this is
+compared against.
 
-    python -m robot_stack.eval.run_libero \\
-        --policy-path lerobot/xvla-libero --seed 42 --tasks 0-9 \\
-        --max-speed 1.5 --min-speed 0.75 --action-stride 2 \\
-        --n-lookahead 4 --lookahead-agg cumulative_bending --lookahead-target angle \\
-        --no-enable-ori-axis --out outputs/pace_look4cb_skip2_1.5
+    python -m robot_stack.eval.run_libero --out outputs/baseline           # no method
+
+    python -m robot_stack.eval.run_libero --out outputs/pace \\
+        --method.type=pace --method.max_speed=1.5 --method.action_stride=2 \\
+        --method.n_lookahead=4 --method.lookahead_agg=cumulative_bending \\
+        --method.lookahead_target=angle
 """
 
-from __future__ import annotations
-
-import argparse
 import json
 import logging
 from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import draccus
 import torch
+from lerobot.configs.eval import EvalPipelineConfig  # noqa: F401  (registers env choices)
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.envs.configs import LiberoEnv
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.scripts.lerobot_eval import eval_policy_all
-from lerobot.utils.random_utils import set_seed
 from lerobot.utils.device_utils import get_safe_torch_device
+from lerobot.utils.random_utils import set_seed
 
 from robot_stack.eval.pace_policy import attach_pace
 from robot_stack.eval.sim_time import wrap_vector_env
+from robot_stack.methods.config import MethodPipelineConfig, NoMethod
 from robot_stack.methods.pace.actuator import RobosuiteSpeedActuator
 from robot_stack.methods.pace.processor import PaceSpeedStep
-from robot_stack.methods.pace.speed import PaceConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ActuationConfig:
+    """How a chosen speed is realised in robosuite. See :mod:`..methods.pace.actuator`."""
+
+    kpkd_scale_exp: float = 2.0
+    disable_kpkd_scaling: bool = False
+    disable_gripper_speedup: bool = False
+    # "up" reproduces the recorded runs and can exceed max_speed by about 6 percent.
+    # "down" makes max_speed a true ceiling, at some cost in throughput.
+    speed_rounding: str = "up"
+    # Compute speeds and stride the chunk, but leave the simulator nominal. Isolates
+    # the action-side speedup from the controller-side gain compensation.
+    disabled: bool = False
+
+
+@dataclass
+class LiberoEvalConfig(MethodPipelineConfig):
+    """Everything one evaluation needs. ``--method.type`` selects the method."""
+
+    out: Path = Path("outputs/eval")
+    policy_path: str = "lerobot/xvla-libero"
+    task_suite: str = "libero_10"
+    tasks: str = "0-9"  # "0-9", "2", "0-3,7"
+    seed: int = 42
+    n_episodes: int = 50
+    batch_size: int = 10
+    # How much of each chunk is executed before the policy is queried again. A
+    # property of the policy rather than of any method, so it lives here.
+    n_action_steps: int = 32
+    device: str | None = None
+    actuation: ActuationConfig = field(default_factory=ActuationConfig)
 
 
 def parse_tasks(spec: str) -> list[int]:
@@ -57,8 +93,7 @@ def action_stats(postprocessor) -> dict | None:
 
     PACE measures geometry -- angles, degrees -- so it needs absolute units. Where a
     policy emits normalized actions, the statistics needed to undo that are already
-    being carried by the unnormalizer step, so they are borrowed rather than
-    re-derived.
+    carried by the unnormalizer step, so they are borrowed rather than re-derived.
 
     Returning None is normal, not a failure: xvla-libero normalizes actions with
     NormalizationMode.IDENTITY, so its actions are absolute already and its stats
@@ -71,125 +106,76 @@ def action_stats(postprocessor) -> dict | None:
     return None
 
 
-def build_pace(args, n_action_steps: int, stats: dict | None) -> PaceSpeedStep:
-    cfg = PaceConfig(
-        max_speed=args.max_speed,
-        min_speed=args.max_speed / 2 if args.min_speed is None else args.min_speed,
-        clamp_deg=args.clamp_deg,
-        action_stride=args.action_stride,
-        adaptive_stride=args.adaptive_stride,
-        n_lookahead=args.n_lookahead,
-        lookahead_agg=args.lookahead_agg,
-        lookahead_target=args.lookahead_target,
-        enable_angle=args.enable_angle,
-        enable_ori=args.enable_ori,
-        enable_ori_axis=args.enable_ori_axis,
-        speed_quantize=args.speed_quantize,
-        quantize_angle_thr=args.quantize_angle_thr,
-    )
-    return PaceSpeedStep(cfg, n_action_steps=n_action_steps, dataset_stats=stats)
+def build_speed_step(cfg: LiberoEvalConfig, stats: dict | None) -> PaceSpeedStep:
+    """The method's postprocessor step, or an inert one when no method is selected.
+
+    An inert ``PaceSpeedStep`` and no step at all are the same thing -- with default
+    config the chunk passes through untouched at speed 1.0 -- so the baseline reuses
+    one code path instead of branching.
+    """
+    steps = cfg.method.postprocessor_steps()
+    step = steps[0] if steps else PaceSpeedStep()
+    step.n_action_steps = cfg.n_action_steps
+    step.dataset_stats = stats
+    return step
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--policy-path", default="lerobot/xvla-libero")
-    p.add_argument("--task-suite", default="libero_10")
-    p.add_argument("--tasks", default="0-9", help='e.g. "0-9", "2", "0-3,7"')
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--n-episodes", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=10)
-    p.add_argument("--n-action-steps", type=int, default=32)
-    p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--device", default=None)
-
-    g = p.add_argument_group("PACE speed selection")
-    g.add_argument("--max-speed", type=float, default=1.0)
-    g.add_argument("--min-speed", type=float, default=None, help="default: max_speed / 2")
-    g.add_argument("--clamp-deg", type=float, default=5.0)
-    g.add_argument("--action-stride", type=int, default=1)
-    g.add_argument("--adaptive-stride", action="store_true")
-    g.add_argument("--n-lookahead", type=int, default=0)
-    g.add_argument("--lookahead-agg", default="min", choices=["min", "mean", "cumulative_bending"])
-    g.add_argument("--lookahead-target", default="all", choices=["all", "angle", "ori", "ori_axis"])
-    g.add_argument("--enable-angle", action=argparse.BooleanOptionalAction, default=True)
-    g.add_argument("--enable-ori", action=argparse.BooleanOptionalAction, default=True)
-    # Note: the policy default is True, but every recorded ablation ran with the axis
-    # channel off. Pass --enable-ori-axis to turn it back on.
-    g.add_argument("--enable-ori-axis", action=argparse.BooleanOptionalAction, default=False)
-    g.add_argument("--speed-quantize", action="store_true")
-    g.add_argument("--quantize-angle-thr", type=float, default=22.5)
-
-    a = p.add_argument_group("PACE actuation")
-    a.add_argument("--kpkd-scale-exp", type=float, default=2.0)
-    a.add_argument(
-        "--speed-rounding",
-        default="up",
-        choices=["up", "down"],
-        help="'up' reproduces the recorded runs (max_speed can be exceeded by ~6%%); "
-        "'down' makes max_speed a real ceiling, costing some throughput",
-    )
-    a.add_argument("--disable-kpkd-scaling", action="store_true")
-    a.add_argument("--disable-gripper-speedup", action="store_true")
-    a.add_argument(
-        "--no-actuate",
-        action="store_true",
-        help="compute speeds and stride the chunk, but leave the simulator nominal",
-    )
-
-    args = p.parse_args()
+@draccus.wrap()
+def main(cfg: LiberoEvalConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    from lerobot.configs.policies import PreTrainedConfig  # noqa: PLC0415
-    from lerobot.envs.configs import LiberoEnv  # noqa: PLC0415
-
-    policy_cfg = PreTrainedConfig.from_pretrained(args.policy_path)
-    policy_cfg.pretrained_path = args.policy_path
-    if args.device:
-        policy_cfg.device = args.device
-    policy_cfg.n_action_steps = args.n_action_steps
+    policy_cfg = PreTrainedConfig.from_pretrained(cfg.policy_path)
+    policy_cfg.pretrained_path = cfg.policy_path
+    policy_cfg.n_action_steps = cfg.n_action_steps
+    if cfg.device:
+        policy_cfg.device = cfg.device
 
     device = get_safe_torch_device(policy_cfg.device, log=True)
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    policy = make_policy(cfg=policy_cfg, env_cfg=LiberoEnv(task=args.task_suite))
+    policy = make_policy(cfg=policy_cfg, env_cfg=LiberoEnv(task=cfg.task_suite))
     policy.eval()
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
-        pretrained_path=args.policy_path,
+        pretrained_path=cfg.policy_path,
         preprocessor_overrides={"device_processor": {"device": str(policy_cfg.device)}},
     )
     stats = action_stats(postprocessor)
-    logger.info("PACE action stats: %s", "from unnormalizer" if stats else "none (identity normalization)")
+    logger.info("action stats: %s", "from unnormalizer" if stats else "none (identity normalization)")
 
+    # No method means no actuation: there is no speed to realise.
+    actuate = not (cfg.actuation.disabled or isinstance(cfg.method, NoMethod))
     actuator = (
-        None
-        if args.no_actuate
-        else RobosuiteSpeedActuator(
-            kpkd_scale_exp=args.kpkd_scale_exp,
-            disable_kpkd_scaling=args.disable_kpkd_scaling,
-            disable_gripper_speedup=args.disable_gripper_speedup,
-            action_stride=args.action_stride,
-            speed_rounding=args.speed_rounding,
+        RobosuiteSpeedActuator(
+            kpkd_scale_exp=cfg.actuation.kpkd_scale_exp,
+            disable_kpkd_scaling=cfg.actuation.disable_kpkd_scaling,
+            disable_gripper_speedup=cfg.actuation.disable_gripper_speedup,
+            speed_rounding=cfg.actuation.speed_rounding,
+            action_stride=getattr(cfg.method, "action_stride", 1),
         )
-    )
-    paced = attach_pace(policy, build_pace(args, args.n_action_steps, stats), actuator)
-    logger.info("PACE config: %s", paced.pace.get_config())
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "pace_config.json").write_text(
-        json.dumps({"pace": paced.pace.get_config(), "args": vars(args)}, indent=2, default=str)
+        if actuate
+        else None
     )
 
-    for task_id in parse_tasks(args.tasks):
-        task_out = args.out / f"task_{task_id}"
+    paced = attach_pace(policy, build_speed_step(cfg, stats), actuator)
+    logger.info("method=%s | %s", cfg.method.type, paced.pace.get_config())
+
+    cfg.out.mkdir(parents=True, exist_ok=True)
+    with open(cfg.out / "run_config.json", "w") as f:
+        # Encoded against LiberoEvalConfig so the method's choice key is included,
+        # which is what makes the file re-parsable with --config_path.
+        draccus.dump(cfg, f)
+
+    for task_id in parse_tasks(cfg.tasks):
+        task_out = cfg.out / f"task_{task_id}"
         if (task_out / "eval_info.json").exists():
             logger.info("task %d already evaluated, skipping", task_id)
             continue
 
-        set_seed(args.seed)
-        env_cfg = LiberoEnv(task=args.task_suite, task_ids=[task_id], control_mode="absolute")
-        envs = make_env(env_cfg, n_envs=args.batch_size, use_async_envs=False)
+        set_seed(cfg.seed)
+        env_cfg = LiberoEnv(task=cfg.task_suite, task_ids=[task_id], control_mode="absolute")
+        envs = make_env(env_cfg, n_envs=cfg.batch_size, use_async_envs=False)
 
         # One task in, one vector env out -- so binding is unambiguous.
         (vec_env,) = (v for group in envs.values() for v in group.values())
@@ -210,59 +196,62 @@ def main() -> None:
                 env_postprocessor=env_post,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
-                n_episodes=args.n_episodes,
-                start_seed=args.seed,
+                n_episodes=cfg.n_episodes,
+                start_seed=cfg.seed,
             )
         close_envs(envs)
 
-        # Fold in per-episode durations, which upstream's schema has no slot for.
-        #
-        # Only *successful* episodes are reliably captured: a success terminates the
-        # env, whereas a failure usually runs to the step cap, and upstream ends the
-        # rollout there without the env ever truncating. That is enough -- ATR
-        # averages successes, and TPR needs failures only as a flag, which
-        # `pc_success` already carries -- but it means the recorded success count is
-        # worth checking against upstream's before either is trusted.
-        episodes = [ep for rec in recorders for ep in rec.episodes]
-        succeeded = [e["sim_time"] for e in episodes if e["success"] and e["sim_time"] is not None]
-
-        expected = round(info["overall"]["pc_success"] / 100 * args.n_episodes)
-        n_recorded = sum(1 for e in episodes if e["success"])
-        if n_recorded != expected:
-            logger.warning(
-                "task %d: recorded %d successful episodes but SR implies %d -- "
-                "ATR is computed over the recorded subset",
-                task_id,
-                n_recorded,
-                expected,
-            )
-
         task_out.mkdir(parents=True, exist_ok=True)
-        info["episodes"] = episodes
-        info["overall"]["avg_success_sim_s"] = sum(succeeded) / len(succeeded) if succeeded else None
-        info["overall"]["n_success_timed"] = len(succeeded)
-
-        # Speeds actually delivered to the simulator (env 0), post-quantization. The
-        # mean is the single number that says whether PACE ran as fast as intended:
-        # sim time scales as 1/speed, so a few percent here is a few percent of ATR.
-        speeds = paced.pace_speed_log
-        if speeds:
-            info["overall"]["applied_speed_mean"] = sum(speeds) / len(speeds)
-            info["overall"]["applied_speed_min"] = min(speeds)
-            info["overall"]["applied_speed_max"] = max(speeds)
-            info["overall"]["applied_speed_below_1"] = sum(1 for v in speeds if v < 1.0) / len(speeds)
-            (task_out / "applied_speeds.json").parent.mkdir(parents=True, exist_ok=True)
-            (task_out / "applied_speeds.json").write_text(json.dumps(speeds))
-        paced.pace_speed_log.clear()
-
+        _record_timings(info, recorders, cfg, task_id, paced)
         (task_out / "eval_info.json").write_text(json.dumps(info, indent=2))
+        (task_out / "applied_speeds.json").write_text(json.dumps(paced.pace_speed_log))
+        paced.pace_speed_log.clear()
         logger.info(
-            "task %d: SR %.1f%%  ATR %s s  (%d episodes recorded)",
+            "task %d: SR %.1f%%  ATR %s s",
             task_id,
             info["overall"]["pc_success"],
-            f"{info['overall']['avg_success_sim_s']:.2f}" if succeeded else "n/a",
-            len(episodes),
+            f"{info['overall']['avg_success_sim_s']:.2f}" if info["overall"]["avg_success_sim_s"] else "n/a",
         )
+
+
+def _record_timings(info: dict, recorders, cfg: LiberoEvalConfig, task_id: int, paced) -> None:
+    """Fold per-episode durations and applied speeds into upstream's schema.
+
+    Only *successful* episodes are reliably captured: a success terminates the env,
+    whereas a failure usually runs to the step cap and upstream ends the rollout there
+    without the env ever truncating. That is enough -- ATR averages successes, and TPR
+    needs failures only as a flag, which `pc_success` carries -- but it means the
+    recorded success count is worth checking against upstream's before either is
+    trusted.
+    """
+    episodes = [ep for rec in recorders for ep in rec.episodes]
+    succeeded = [e["sim_time"] for e in episodes if e["success"] and e["sim_time"] is not None]
+
+    expected = round(info["overall"]["pc_success"] / 100 * cfg.n_episodes)
+    n_recorded = sum(1 for e in episodes if e["success"])
+    if n_recorded != expected:
+        logger.warning(
+            "task %d: recorded %d successful episodes but SR implies %d -- "
+            "ATR is computed over the recorded subset",
+            task_id,
+            n_recorded,
+            expected,
+        )
+
+    info["episodes"] = episodes
+    info["overall"]["avg_success_sim_s"] = sum(succeeded) / len(succeeded) if succeeded else None
+    info["overall"]["n_success_timed"] = len(succeeded)
+
+    # Speeds actually delivered to the simulator (env 0), post-quantization. The mean
+    # is the single number saying whether the method ran as fast as intended: sim time
+    # scales as 1/speed, so a few percent here is a few percent of ATR.
+    speeds = paced.pace_speed_log
+    if speeds:
+        info["overall"]["applied_speed_mean"] = sum(speeds) / len(speeds)
+        info["overall"]["applied_speed_min"] = min(speeds)
+        info["overall"]["applied_speed_max"] = max(speeds)
+        info["overall"]["applied_speed_below_1"] = sum(1 for v in speeds if v < 1.0) / len(speeds)
+    info["config"] = asdict(cfg) | {"method_type": cfg.method.type}
 
 
 if __name__ == "__main__":
