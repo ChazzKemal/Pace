@@ -64,3 +64,16 @@ one LeRobot.
 ## Status
 
 Batch 0 — skeleton and pinned dependency. No methods yet.
+
+## Tests
+
+```bash
+pytest                                                    # everything that needs no external data
+DEMOSPEEDUP_UPSTREAM=/path/to/DemoSpeedup pytest          # + parity against the real upstream
+```
+
+`DEMOSPEEDUP_UPSTREAM` points at a clone of
+[lingxiao-guo/DemoSpeedup](https://github.com/lingxiao-guo/DemoSpeedup). Those tests
+check the retiming against upstream's own code rather than against this repo's ports
+of it, and pin the three places it deliberately differs. They skip without the clone.
+Same variable name as crisp_gym's `demospeedup/tests/test_upstream_parity.py`.

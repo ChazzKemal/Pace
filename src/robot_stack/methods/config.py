@@ -22,11 +22,15 @@ class rather than threading flags through the call graph.
 from __future__ import annotations
 
 import abc
+import logging
 from dataclasses import dataclass, field, fields
 
 import draccus
 from lerobot.processor.pipeline import ProcessorStep
 
+from robot_stack.methods.demospeedup.labels import describe, load_labels
+from robot_stack.methods.demospeedup.processor import DemoSpeedupRetimeStep
+from robot_stack.methods.demospeedup.retime import HIGH_V, LOW_V
 from robot_stack.methods.pace.processor import PaceSpeedStep
 from robot_stack.methods.pace.speed import PaceConfig
 
@@ -121,3 +125,45 @@ class MethodPipelineConfig:
     """
 
     method: MethodConfig = field(default_factory=NoMethod)
+
+
+@MethodConfig.register_subclass("demospeedup")
+@dataclass
+class DemoSpeedupMethod(MethodConfig):
+    """Entropy-guided demonstration retiming. Acts at training time, on the targets.
+
+    Unlike PACE this contributes a *pre*processor step: the observation is unchanged
+    and the action chunk it is regressed against is subsampled, so the policy learns
+    to cover more ground per step.
+    """
+
+    # A dataset root holding meta/demospeedup/labels.parquet, or a directory of
+    # episode_<i>.npy. Which one is decided by what is there, not by a flag.
+    labels_path: str | None = None
+    low_v: int = LOW_V
+    high_v: int = HIGH_V
+    # "zero" for policies whose loss is masked by action_is_pad (ACT, Diffusion);
+    # "hold" for policies regressing the whole chunk unmasked (xVLA), where a zero
+    # tail in an absolute action space commands the world origin.
+    pad_mode: str = "zero"
+
+    def __post_init__(self):
+        if self.pad_mode not in ("zero", "hold"):
+            raise ValueError(f"pad_mode must be 'zero' or 'hold', got {self.pad_mode!r}")
+        if self.low_v < 1 or self.high_v < 1:
+            raise ValueError(f"strides must be >= 1, got low_v={self.low_v}, high_v={self.high_v}")
+
+    def preprocessor_steps(self) -> list[ProcessorStep]:
+        """Build the retiming step, loading labels if a path was given.
+
+        Without a path the step is constructed empty and passes every sample through.
+        That keeps `--method.type=demospeedup` selectable while a labelling run is
+        still pending, rather than making an unlabelled dataset a hard error.
+        """
+        labels, config = ({}, {})
+        if self.labels_path:
+            labels, config = load_labels(self.labels_path)
+            logging.info("DemoSpeedup labels: %s", describe(labels, config))
+        return [
+            DemoSpeedupRetimeStep(labels=labels, low_v=self.low_v, high_v=self.high_v, pad_mode=self.pad_mode)
+        ]
