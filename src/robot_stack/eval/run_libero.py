@@ -19,7 +19,7 @@ compared against.
 import json
 import logging
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import draccus
@@ -251,7 +251,9 @@ def _record_timings(info: dict, recorders, cfg: LiberoEvalConfig, task_id: int, 
         info["overall"]["applied_speed_min"] = min(speeds)
         info["overall"]["applied_speed_max"] = max(speeds)
         info["overall"]["applied_speed_below_1"] = sum(1 for v in speeds if v < 1.0) / len(speeds)
-    info["config"] = asdict(cfg) | {"method_type": cfg.method.type}
+    # Encoded through draccus rather than asdict: it handles Path and the method's
+    # choice key, and matches what run_config.json holds.
+    info["config"] = draccus.encode(cfg)
 
 
 if __name__ == "__main__":
