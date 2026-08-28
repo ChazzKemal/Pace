@@ -86,12 +86,23 @@ class RobosuiteSpeedActuator(SpeedActuator):
         """
         if speed_rounding not in ("up", "down"):
             raise ValueError(f"speed_rounding must be 'up' or 'down', got {speed_rounding!r}")
+        self.control_dt = control_dt
         self.steps_ideal = control_dt / model_dt
         self.kpkd_scale_exp = kpkd_scale_exp
         self.disable_kpkd_scaling = disable_kpkd_scaling
         self.disable_gripper_speedup = disable_gripper_speedup
         self.action_stride = action_stride
         self.speed_rounding = speed_rounding
+
+    def apply_dt(self, handle, dt: float) -> float:
+        """Realise a per-action time budget instead of a speed multiplier.
+
+        The TimedActions-facing entry: ``dt`` seconds per action against the nominal
+        ``control_dt``. Delegates to :meth:`apply`; returns the *realised* dt, which
+        differs from the request by the substep quantization exactly as realised
+        speed differs from requested speed.
+        """
+        return self.control_dt / self.apply(handle, self.control_dt / dt)
 
     def quantize(self, speed: float) -> float:
         """Round a requested speed to one the simulator can actually deliver.

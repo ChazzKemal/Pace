@@ -26,6 +26,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 
 from robot_stack.methods.pace.speed import PaceConfig, compute_speeds, stride_indices, unnormalize_actions
+from robot_stack.timed import DT_KEY
 
 # Key under which per-step speed multipliers are published in the transition's
 # complementary data. Downstream actuators read this; nothing else writes it.
@@ -50,6 +51,7 @@ class PaceSpeedStep(ProcessorStep):
         config: PaceConfig | dict | None = None,
         n_action_steps: int | None = None,
         dataset_stats: dict | None = None,
+        control_dt: float | None = None,
     ):
         """
         Args:
@@ -60,12 +62,16 @@ class PaceSpeedStep(ProcessorStep):
             dataset_stats: Only needed when this step runs *upstream* of the
                 normalization step and therefore sees normalized actions. In the
                 normal ordering (PACE last) leave it None.
+            control_dt: The nominal seconds per action. When set, the step also
+                publishes per-step ``DT_KEY`` (= control_dt / speed) so consumers
+                that think in time rather than multipliers need no PACE knowledge.
         """
         if isinstance(config, dict):
             config = PaceConfig.from_dict(config)
         self.config = config or PaceConfig()
         self.n_action_steps = n_action_steps
         self.dataset_stats = dataset_stats
+        self.control_dt = control_dt
 
     def __call__(self, transition):
         self._current_transition = transition.copy()
@@ -77,6 +83,8 @@ class PaceSpeedStep(ProcessorStep):
         new_transition[TransitionKey.ACTION] = actions
         complementary = dict(new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {})
         complementary[SPEED_KEY] = speeds
+        if self.control_dt is not None:
+            complementary[DT_KEY] = self.control_dt / speeds
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
         return new_transition
 
@@ -110,7 +118,7 @@ class PaceSpeedStep(ProcessorStep):
 
     def get_config(self) -> dict[str, Any]:
         """Serialized into the checkpoint, so deploy inherits the evaluated config."""
-        return {**self.config.to_dict(), "n_action_steps": self.n_action_steps}
+        return {**self.config.to_dict(), "n_action_steps": self.n_action_steps, "control_dt": self.control_dt}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

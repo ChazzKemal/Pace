@@ -37,7 +37,7 @@ from lerobot.utils.random_utils import set_seed
 from robot_stack.eval.pace_policy import attach_pace
 from robot_stack.eval.sim_time import wrap_vector_env
 from robot_stack.methods.config import MethodPipelineConfig, NoMethod
-from robot_stack.methods.pace.actuator import RobosuiteSpeedActuator
+from robot_stack.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
 from robot_stack.methods.pace.processor import PaceSpeedStep
 
 logger = logging.getLogger(__name__)
@@ -120,6 +120,9 @@ def build_speed_step(cfg: LiberoEvalConfig, stats: dict | None) -> PaceSpeedStep
     step = steps[0] if steps else PaceSpeedStep()
     step.n_action_steps = cfg.n_action_steps
     step.dataset_stats = stats
+    # With the control period known, the step also publishes per-step dt (DT_KEY),
+    # the TimedActions view of the same decision.
+    step.control_dt = DEFAULT_CONTROL_DT
     return step
 
 
