@@ -2,15 +2,23 @@
 
 Unlike PACE, this acts at *training* time and on the *targets*: the observation a
 sample carries is untouched, while the action chunk it is regressed against is
-subsampled per the frame's label. The policy therefore learns to cover more ground
-per step, and at inference it simply runs at the ordinary control rate.
+replaced by a retimed one. The policy therefore learns to cover more ground per
+step, and at inference it simply runs at the ordinary control rate.
 
-Consolidating on this -- rather than pre-writing a retimed dataset to disk -- keeps
-every frame as a chunk start (a disk conversion drops 2-4x of them along with the
-frames themselves) and means the labels, not a derived artifact, are the thing that
-has to be reproduced.
+The step treats the episode as the object it is. LeRobot's loader serves a fixed
+action window per sample, but the stride walk needs the episode *tail* -- upstream
+walks the whole remainder and truncates to the chunk, which is what keeps every
+chunk slot a real waypoint mid-episode. So the step preloads the full action table
+(~8 MB for LIBERO-10; the same order of size as the labels it already holds) and at
+batch time substitutes each sample's action chunk with a walk over its episode's
+tail. The loader's own action window is ignored.
 
-Finding the label for a sample needs its index *within* its episode. LeRobot's batch
+Because the substituted actions come from the raw table, this step must run
+*before* the normalization step, not after it (see ``run_train``); index selection
+commutes with per-dim affine normalization, so the semantics match upstream's
+normalize-then-retime either way.
+
+Finding the tail for a sample needs its index *within* its episode. LeRobot's batch
 carries ``frame_index``, but the batch-to-transition converter forwards only a fixed
 key set that does not include it -- so the step reconstructs it from the global
 ``index`` and a table of episode start offsets. See :func:`episode_starts_from_metadata`.
@@ -25,7 +33,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 from lerobot.utils.constants import ACTION
 
-from robot_stack.methods.demospeedup.retime import HIGH_V, LOW_V, retime_chunk
+from robot_stack.methods.demospeedup.retime import HIGH_V, LOW_V, retime_tail
 
 ACTION_IS_PAD = f"{ACTION}_is_pad"
 
@@ -45,17 +53,19 @@ def episode_starts_from_metadata(meta) -> dict[int, int]:
 
 @ProcessorStepRegistry.register("demospeedup_retime")
 class DemoSpeedupRetimeStep(ProcessorStep):
-    """Subsample each sample's action chunk according to its precision labels.
+    """Replace each sample's action chunk with a walk over its episode tail.
 
-    Input/output: ``transition[ACTION]`` shaped ``(B, horizon, action_dim)``, with
-    ``episode_index`` and ``index`` in complementary data. Samples whose episode has
-    no labels pass through untouched, so a partially-labelled dataset degrades to
-    ordinary training on the unlabelled part instead of failing.
+    Input/output: ``transition[ACTION]`` shaped ``(B, chunk_len, action_dim)`` in the
+    raw action space, with ``episode_index`` and ``index`` in complementary data.
+    Samples whose episode has no labels pass through untouched, so a
+    partially-labelled dataset degrades to ordinary training on the unlabelled part
+    instead of failing.
     """
 
     def __init__(
         self,
         labels: dict[int, np.ndarray] | None = None,
+        episode_actions: dict[int, np.ndarray] | None = None,
         episode_starts: dict[int, int] | None = None,
         low_v: int = LOW_V,
         high_v: int = HIGH_V,
@@ -64,18 +74,40 @@ class DemoSpeedupRetimeStep(ProcessorStep):
         """
         Args:
             labels: ``{episode_index: (T,) labels}``, from :mod:`..demospeedup.labels`.
+            episode_actions: ``{episode_index: (T, action_dim) raw actions}`` -- the
+                episode's full action trajectory, aligned frame-for-frame with the
+                labels. Required for every labelled episode.
             episode_starts: ``{episode_index: global start index}``. Required to turn
                 a sample's global index into its position inside its episode.
             low_v: Stride through precision frames.
             high_v: Stride through non-precision frames.
-            pad_mode: ``"zero"`` for loss masked by ``action_is_pad`` (ACT, Diffusion);
-                ``"hold"`` for policies regressing the whole chunk (xVLA).
+            pad_mode: ``"zero"`` only when the policy's loss is masked by
+                ``action_is_pad`` (ACT); ``"hold"`` for unmasked chunk losses (xVLA,
+                Diffusion under its defaults). Reached only at episode ends.
         """
         self.labels = labels or {}
+        self.episode_actions = episode_actions or {}
         self.episode_starts = episode_starts or {}
         self.low_v = low_v
         self.high_v = high_v
         self.pad_mode = pad_mode
+
+        # A labelled episode without its actions -- or with actions of a different
+        # length -- cannot be retimed and must not silently train as a baseline.
+        # Misalignment would retime against the wrong frames and still train, so it
+        # is a construction-time error, not a per-batch fallback.
+        for episode, episode_labels in self.labels.items():
+            actions = self.episode_actions.get(episode)
+            if actions is None:
+                raise ValueError(
+                    f"episode {episode} has labels but no actions; pass episode_actions "
+                    "covering every labelled episode."
+                )
+            if len(actions) != len(episode_labels):
+                raise ValueError(
+                    f"episode {episode}: {len(episode_labels)} labels vs {len(actions)} actions -- "
+                    "the label files do not match this dataset."
+                )
 
     def __call__(self, transition):
         self._current_transition = transition.copy()
@@ -96,28 +128,36 @@ class DemoSpeedupRetimeStep(ProcessorStep):
 
         is_pad = complementary.get(ACTION_IS_PAD)
         actions = actions.clone()
-        is_pad = is_pad.clone() if is_pad is not None else None
-        horizon = actions.shape[1]
+        # Rows we substitute get a freshly constructed mask; rows we pass through
+        # keep whatever the dataset said (all-False when it said nothing).
+        is_pad = (
+            is_pad.clone()
+            if is_pad is not None
+            else torch.zeros(actions.shape[:2], dtype=torch.bool, device=actions.device)
+        )
+        chunk_len = actions.shape[1]
 
         for i in range(actions.shape[0]):
             ep = int(episode_index[i])
             if ep not in self.labels:
                 continue
-            window = self._label_window(ep, int(frame_index[i]), horizon)
-            actions[i], retimed_pad = retime_chunk(
-                actions[i],
-                window,
-                is_pad[i] if is_pad is not None else None,
+            frame = int(frame_index[i])
+            tail_actions = torch.from_numpy(self.episode_actions[ep][frame:]).to(
+                device=actions.device, dtype=actions.dtype
+            )
+            chunk, chunk_pad = retime_tail(
+                tail_actions,
+                self.labels[ep][frame:],
+                chunk_len,
                 self.low_v,
                 self.high_v,
                 self.pad_mode,
             )
-            if is_pad is not None and retimed_pad is not None:
-                is_pad[i] = retimed_pad
+            actions[i] = chunk
+            is_pad[i] = chunk_pad
 
         new_transition[TransitionKey.ACTION] = actions
-        if is_pad is not None:
-            new_transition[TransitionKey.COMPLEMENTARY_DATA] = {**complementary, ACTION_IS_PAD: is_pad}
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = {**complementary, ACTION_IS_PAD: is_pad}
         return new_transition
 
     def _frame_indices(self, complementary: dict, episode_index) -> torch.Tensor:
@@ -143,22 +183,8 @@ class DemoSpeedupRetimeStep(ProcessorStep):
         starts = torch.tensor([self.episode_starts[int(e)] for e in episode_index], device=index.device)
         return index - starts
 
-    def _label_window(self, episode: int, frame: int, horizon: int) -> np.ndarray:
-        """The `horizon` labels this chunk spans, extended past the episode end.
-
-        A chunk that runs off the end of an episode is padded with the final label
-        rather than with zeros: zero means *precision*, so padding with it would brake
-        the tail of every episode-ending chunk for no reason.
-        """
-        labels = self.labels[episode]
-        window = labels[frame : frame + horizon]
-        if len(window) < horizon:
-            fill = window[-1] if len(window) else 0
-            window = np.pad(window, (0, horizon - len(window)), constant_values=fill)
-        return window
-
     def get_config(self) -> dict[str, Any]:
-        """Labels are data, not configuration -- only the retiming knobs serialize."""
+        """Labels and actions are data, not configuration -- only the knobs serialize."""
         return {"low_v": self.low_v, "high_v": self.high_v, "pad_mode": self.pad_mode}
 
     def transform_features(

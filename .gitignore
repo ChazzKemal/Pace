@@ -6,3 +6,5 @@ outputs/
 # local scratch / editor
 testing.py
 .vscode/
+logs/
+outputs/

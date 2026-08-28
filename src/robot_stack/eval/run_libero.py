@@ -64,6 +64,9 @@ class LiberoEvalConfig(MethodPipelineConfig):
 
     out: Path = Path("outputs/eval")
     policy_path: str = "lerobot/xvla-libero"
+    # Set when policy_path is a PEFT adapter directory rather than a full checkpoint.
+    # The adapter's config names the base model, so nothing else has to be supplied.
+    use_peft: bool = False
     task_suite: str = "libero_10"
     tasks: str = "0-9"  # "0-9", "2", "0-3,7"
     seed: int = 42
@@ -126,6 +129,7 @@ def main(cfg: LiberoEvalConfig) -> None:
 
     policy_cfg = PreTrainedConfig.from_pretrained(cfg.policy_path)
     policy_cfg.pretrained_path = cfg.policy_path
+    policy_cfg.use_peft = cfg.use_peft
     policy_cfg.n_action_steps = cfg.n_action_steps
     if cfg.device:
         policy_cfg.device = cfg.device

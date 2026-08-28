@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import abc
 import logging
+
+import numpy as np
 from dataclasses import dataclass, field, fields
 
 import draccus
 from lerobot.processor.pipeline import ProcessorStep
 
 from robot_stack.methods.demospeedup.labels import describe, load_labels
-from robot_stack.methods.demospeedup.processor import DemoSpeedupRetimeStep
+from robot_stack.methods.demospeedup.processor import DemoSpeedupRetimeStep, episode_starts_from_metadata
 from robot_stack.methods.demospeedup.retime import HIGH_V, LOW_V
 from robot_stack.methods.pace.processor import PaceSpeedStep
 from robot_stack.methods.pace.speed import PaceConfig
@@ -50,13 +52,27 @@ class MethodConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore[misc]
         """The registered name, e.g. ``"pace"``. What ``--method.type`` selects."""
         return self.get_choice_name(self.__class__)
 
-    def preprocessor_steps(self) -> list[ProcessorStep]:
-        """Steps to insert before the policy. Empty for methods that act on output."""
+    def preprocessor_steps(self, dataset=None) -> list[ProcessorStep]:
+        """Steps to insert before the policy. Empty for methods that act on output.
+
+        Args:
+            dataset: The training ``LeRobotDataset``, when the caller has one. Methods
+                that need the episodes themselves (DemoSpeedup preloads each episode's
+                action trajectory and start offset) read it; the rest ignore it, so a
+                runner with no dataset -- an eval loop -- can still build its steps.
+        """
         return []
 
     def postprocessor_steps(self) -> list[ProcessorStep]:
         """Steps to insert after the policy."""
         return []
+
+    def adjust_policy_after_datasets(self, policy_cfg) -> None:
+        """Mutate the policy config after the datasets are built, before the policy is.
+
+        Exists for methods that change the chunk the policy trains (DemoSpeedup's
+        halving). No-op by default.
+        """
 
 
 @MethodConfig.register_subclass("none")
@@ -142,10 +158,16 @@ class DemoSpeedupMethod(MethodConfig):
     labels_path: str | None = None
     low_v: int = LOW_V
     high_v: int = HIGH_V
-    # "zero" for policies whose loss is masked by action_is_pad (ACT, Diffusion);
-    # "hold" for policies regressing the whole chunk unmasked (xVLA), where a zero
-    # tail in an absolute action space commands the world origin.
+    # "zero" only for policies whose loss is masked by action_is_pad. That is ACT
+    # unconditionally (modeling_act masks its L1), and Diffusion ONLY with
+    # do_mask_loss_for_padding=true -- its default is false, and an unmasked zero
+    # tail is trained as a real target. "hold" (repeat the last kept waypoint) for
+    # any unmasked loss: xVLA always, Diffusion under its defaults. In an absolute
+    # action space a trained zero is a command to the world origin.
     pad_mode: str = "zero"
+    # Halve the policy's chunk: 15 retimed waypoints span the motion of the original
+    # 30. Mirrors upstream's bigym halving and the fork's `speedup_halve_chunk`.
+    halve_chunk: bool = True
 
     def __post_init__(self):
         if self.pad_mode not in ("zero", "hold"):
@@ -153,17 +175,66 @@ class DemoSpeedupMethod(MethodConfig):
         if self.low_v < 1 or self.high_v < 1:
             raise ValueError(f"strides must be >= 1, got low_v={self.low_v}, high_v={self.high_v}")
 
-    def preprocessor_steps(self) -> list[ProcessorStep]:
+    def preprocessor_steps(self, dataset=None) -> list[ProcessorStep]:
         """Build the retiming step, loading labels if a path was given.
 
         Without a path the step is constructed empty and passes every sample through.
         That keeps `--method.type=demospeedup` selectable while a labelling run is
         still pending, rather than making an unlabelled dataset a hard error.
+
+        With labels, the ``dataset`` is required: the step preloads each episode's
+        full raw action trajectory from it (the walk consumes episode tails, exactly
+        as upstream does) plus the start offsets that locate a sample within its
+        episode. The step validates label/action lengths per episode, so a label set
+        from a different dataset fails loudly at construction.
         """
         labels, config = ({}, {})
         if self.labels_path:
             labels, config = load_labels(self.labels_path)
             logging.info("DemoSpeedup labels: %s", describe(labels, config))
+        if not labels:
+            return [DemoSpeedupRetimeStep(low_v=self.low_v, high_v=self.high_v, pad_mode=self.pad_mode)]
+        if dataset is None:
+            raise ValueError(
+                "DemoSpeedup needs the training dataset to preload episode action "
+                "trajectories, but preprocessor_steps() was called without it."
+            )
+        episode_starts = episode_starts_from_metadata(dataset.meta)
+        action_table = np.asarray(dataset.hf_dataset["action"], dtype=np.float32)
+        episode_actions = {
+            episode: action_table[start : start + dataset.meta.episodes[episode]["length"]]
+            for episode, start in episode_starts.items()
+        }
         return [
-            DemoSpeedupRetimeStep(labels=labels, low_v=self.low_v, high_v=self.high_v, pad_mode=self.pad_mode)
+            DemoSpeedupRetimeStep(
+                labels=labels,
+                episode_actions=episode_actions,
+                episode_starts=episode_starts,
+                low_v=self.low_v,
+                high_v=self.high_v,
+                pad_mode=self.pad_mode,
+            )
         ]
+    def adjust_policy_after_datasets(self, policy_cfg) -> None:
+        """Halve the chunk the policy trains; also guard the pad_mode/loss pairing.
+
+        hasattr guards because the fields differ per policy family: xVLA/ACT carry
+        ``chunk_size`` and ``n_action_steps``, Diffusion a ``horizon``. The dataset's
+        own action window no longer matters -- the retiming step substitutes chunks
+        from its preloaded episode table -- so ordering relative to dataset creation
+        is no longer load-bearing; this hook is simply where the trainer calls us.
+        """
+        if self.pad_mode == "zero" and getattr(policy_cfg, "do_mask_loss_for_padding", True) is False:
+            raise ValueError(
+                "pad_mode='zero' requires the policy to mask padded actions out of its "
+                "loss, but this policy sets do_mask_loss_for_padding=False (Diffusion's "
+                "default): the zero tail would be trained as a real target. Use "
+                "--method.pad_mode=hold or --policy.do_mask_loss_for_padding=true."
+            )
+        if not self.halve_chunk:
+            return
+        for name in ("chunk_size", "horizon", "n_action_steps"):
+            value = getattr(policy_cfg, name, None)
+            if value is not None:
+                setattr(policy_cfg, name, value // 2)
+                logging.info("DemoSpeedup: halved %s to %d", name, value // 2)

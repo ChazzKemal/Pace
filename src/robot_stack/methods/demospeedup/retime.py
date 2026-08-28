@@ -109,8 +109,8 @@ def retime_chunk(
     The chunk keeps its original length; the walked waypoints are packed to the
     front and the tail is filled per ``pad_mode``:
 
-    * ``"zero"`` leaves zeros, correct when the loss is masked by ``action_is_pad``
-      (ACT, Diffusion).
+    * ``"zero"`` leaves zeros, correct only when the loss is masked by
+      ``action_is_pad`` (ACT always; Diffusion only with do_mask_loss_for_padding).
     * ``"hold"`` repeats the last kept waypoint, required when the policy regresses
       the whole chunk unmasked (xVLA's flow matching). In an *absolute* action space
       a zero tail is not neutral -- it is a command to drive to the world origin.
@@ -150,3 +150,48 @@ def speedup_factor(labels, low_v: int = LOW_V, high_v: int = HIGH_V) -> float:
     n = len(np.asarray(labels))
     kept = len(episode_keep_indices(labels, low_v, high_v))
     return n / max(kept, 1)
+
+
+def retime_tail(
+    actions_tail: torch.Tensor,
+    labels_tail,
+    chunk_len: int,
+    low_v: int = LOW_V,
+    high_v: int = HIGH_V,
+    pad_mode: str = "zero",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Walk the remaining episode and emit exactly one chunk. Upstream's formulation.
+
+    The walk consumes the (variable-length) episode tail and the chunk is the first
+    ``chunk_len`` frames it lands on -- truncation, not padding. Mid-episode the tail
+    outlasts the walk (it advances at most ``high_v`` per kept frame), so every slot
+    is a real waypoint; only near the episode end can the walk run dry, and the
+    remainder is filled per ``pad_mode`` with the pad mask set True.
+
+    Args:
+        actions_tail: ``(tail_len, action_dim)`` -- the episode's actions from the
+            sample's frame to the end, in the raw (unnormalized) action space.
+        labels_tail: ``(tail_len,)`` labels over the same frames.
+
+    Returns:
+        ``(chunk_actions, is_pad)`` shaped ``(chunk_len, action_dim)`` / ``(chunk_len,)``.
+    """
+    if pad_mode not in ("zero", "hold"):
+        raise ValueError(f"pad_mode must be 'zero' or 'hold', got {pad_mode!r}")
+    if actions_tail.ndim != 2 or actions_tail.shape[0] == 0:
+        raise ValueError(f"retime_tail expects a non-empty (tail_len, action_dim), got {tuple(actions_tail.shape)}")
+    if len(labels_tail) != actions_tail.shape[0]:
+        raise ValueError(
+            f"labels ({len(labels_tail)}) and actions ({actions_tail.shape[0]}) cover different frames"
+        )
+
+    kept = [0, *keep_indices(labels_tail, low_v, high_v)][:chunk_len]
+
+    out = actions_tail.new_zeros((chunk_len, actions_tail.shape[1]))
+    is_pad = torch.ones(chunk_len, dtype=torch.bool, device=actions_tail.device)
+    n = len(kept)
+    out[:n] = actions_tail[kept]
+    is_pad[:n] = False
+    if pad_mode == "hold" and n < chunk_len:
+        out[n:] = out[n - 1]
+    return out, is_pad

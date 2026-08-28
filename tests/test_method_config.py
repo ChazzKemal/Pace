@@ -89,3 +89,52 @@ def test_round_trips_through_draccus():
     original = PaceMethod(max_speed=1.5, action_stride=2, lookahead_agg="cumulative_bending")
     restored = draccus.decode(MethodConfig, draccus.encode(original, MethodConfig))
     assert restored == original
+
+
+def test_halving_touches_only_demospeedup_policies():
+    """The method halves the trained chunk; NoMethod and halve_chunk=false do not."""
+
+    @dataclass
+    class PolicyKnobs:
+        chunk_size: int = 30
+        n_action_steps: int = 30
+
+    knobs = PolicyKnobs()
+    parse(["--method.type=demospeedup"]).method.adjust_policy_after_datasets(knobs)
+    assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
+
+    knobs = PolicyKnobs()
+    parse(["--method.type=demospeedup", "--method.halve_chunk=false"]).method.adjust_policy_after_datasets(
+        knobs
+    )
+    assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
+
+    knobs = PolicyKnobs()
+    parse([]).method.adjust_policy_after_datasets(knobs)
+    assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
+
+
+def test_tail_walk_fills_every_slot_mid_episode():
+    """Upstream's property, now by construction: mid-episode chunks have no pads.
+
+    The walk advances at most high_v raw frames per kept waypoint, so any tail of at
+    least chunk*high_v frames fills the chunk with real waypoints -- for ANY label
+    content. This is the property the fork's fixed 2x window violated (~7% of its
+    executed steps were trained dwells).
+    """
+    import numpy as np
+    import torch
+
+    from robot_stack.methods.demospeedup.retime import retime_tail
+
+    chunk, high_v = 15, 4
+    rng = np.random.default_rng(0)
+    for _ in range(300):
+        tail_len = rng.integers(chunk * high_v, 300)
+        labels = (rng.random(tail_len) < rng.random()).astype(np.int64)
+        actions = torch.arange(tail_len, dtype=torch.float32).unsqueeze(1)
+        out, is_pad = retime_tail(actions, labels, chunk, 2, high_v)
+        assert not is_pad.any(), f"walk ran dry mid-episode: {labels.tolist()}"
+        vals = out.squeeze(1).tolist()
+        assert vals == sorted(set(vals)), "waypoints must be distinct and in order"
+        assert vals[0] == 0.0

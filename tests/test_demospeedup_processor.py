@@ -1,9 +1,10 @@
-"""The retiming step, and how it finds a sample's labels.
+"""The retiming step, and how it finds a sample's episode tail.
 
-The arithmetic is covered by test_demospeedup_retime.py. What is left is the part
-that can silently mis-align: locating each sample within its own episode. Getting
-that wrong retimes chunks against the wrong labels and still trains, so it is worth
-testing more carefully than the maths.
+The walk arithmetic is covered by test_demospeedup_retime.py. What is left is the
+part that can silently mis-align: locating each sample within its own episode and
+substituting the right tail's walk for its action chunk. Getting that wrong retimes
+chunks against the wrong frames and still trains, so it is worth testing more
+carefully than the maths.
 """
 
 import numpy as np
@@ -14,9 +15,9 @@ from lerobot.processor.pipeline import ProcessorStepRegistry
 
 from robot_stack.methods.config import DemoSpeedupMethod
 from robot_stack.methods.demospeedup.processor import ACTION_IS_PAD, DemoSpeedupRetimeStep
-from robot_stack.methods.demospeedup.retime import retime_chunk
+from robot_stack.methods.demospeedup.retime import retime_tail
 
-HORIZON, DIM = 20, 7
+CHUNK, DIM = 20, 7
 
 
 def transition(actions, episode_index, *, index=None, frame_index=None, is_pad=None):
@@ -31,97 +32,145 @@ def transition(actions, episode_index, *, index=None, frame_index=None, is_pad=N
 
 
 @pytest.fixture
-def labels():
+def episodes():
     rng = np.random.default_rng(0)
-    return {0: rng.integers(0, 2, 100).astype(np.int64), 1: rng.integers(0, 2, 80).astype(np.int64)}
+    labels = {0: rng.integers(0, 2, 100).astype(np.int64), 1: rng.integers(0, 2, 80).astype(np.int64)}
+    actions = {ep: rng.normal(size=(len(lab), DIM)).astype(np.float32) for ep, lab in labels.items()}
+    return labels, actions
+
+
+def build(labels, actions, **kwargs):
+    kwargs.setdefault("low_v", 2)
+    kwargs.setdefault("high_v", 4)
+    return DemoSpeedupRetimeStep(labels=labels, episode_actions=actions, **kwargs)
 
 
 def test_is_registered():
     assert ProcessorStepRegistry.get("demospeedup_retime") is DemoSpeedupRetimeStep
 
 
-def test_retimes_each_sample_against_its_own_window(labels):
-    """The core correctness claim: sample i uses episode i's labels at its own frame."""
-    step = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
-    actions = torch.randn(2, HORIZON, DIM)
-    out = step(transition(actions.clone(), [0, 1], frame_index=[10, 30]))[TransitionKey.ACTION]
+def test_substitutes_each_samples_own_tail(episodes):
+    """The core correctness claim: sample i gets the walk over episode i's tail."""
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
+    batch_actions = torch.randn(2, CHUNK, DIM)  # loader window: values must be ignored
+    out = step(transition(batch_actions.clone(), [0, 1], frame_index=[10, 30]))[TransitionKey.ACTION]
 
     for i, (ep, frame) in enumerate(((0, 10), (1, 30))):
-        expected, _ = retime_chunk(actions[i].clone(), labels[ep][frame : frame + HORIZON], None, 2, 4)
+        expected, _ = retime_tail(
+            torch.from_numpy(ep_actions[ep][frame:]), labels[ep][frame:], CHUNK, 2, 4, "zero"
+        )
         torch.testing.assert_close(out[i], expected, rtol=0, atol=0)
 
 
-def test_global_index_is_converted_to_a_within_episode_frame(labels):
+def test_loader_window_content_is_irrelevant(episodes):
+    """The batch's own action values must not leak into the output.
+
+    The loader's fixed window is under-supplied by construction; the step exists to
+    replace it. Two different window contents must produce identical chunks.
+    """
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
+    a = step(transition(torch.zeros(1, CHUNK, DIM), [0], frame_index=[5]))[TransitionKey.ACTION]
+    b = step(transition(torch.randn(1, CHUNK, DIM), [0], frame_index=[5]))[TransitionKey.ACTION]
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_mid_episode_chunk_has_no_pad_slots(episodes):
+    """Upstream's property: mid-episode, every slot is a real waypoint."""
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
+    out = step(transition(torch.randn(1, CHUNK, DIM), [0], frame_index=[0]))
+    assert not out[TransitionKey.COMPLEMENTARY_DATA][ACTION_IS_PAD][0].any()
+
+
+def test_episode_end_pads_and_masks(episodes):
+    """Only where the episode itself runs out may pad slots appear -- masked."""
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions, pad_mode="hold")
+    frame = len(labels[0]) - 3
+    out = step(transition(torch.randn(1, CHUNK, DIM), [0], frame_index=[frame]))
+    pad = out[TransitionKey.COMPLEMENTARY_DATA][ACTION_IS_PAD][0]
+    acts = out[TransitionKey.ACTION][0]
+    n = int((~pad).sum())
+    assert 0 < n < CHUNK
+    torch.testing.assert_close(acts[n:], acts[n - 1].expand(CHUNK - n, DIM))  # hold, not zeros
+
+
+def test_global_index_is_converted_to_a_within_episode_frame(episodes):
     """`frame_index` does not survive LeRobot's batch-to-transition converter.
 
     Only the dataset-global `index` does, so the step subtracts the episode's start
-    offset. If that arithmetic is wrong, chunks are retimed against the wrong labels
+    offset. If that arithmetic is wrong, chunks are retimed against the wrong frames
     and training still succeeds -- which is why this is asserted against the
     frame_index path rather than merely exercised.
     """
+    labels, ep_actions = episodes
     starts = {0: 0, 1: 100}
-    step = DemoSpeedupRetimeStep(labels=labels, episode_starts=starts, low_v=2, high_v=4)
-    direct = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
+    step = build(labels, ep_actions, episode_starts=starts)
+    direct = build(labels, ep_actions)
 
-    actions = torch.randn(2, HORIZON, DIM)
+    actions = torch.randn(2, CHUNK, DIM)
     via_index = step(transition(actions.clone(), [0, 1], index=[10, 130]))[TransitionKey.ACTION]
     via_frame = direct(transition(actions.clone(), [0, 1], frame_index=[10, 30]))[TransitionKey.ACTION]
     torch.testing.assert_close(via_index, via_frame, rtol=0, atol=0)
 
 
-def test_global_index_without_starts_is_an_error_not_a_guess(labels):
-    step = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
+def test_global_index_without_starts_is_an_error_not_a_guess(episodes):
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
     with pytest.raises(ValueError, match="episode_starts"):
-        step(transition(torch.randn(1, HORIZON, DIM), [0], index=[10]))
+        step(transition(torch.randn(1, CHUNK, DIM), [0], index=[10]))
 
 
-def test_unlabelled_episodes_pass_through(labels):
+def test_unlabelled_episodes_pass_through(episodes):
     """A partially labelled dataset must degrade to ordinary training, not fail."""
-    step = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
-    actions = torch.randn(2, HORIZON, DIM)
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
+    actions = torch.randn(2, CHUNK, DIM)
     out = step(transition(actions.clone(), [0, 99], frame_index=[10, 0]))[TransitionKey.ACTION]
-    assert not torch.equal(out[0], actions[0]), "labelled episode should have been retimed"
+    assert not torch.equal(out[0], actions[0]), "labelled episode should have been substituted"
     torch.testing.assert_close(out[1], actions[1], rtol=0, atol=0)
 
 
-def test_no_labels_at_all_is_a_no_op(labels):
+def test_no_labels_at_all_is_a_no_op():
     """So --method.type=demospeedup stays selectable before a labelling run exists."""
-    actions = torch.randn(2, HORIZON, DIM)
+    actions = torch.randn(2, CHUNK, DIM)
     out = DemoSpeedupRetimeStep()(transition(actions.clone(), [0, 1], frame_index=[0, 0]))
     torch.testing.assert_close(out[TransitionKey.ACTION], actions, rtol=0, atol=0)
 
 
-def test_chunk_running_past_the_episode_end_pads_with_the_last_label(labels):
-    """Zero means *precision*, so zero-padding would brake every final chunk."""
-    step = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
-    near_end = len(labels[0]) - 5
-    window = step._label_window(0, near_end, HORIZON)
-    assert len(window) == HORIZON
-    assert np.all(window[5:] == labels[0][-1])
+def test_labels_without_actions_fail_at_construction(episodes):
+    """A labelled episode the step cannot retime must not silently train as baseline."""
+    labels, ep_actions = episodes
+    with pytest.raises(ValueError, match="no actions"):
+        DemoSpeedupRetimeStep(labels=labels, episode_actions={0: ep_actions[0]})
 
 
-def test_the_input_batch_is_not_mutated(labels):
-    """Training loops reuse batches; retiming in place would corrupt later use."""
-    step = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
-    actions = torch.randn(2, HORIZON, DIM)
+def test_mismatched_label_and_action_lengths_fail_at_construction(episodes):
+    """Labels from a different dataset must fail loudly, not retime the wrong frames."""
+    labels, ep_actions = episodes
+    wrong = dict(ep_actions)
+    wrong[1] = wrong[1][:-1]
+    with pytest.raises(ValueError, match="do not match"):
+        DemoSpeedupRetimeStep(labels=labels, episode_actions=wrong)
+
+
+def test_the_input_batch_is_not_mutated(episodes):
+    """Training loops reuse batches; substituting in place would corrupt later use."""
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
+    actions = torch.randn(2, CHUNK, DIM)
     original = actions.clone()
     step(transition(actions, [0, 1], frame_index=[10, 30]))
     torch.testing.assert_close(actions, original, rtol=0, atol=0)
 
 
-def test_missing_episode_index_is_a_clear_error(labels):
-    step = DemoSpeedupRetimeStep(labels=labels)
+def test_missing_episode_index_is_a_clear_error(episodes):
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions)
     with pytest.raises(KeyError, match="episode_index"):
-        step({TransitionKey.ACTION: torch.randn(1, HORIZON, DIM), TransitionKey.COMPLEMENTARY_DATA: {}})
-
-
-def test_pad_mask_is_subsampled_alongside_the_actions(labels):
-    step = DemoSpeedupRetimeStep(labels=labels, low_v=2, high_v=4)
-    is_pad = torch.zeros(1, HORIZON, dtype=torch.bool)
-    is_pad[0, -4:] = True
-    out = step(transition(torch.randn(1, HORIZON, DIM), [0], frame_index=[10], is_pad=is_pad.clone()))
-    assert out[TransitionKey.COMPLEMENTARY_DATA][ACTION_IS_PAD].shape == is_pad.shape
-    assert bool(out[TransitionKey.COMPLEMENTARY_DATA][ACTION_IS_PAD][0, -1]), "tail must stay masked"
+        step({TransitionKey.ACTION: torch.randn(1, CHUNK, DIM), TransitionKey.COMPLEMENTARY_DATA: {}})
 
 
 def test_method_validates_its_knobs():
