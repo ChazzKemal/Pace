@@ -184,3 +184,4 @@ def test_gripper_speedup_can_be_disabled():
     env = FakeEnv()
     RobosuiteSpeedActuator(disable_gripper_speedup=True).apply(env, 2.0)
     assert env.robot.gripper.speed == 0.01
+
