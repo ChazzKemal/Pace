@@ -1,0 +1,96 @@
+# The real-robot (UR10e) environment. One LeRobot: the SHA below is the same one
+# the sim environment pins in ../pyproject.toml -- bump both together or not at all.
+# scripts/setup_robot_env.sh + fastdds_orbbec.xml are deployment-site network
+# config (Discovery Server, FastDDS tuning), kept here rather than in crisp_gym.
+[workspace]
+preview = ["pixi-build"]
+authors = [
+    "Maximilian Dösch <doesch.maximilian@gmail.com>",
+    "Daniel San José Pro <42489409+danielsanjosepro@users.noreply.github.com>"
+]
+channels = ["https://fast.prefix.dev/conda-forge"]
+name = "robot-stack-real"
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+compilers = "*"
+cmake = "*"
+pkg-config = "*"
+make = "*"
+ninja = "*"
+typing_inspect = ">=0.9.0,<0.10"
+libstdcxx-ng = ">=12.2.0"
+
+
+[target.linux.dependencies]
+libgl-devel = "*"
+
+[environments]
+dev = { features = ["dev"] }
+lerobot = { features = ["lerobot"] }
+jazzy = { features = ["jazzy"] }
+jazzy-lerobot = { features = ["jazzy", "lerobot", "dev"] }
+
+[feature.dev.pypi-dependencies]
+pre-commit = "*"
+ruff = "*"
+debugpy = ">=1.8.14,<2"
+pudb = ">=2025.1.3, <2026"
+matplotlib = ">=3.10.9, <4"
+
+[feature.lerobot.dependencies]
+pynput = "*"
+
+[feature.lerobot.pypi-dependencies]
+pyspacemouse = "*"
+# THE SAME SHA as robot_stack's uv environment (pyproject.toml at the repo root):
+# two environments, one LeRobot. Bump both together or not at all.
+# Extras: ACT needs no extra; "diffusion" covers the other in-scope real policy.
+# ("smolvla", pinned here historically, is out of scope on the robot.)
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "bf31dd794ffb4f87380aba3912f64421e8352d3c", extras = ["diffusion"]}
+
+[feature.jazzy]
+channels = ["https://prefix.dev/robostack-jazzy"]
+
+[feature.jazzy.dependencies]
+python = "3.12.*"
+# NOTE: ros-jazzy packages pin numpy<2.0 (compiled against numpy 1.x ABI),
+# so do NOT add numpy>=2.0 here — that conflicts with all ROS packages.
+# ros-jazzy-desktop pulls in depthimage-to-laserscan which requires numpy<2.0
+# Use ros-base + only the packages crisp_py actually needs
+ros-jazzy-ros-base = "*"
+ros-jazzy-control-msgs = "*"
+ros-jazzy-controller-manager-msgs = "*"
+ros-jazzy-trajectory-msgs = "*"
+ros-jazzy-geometry-msgs = "*"
+ros-jazzy-sensor-msgs = "*"
+ros-jazzy-image-transport = "*"
+ros-jazzy-cv-bridge = "*"
+colcon-common-extensions = "*"
+rosdep = "*"
+ros-jazzy-rmw-cyclonedds-cpp = "*"
+ros-jazzy-rmw-fastrtps-cpp = "*"
+pinocchio = "*"
+ros-jazzy-ros2controlcli = ">=4.32.0,<5"
+
+[feature.jazzy.activation]
+scripts = ["scripts/setup_robot_env.sh"]
+env = { RMW_IMPLEMENTATION = "rmw_fastrtps_cpp" }
+
+[pypi-options]
+# ros-jazzy is compiled against the numpy 1.x ABI; the conda layer pins numpy<2
+# but pypi packages (lerobot's tree included) would happily resolve numpy 2.x on
+# top of it. This override makes the constraint explicit at the pypi layer too.
+dependency-overrides = { numpy = ">=1.26,<2" }
+
+[pypi-dependencies]
+# The lab's crisp state, pinned by SHA on the `robot-stack-pin` branches -- diverged
+# dependencies handled exactly like the robosuite fork in the sim environment:
+# referenced, never vendored. The branch commits document the delta vs upstream.
+crisp_gym = { git = "https://github.com/ChazzKemal/crisp_gym", rev = "45dbb0664a32796bba39b32df5d71a28b4450e9e" }
+crisp_python = { git = "https://github.com/ChazzKemal/crisp_py", rev = "47b3d23cfa465911f7aea3bc18868e74eb69d85c" }
+
+# (crisp_gym's `configure` task lives with its checkout; deploy entry scripts --
+# examples/17_replay_dataset.py, 19_deploy_policy.py -- run from a clone of the
+# pinned branch, inside this environment.)

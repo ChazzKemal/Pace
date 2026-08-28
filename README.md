@@ -57,9 +57,12 @@ Florence-2 key layout on load), resolve the policy class for third-party plugins
 and run under numpy 1.26 — which the ROS side needs, since `ros-jazzy` is compiled
 against the numpy 1.x ABI.
 
-The real robot will pin **the same SHA** from `crisp_gym`'s pixi manifest, with
+The real robot pins **the same SHA** in `real/pixi.toml`, with
 `[pypi-options] dependency-overrides = { numpy = ">=1.26,<2" }`. Two environments,
-one LeRobot.
+one LeRobot. The lab's diverged crisp state is pinned there too -- by SHA on the
+`robot-stack-pin` branches of `ChazzKemal/crisp_gym` and `ChazzKemal/crisp_py`,
+the same way the robosuite fork is handled: referenced, never vendored. The
+branch commits document the exact delta vs upstream (utiasDSL).
 
 ## Status
 
