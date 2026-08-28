@@ -101,12 +101,17 @@ def unnormalize_actions(actions: torch.Tensor, stats: dict | None) -> torch.Tens
         return actions.clone()
     s = stats["action"]
     out = actions.clone()
+
+    def as_t(v):
+        # Checkpoint-loaded stats arrive as numpy arrays; runtime overrides as tensors.
+        return torch.as_tensor(v, dtype=actions.dtype, device=actions.device)
+
     if "std" in s:
-        std = s["std"].to(actions.device)
-        mean = s.get("mean", torch.zeros_like(std)).to(actions.device)
+        std = as_t(s["std"])
+        mean = as_t(s["mean"]) if "mean" in s else torch.zeros_like(std)
         return out * std + mean
     if "max" in s and "min" in s:
-        hi, lo = s["max"].to(actions.device), s["min"].to(actions.device)
+        hi, lo = as_t(s["max"]), as_t(s["min"])
         return (out + 1) / 2 * (hi - lo) + lo
     return out
 

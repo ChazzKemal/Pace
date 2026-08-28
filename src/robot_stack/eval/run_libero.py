@@ -36,7 +36,8 @@ from lerobot.utils.random_utils import set_seed
 
 from robot_stack.eval.pace_policy import attach_pace
 from robot_stack.eval.sim_time import wrap_vector_env
-from robot_stack.methods.config import MethodPipelineConfig, NoMethod
+from robot_stack.methods.config import DemoSpeedupMethod, MethodPipelineConfig, NoMethod
+from robot_stack.methods.demospeedup.actuator import DemoSpeedupTrackingActuator
 from robot_stack.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
 from robot_stack.methods.pace.processor import PaceSpeedStep
 
@@ -99,13 +100,21 @@ def action_stats(postprocessor) -> dict | None:
     carried by the unnormalizer step, so they are borrowed rather than re-derived.
 
     Returning None is normal, not a failure: xvla-libero normalizes actions with
-    NormalizationMode.IDENTITY, so its actions are absolute already and its stats
-    dict is empty. PACE's unnormalization is then a no-op, which is correct.
+    NormalizationMode.IDENTITY, so its actions are absolute already. The check is
+    on the norm *map*, not on whether a stats dict exists -- a checkpoint saved by
+    training carries the dataset stats even for IDENTITY features, where the
+    unnormalizer never applies them; PACE must not apply them either.
     """
+    from lerobot.configs.types import FeatureType, NormalizationMode
+
     for step in getattr(postprocessor, "steps", []):
         stats = getattr(step, "stats", None)
-        if stats and "action" in stats:
-            return stats
+        if not (stats and "action" in stats):
+            continue
+        norm_map = getattr(step, "norm_map", None) or {}
+        if norm_map.get(FeatureType.ACTION) == NormalizationMode.IDENTITY:
+            return None
+        return stats
     return None
 
 
@@ -164,12 +173,24 @@ def main(cfg: LiberoEvalConfig) -> None:
         if actuate
         else None
     )
+    if actuator is not None and isinstance(cfg.method, DemoSpeedupMethod):
+        # DemoSpeedup's actuation is its own (methods/demospeedup/actuator.py):
+        # constant tracking stiffening at low_v, time untouched. It shares only the
+        # per-step apply() duck-type with PACE's actuator.
+        actuator = DemoSpeedupTrackingActuator(
+            low_v=cfg.method.low_v,
+            kpkd_scale_exp=cfg.actuation.kpkd_scale_exp,
+            disable_kpkd_scaling=cfg.actuation.disable_kpkd_scaling,
+            disable_gripper_speedup=cfg.actuation.disable_gripper_speedup,
+        )
 
     paced = attach_pace(policy, build_speed_step(cfg, stats), actuator)
     logger.info("method=%s | %s", cfg.method.type, paced.pace.get_config())
 
     cfg.out.mkdir(parents=True, exist_ok=True)
-    with open(cfg.out / "run_config.json", "w") as f:
+    # draccus.dump emits YAML -- name the file accordingly. (Its .json-named
+    # predecessor cost a debugging session: a json.load probe declared it empty.)
+    with open(cfg.out / "run_config.yaml", "w") as f:
         # Encoded against LiberoEvalConfig so the method's choice key is included,
         # which is what makes the file re-parsable with --config_path.
         draccus.dump(cfg, f)
@@ -190,6 +211,16 @@ def main(cfg: LiberoEvalConfig) -> None:
         paced.bind_env(vec_env)
 
         env_pre, env_post = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=policy_cfg)
+        # The env pipeline for xVLA+LIBERO ImageNet-normalizes images itself. The hub
+        # checkpoint's own preprocessor does NOT (which is why training from it needs
+        # the ImageNet-patched base) -- but a checkpoint SAVED from that patched
+        # lineage carries the step, and running both would normalize twice; the
+        # step's own guard rejects that. Keep exactly one application: the env's.
+        if any("ImageNet" in type(step).__name__ for step in env_pre.steps):
+            before = len(preprocessor.steps)
+            preprocessor.steps = [s for s in preprocessor.steps if "ImageNet" not in type(s).__name__]
+            if len(preprocessor.steps) != before:
+                logger.info("dropped checkpoint-side ImageNet step (env pipeline provides it)")
         autocast = (
             torch.autocast(device_type=device.type)
             if getattr(policy_cfg, "use_amp", False)
