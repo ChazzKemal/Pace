@@ -79,7 +79,20 @@ python -m pace_bench.eval.run_libero \
 ```
 
 End-to-end pipelines for the recorded experiments are in `run_demospeedup_*.sh` and
-`eval_demospeedup_libero10.sh`; each stage skip-guards, so a killed run resumes.
+`eval_demospeedup_libero10.sh`; each stage skip-guards, so a killed run resumes. They
+hold no absolute paths: each resolves the repo from its own location and reads
+everything it does not produce from `data/` beside the checkout —
+
+```
+data/                      (not in git; PACE_DATA_ROOT points elsewhere)
+  datasets/real/           UR10e recordings
+  datasets/sim/            libero_10_ee6d
+  checkpoints/             xvla_libero_patched — the pretrained xVLA
+  labels/                  DemoSpeedup stage-2 output, per labelling run
+```
+
+Each input is also individually overridable; a script names the variable to set when
+a directory is missing, and stops before training rather than part way through.
 
 ## Layout
 

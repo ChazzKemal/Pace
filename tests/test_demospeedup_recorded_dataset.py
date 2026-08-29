@@ -9,6 +9,7 @@ Skips when the datasets are not on this machine.
 """
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -16,8 +17,12 @@ import pytest
 
 from pace_bench.methods.demospeedup import episode_keep_indices, load_labels
 
-SOURCE = Path("/home/batur/Coding/data/merged_act_finetune_20260528")
-RETIMED = Path("/home/batur/Coding/data/merged_speedup_20260528")
+# The recorded datasets are not in git; they live in `data/` beside the checkout,
+# or wherever PACE_DATA_ROOT points -- the same convention the pipeline scripts use.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_ROOT = Path(os.environ.get("PACE_DATA_ROOT", REPO_ROOT.parent / "data"))
+SOURCE = DATA_ROOT / "datasets" / "real" / "merged_act_finetune_20260528"
+RETIMED = DATA_ROOT / "datasets" / "real" / "merged_speedup_20260528"
 
 pytestmark = pytest.mark.skipif(
     not (SOURCE.is_dir() and RETIMED.is_dir()),

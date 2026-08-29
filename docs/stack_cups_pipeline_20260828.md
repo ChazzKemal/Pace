@@ -7,7 +7,7 @@ launched ~22:48. Everything lands under `pace_bench/outputs/`; per-stage logs in
 
 ## The dataset
 
-`/home/batur/Coding/data/stack_cups_20260828` — 12 episodes, 8 875 frames @ 20 fps,
+`data/datasets/real/stack_cups_20260828`, beside the checkout — 12 episodes, 8 875 frames @ 20 fps,
 two cameras (`camera`, `d405`), action `[x y z rx ry rz gripper]` (angle-axis).
 Verified **absolute** cartesian poses (actions track state within ~4 cm, ~1.7 mm/step)
 — the hard requirement for DemoSpeedup, whose retiming deletes frames so surviving

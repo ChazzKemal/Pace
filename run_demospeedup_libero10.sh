@@ -20,12 +20,27 @@
 # action samples); stage 2 is not ported yet, so they are consumed as given.
 # =============================================================================
 set -euo pipefail
-cd /home/batur/Coding/pace_bench
+# Everything is resolved from this script's own location: the repo is its
+# directory, and the three inputs this run does not itself produce -- the dataset,
+# the pretrained xVLA, the stage-2 labels -- live in `data/` beside the checkout,
+# under datasets/sim, checkpoints/ and labels/. All are overridable; none are in git.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$REPO_ROOT"
+DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
+DATASET_ROOT=${LIBERO10_ROOT:-$DATA_ROOT/datasets/sim/libero_10_ee6d}
+POLICY_PATH=${XVLA_POLICY_PATH:-$DATA_ROOT/checkpoints/xvla_libero_patched}
+LABELS_PATH=${LIBERO10_LABELS_PATH:-$DATA_ROOT/labels/xvla_libero10_ee6d/speedup_labels}
+require () {  # require <path> <env var to override it>
+    [ -e "$1" ] || { echo "missing $1 -- set $2 to its location"; exit 1; }
+}
+require "$DATASET_ROOT" LIBERO10_ROOT
+require "$POLICY_PATH" XVLA_POLICY_PATH
+require "$LABELS_PATH" LIBERO10_LABELS_PATH
 export MUJOCO_GL=egl PYTHONUNBUFFERED=1 VIDEO_BACKEND=pyav
 
 PY=.venv/bin/python
 DATASET=(--dataset.repo_id=local/libero_10_ee6d
-         --dataset.root=/home/batur/libero_ee6d/libero_10_ee6d
+         "--dataset.root=$DATASET_ROOT"
          --dataset.video_backend=pyav)
 # LoRA on all linear layers; the action heads are DomainAwareLinear (nn.Embedding),
 # which LoRA cannot target, so they are fully trained instead.
@@ -33,7 +48,7 @@ PEFT=(--peft.method_type=LORA --peft.r=8 --peft.lora_alpha=8 --peft.target_modul
       --peft.full_training_modules='["transformer.soft_prompt_hub","transformer.action_encoder","transformer.action_decoder"]')
 # alpha/rank = 1.0 and lr 1e-5: flow matching compounds adapter error over 10
 # denoising steps, so both are held low.
-COMMON=(--policy.path=/home/batur/xvla_libero_patched
+COMMON=("--policy.path=$POLICY_PATH"
         --policy.device=cuda --policy.push_to_hub=false --policy.optimizer_lr=1e-5
         --batch_size=8 --steps=20000 --save_freq=5000 --log_freq=100
         --num_workers=4 --seed=42
@@ -62,7 +77,7 @@ run ds_libero10_base xvla_baseline \
 run ds_libero10_speedup xvla_demospeedup \
     --policy.chunk_size=30 --policy.n_action_steps=30 \
     --method.type=demospeedup \
-    --method.labels_path=/home/batur/lerobot_uncertainty/outputs/label/xvla_libero10_ee6d/speedup_labels \
+    --method.labels_path="$LABELS_PATH" \
     --method.pad_mode=hold
 
 echo "=== both trainings done ==="

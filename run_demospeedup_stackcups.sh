@@ -21,11 +21,18 @@
 # baselines are <policy>_baseline. Run names are deliberately independent of
 # the output dirs below, so renaming a run never orphans a checkpoint.
 set -uo pipefail
-cd /home/batur/Coding/pace_bench
+# Everything is resolved from this script's own location: the repo is its
+# directory, and the datasets sit in `data/` beside the checkout. Point
+# PACE_DATA_ROOT (or STACK_CUPS_ROOT) elsewhere to run against another copy.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$REPO_ROOT"
+DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
+DATASET_ROOT=${STACK_CUPS_ROOT:-$DATA_ROOT/datasets/real/stack_cups_20260828}
+[ -d "$DATASET_ROOT" ] || { echo "no dataset at $DATASET_ROOT -- set STACK_CUPS_ROOT"; exit 1; }
 export VIDEO_BACKEND=pyav PYTHONUNBUFFERED=1
 PY=.venv/bin/python
 DATA=(--dataset.repo_id=local/stack_cups
-      --dataset.root=/home/batur/Coding/data/stack_cups_20260828
+      "--dataset.root=$DATASET_ROOT"
       --dataset.video_backend=pyav)
 WANDB=(--wandb.enable=true --wandb.project=pace_benchmark_stack_cups)
 mkdir -p logs outputs/label
@@ -50,9 +57,9 @@ if [ "$(ls outputs/label/stack_cups/speedup_labels/episode_*.npy 2>/dev/null | w
     echo "labels already present, skipping"
 else
 "$PY" -m pace_bench.methods.demospeedup.run_label \
-    --policy_path="$PWD/outputs/train/cups_act_base/checkpoints/last/pretrained_model" \
+    --policy_path="$REPO_ROOT/outputs/train/cups_act_base/checkpoints/last/pretrained_model" \
     --dataset_repo_id=local/stack_cups \
-    --dataset_root=/home/batur/Coding/data/stack_cups_20260828 \
+    --dataset_root="$DATASET_ROOT" \
     --num_action_samples=10 --temporal_aggregation=true --kde_bandwidth=1.0 \
     --min_cluster_size=5 --max_cluster_size=25 --rule=mean \
     --out=outputs/label/stack_cups \
@@ -66,7 +73,7 @@ done_already cups_act_speedup || "$PY" -m pace_bench.train.run_train "${DATA[@]}
     --policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100 \
     --policy.device=cuda --policy.push_to_hub=false \
     --method.type=demospeedup \
-    --method.labels_path="$PWD/outputs/label/stack_cups/speedup_labels" \
+    --method.labels_path="$REPO_ROOT/outputs/label/stack_cups/speedup_labels" \
     --method.pad_mode=zero \
     --batch_size=32 --steps=30000 --save_freq=10000 --log_freq=100 --num_workers=4 --seed=42 \
     --job_name=act_demospeedup --output_dir=outputs/train/cups_act_speedup \
