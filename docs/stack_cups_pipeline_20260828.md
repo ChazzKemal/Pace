@@ -1,8 +1,8 @@
 # DemoSpeedup on `stack_cups` — overnight run, 2026-08-28
 
 Five-stage pipeline running in tmux session **`dscups`** (`tmux attach -t dscups`),
-launched ~22:48. Everything lands under `robot_stack/outputs/`; per-stage logs in
-`robot_stack/logs/cups_*.log`. WandB project:
+launched ~22:48. Everything lands under `pace_bench/outputs/`; per-stage logs in
+`pace_bench/logs/cups_*.log`. WandB project:
 [demospeedup-stackcups](https://wandb.ai/colors-chazz/demospeedup-stackcups).
 
 ## The dataset

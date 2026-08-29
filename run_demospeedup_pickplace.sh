@@ -18,7 +18,7 @@
 # baselines are <policy>_baseline. Run names are deliberately independent of
 # the output dirs below, so renaming a run never orphans a checkpoint.
 set -uo pipefail
-cd /home/batur/Coding/robot_stack
+cd /home/batur/Coding/pace_bench
 export VIDEO_BACKEND=pyav PYTHONUNBUFFERED=1
 PY=.venv/bin/python
 DATA=(--dataset.repo_id=local/pickplace

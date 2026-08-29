@@ -7,7 +7,7 @@
 # tracking bump (gripper stroke rate and OSC kp/kd scaled by low_v=2, time
 # untouched) -- the analogue of upstream DemoSpeedup's eval-time high-gain XMLs.
 set -euo pipefail
-cd /home/batur/Coding/robot_stack
+cd /home/batur/Coding/pace_bench
 export MUJOCO_GL=egl PYTHONUNBUFFERED=1
 
 PY=.venv/bin/python

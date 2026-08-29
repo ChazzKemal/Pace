@@ -20,7 +20,7 @@
 # action samples); stage 2 is not ported yet, so they are consumed as given.
 # =============================================================================
 set -euo pipefail
-cd /home/batur/Coding/robot_stack
+cd /home/batur/Coding/pace_bench
 export MUJOCO_GL=egl PYTHONUNBUFFERED=1 VIDEO_BACKEND=pyav
 
 PY=.venv/bin/python
