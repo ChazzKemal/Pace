@@ -20,7 +20,7 @@ exists.
 value is being unchanged: upstream's spelling, its dead assignments, its
 misplaced parenthesis in ``hdbscan_with_custom_merge``'s cluster verdict. Fixing
 anything here would silently redefine what "matches upstream" means. The ports
-live in ``robot_stack.methods.demospeedup``; deliberate divergences from this
+live in ``pace_bench.methods.demospeedup``; deliberate divergences from this
 file are recorded and tested there.
 
 One deviation, forced by reproducibility: upstream constructs its

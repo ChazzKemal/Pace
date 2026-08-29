@@ -19,7 +19,7 @@ from lerobot.utils.constants import ACTION
 
 # PACE never landed upstream -- porting it is the point of this repo. So an
 # XVLAPolicy without the speed methods means the wrong interpreter: upstream
-# LeRobot (robot_stack's .venv) rather than the fork. Say so here, instead of
+# LeRobot (pace_bench's .venv) rather than the fork. Say so here, instead of
 # letting it surface later as an AttributeError on `add_speed_configs`.
 if not hasattr(XVLAPolicy, "add_speed_configs"):
     raise RuntimeError(

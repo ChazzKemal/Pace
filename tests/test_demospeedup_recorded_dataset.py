@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from robot_stack.methods.demospeedup import episode_keep_indices, load_labels
+from pace_bench.methods.demospeedup import episode_keep_indices, load_labels
 
 SOURCE = Path("/home/batur/Coding/data/merged_act_finetune_20260528")
 RETIMED = Path("/home/batur/Coding/data/merged_speedup_20260528")

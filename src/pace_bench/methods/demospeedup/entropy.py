@@ -18,8 +18,8 @@ So low entropy is a *precision* frame (short stride) and high entropy is
 frames average 0.0096 and non-precision frames 0.0263.
 
 This module is only the measurement. Turning an entropy trace into precision labels
-is :mod:`robot_stack.methods.demospeedup.segment`; drawing the samples is
-:mod:`robot_stack.methods.demospeedup.sampler`. Keeping them apart is what lets a
+is :mod:`pace_bench.methods.demospeedup.segment`; drawing the samples is
+:mod:`pace_bench.methods.demospeedup.sampler`. Keeping them apart is what lets a
 labelling run be re-segmented without re-running a policy over the dataset.
 
 Reference implementation: ``lingxiao-guo/DemoSpeedup`` @ ``34bd43a``,

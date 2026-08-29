@@ -12,7 +12,11 @@
 #
 # All in-repo: labelling used to run in the lerobot_uncertainty fork under conda,
 # against a checkpoint copy with config keys stripped for the fork's older draccus.
-# robot_stack.methods.demospeedup.run_label replaced both.
+# pace_bench.methods.demospeedup.run_label replaced both.
+#
+# wandb: project pace_benchmark_<task>, run named <policy>_<addon> --
+# baselines are <policy>_baseline. Run names are deliberately independent of
+# the output dirs below, so renaming a run never orphans a checkpoint.
 set -uo pipefail
 cd /home/batur/Coding/robot_stack
 export VIDEO_BACKEND=pyav PYTHONUNBUFFERED=1
@@ -20,7 +24,7 @@ PY=.venv/bin/python
 DATA=(--dataset.repo_id=local/pickplace
       --dataset.root=/home/batur/Coding/data/pickplace_cart7_v2_angleaxis_nogrip
       --dataset.video_backend=pyav)
-WANDB=(--wandb.enable=true --wandb.project=demospeedup-pickplace)
+WANDB=(--wandb.enable=true --wandb.project=pace_benchmark_pickplace)
 mkdir -p logs outputs/label
 stage () { echo; echo "═══════════ $1 ═══════════"; }
 done_already () { [ -d "outputs/train/$1/checkpoints/last" ] && { echo "$1 already trained, skipping"; return 0; }
@@ -29,11 +33,11 @@ done_already () { [ -d "outputs/train/$1/checkpoints/last" ] && { echo "$1 alrea
     rm -rf "outputs/train/$1"; return 1; }
 
 stage "1: ACT baseline / proxy (fresh, this stack)"
-done_already pickplace_act_base || "$PY" -m robot_stack.train.run_train "${DATA[@]}" "${WANDB[@]}" \
+done_already pickplace_act_base || "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" \
     --policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100 \
     --policy.device=cuda --policy.push_to_hub=false \
     --batch_size=32 --steps=100000 --save_freq=20000 --log_freq=100 --num_workers=4 --seed=42 \
-    --job_name=pickplace_act_base --output_dir=outputs/train/pickplace_act_base \
+    --job_name=act_baseline --output_dir=outputs/train/pickplace_act_base \
     2>&1 | tee logs/pickplace_act_base.log
 [ -d outputs/train/pickplace_act_base/checkpoints/last ] || { echo "STAGE1 FAILED"; exit 1; }
 
@@ -41,7 +45,7 @@ stage "2: entropy labelling (oracle = the stage-1 baseline)"
 if [ "$(ls outputs/label/pickplace/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq 45 ]; then
     echo "labels already present, skipping"
 else
-    "$PY" -m robot_stack.methods.demospeedup.run_label \
+    "$PY" -m pace_bench.methods.demospeedup.run_label \
         --policy_path="$PWD/outputs/train/pickplace_act_base/checkpoints/last/pretrained_model" \
         --dataset_repo_id=local/pickplace \
         --dataset_root=/home/batur/Coding/data/pickplace_cart7_v2_angleaxis_nogrip \
@@ -78,14 +82,14 @@ print("SIGNAL:", "OK" if mean_run > 3 * expected_random else "SUSPICIOUS - revie
 PYEOF
 
 stage "3: DemoSpeedup ACT (chunk 100 -> 50, 100k steps)"
-done_already pickplace_act_speedup || "$PY" -m robot_stack.train.run_train "${DATA[@]}" "${WANDB[@]}" \
+done_already pickplace_act_speedup || "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" \
     --policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100 \
     --policy.device=cuda --policy.push_to_hub=false \
     --method.type=demospeedup \
     --method.labels_path="$PWD/outputs/label/pickplace/speedup_labels" \
     --method.pad_mode=zero \
     --batch_size=32 --steps=100000 --save_freq=20000 --log_freq=100 --num_workers=4 --seed=42 \
-    --job_name=pickplace_act_speedup --output_dir=outputs/train/pickplace_act_speedup \
+    --job_name=act_demospeedup --output_dir=outputs/train/pickplace_act_speedup \
     2>&1 | tee logs/pickplace_act_speedup.log
 [ -d outputs/train/pickplace_act_speedup/checkpoints/last ] || { echo "STAGE4 FAILED"; exit 1; }
 echo "═══════════ PICKPLACE PIPELINE DONE ═══════════"

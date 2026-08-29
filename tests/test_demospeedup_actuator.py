@@ -9,7 +9,7 @@ shares only the per-step apply() duck-type with PACE's actuator.
 
 import pytest
 
-from robot_stack.methods.demospeedup.actuator import DemoSpeedupTrackingActuator
+from pace_bench.methods.demospeedup.actuator import DemoSpeedupTrackingActuator
 
 
 class FakeController:

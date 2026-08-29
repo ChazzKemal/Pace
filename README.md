@@ -1,4 +1,4 @@
-# robot_stack
+# pace_bench
 
 Speedup methods for LeRobot policies, shared by simulation and the real UR10e.
 

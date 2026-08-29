@@ -25,8 +25,8 @@ from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 
-from robot_stack.methods.pace.speed import PaceConfig, compute_speeds, stride_indices, unnormalize_actions
-from robot_stack.timed import DT_KEY
+from pace_bench.methods.pace.speed import PaceConfig, compute_speeds, stride_indices, unnormalize_actions
+from pace_bench.timed import DT_KEY
 
 # Key under which per-step speed multipliers are published in the transition's
 # complementary data. Downstream actuators read this; nothing else writes it.

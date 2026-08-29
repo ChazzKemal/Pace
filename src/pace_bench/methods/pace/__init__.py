@@ -3,8 +3,8 @@
 Speed up where the trajectory is smooth, brake where it bends. No retraining.
 """
 
-from robot_stack.methods.pace.processor import SPEED_KEY, PaceSpeedStep
-from robot_stack.methods.pace.speed import (
+from pace_bench.methods.pace.processor import SPEED_KEY, PaceSpeedStep
+from pace_bench.methods.pace.speed import (
     PaceConfig,
     apply_lookahead,
     compute_speeds,

@@ -9,7 +9,7 @@ authors = [
     "Daniel San José Pro <42489409+danielsanjosepro@users.noreply.github.com>"
 ]
 channels = ["https://fast.prefix.dev/conda-forge"]
-name = "robot-stack-real"
+name = "pace-bench-real"
 platforms = ["linux-64"]
 
 [dependencies]
@@ -44,7 +44,7 @@ pynput = "*"
 
 [feature.lerobot.pypi-dependencies]
 pyspacemouse = "*"
-# THE SAME SHA as robot_stack's uv environment (pyproject.toml at the repo root):
+# THE SAME SHA as pace_bench's uv environment (pyproject.toml at the repo root):
 # two environments, one LeRobot. Bump both together or not at all.
 # Extras: ACT needs no extra; "diffusion" covers the other in-scope real policy.
 # ("smolvla", pinned here historically, is out of scope on the robot.)

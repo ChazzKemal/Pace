@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 import torch
 
-from robot_stack.methods.pace import PaceConfig, PaceSpeedStep
+from pace_bench.methods.pace import PaceConfig, PaceSpeedStep
 
 ASSETS = Path(__file__).parent / "assets"
 GOLDEN = np.load(ASSETS / "pace_golden.npz")

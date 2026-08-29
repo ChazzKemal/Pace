@@ -67,7 +67,7 @@ fi
 
 _log "Done."
 
-# ── libjpeg preload (robot_stack addition) ───────────────────────────────────
+# ── libjpeg preload (pace_bench addition) ───────────────────────────────────
 # The pip opencv wheel bundles its own libjpeg, which loads before the conda
 # env's and lacks the 12-bit symbols (jpeg12_write_raw_data) that the conda
 # libtiff was built against — `import cv2` then fails, taking every

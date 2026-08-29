@@ -37,28 +37,29 @@ COMMON=(--policy.path=/home/batur/xvla_libero_patched
         --policy.device=cuda --policy.push_to_hub=false --policy.optimizer_lr=1e-5
         --batch_size=8 --steps=20000 --save_freq=5000 --log_freq=100
         --num_workers=4 --seed=42
-        --wandb.enable=true --wandb.project="${WANDB_PROJECT:-demospeedup-libero10}")
+        --wandb.enable=true --wandb.project="${WANDB_PROJECT:-pace_benchmark_libero10}")
 
-run () {  # run <name> <extra args...>
-    local name=$1; shift
+run () {  # run <dir> <wandb run name> <extra args...>
+    local name=$1 job=$2; shift 2
     if [[ -d "outputs/train/${name}/checkpoints/last" ]]; then
         echo "=== ${name} already trained, skipping ==="
         return 0
     fi
     echo "=== training ${name} ==="
-    # --job_name names the wandb run. Without it both runs default to the policy
-    # type ("xvla") and are indistinguishable in the project.
-    "$PY" -m robot_stack.train.run_train \
+    # --job_name names the wandb run: <policy>_<addon>, per the project convention
+    # (project pace_benchmark_<task>). It is kept separate from the output dir so
+    # renaming runs never orphans an existing checkpoint.
+    "$PY" -m pace_bench.train.run_train \
         "${DATASET[@]}" "${PEFT[@]}" "${COMMON[@]}" "$@" \
-        --output_dir="outputs/train/${name}" --job_name="${name}" \
+        --output_dir="outputs/train/${name}" --job_name="${job}" \
         2>&1 | tee "logs/${name}.log"
 }
 
-run ds_libero10_base \
+run ds_libero10_base xvla_baseline \
     --policy.chunk_size=30 --policy.n_action_steps=30 \
     --method.type=none
 
-run ds_libero10_speedup \
+run ds_libero10_speedup xvla_demospeedup \
     --policy.chunk_size=30 --policy.n_action_steps=30 \
     --method.type=demospeedup \
     --method.labels_path=/home/batur/lerobot_uncertainty/outputs/label/xvla_libero10_ee6d/speedup_labels \

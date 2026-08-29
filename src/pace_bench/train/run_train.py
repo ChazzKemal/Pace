@@ -8,7 +8,7 @@ the preprocessor pipeline is built -- and calls upstream's ``train()`` unchanged
 The config is upstream's ``TrainPipelineConfig`` plus one field, so every existing
 lerobot-train flag keeps working and ``--method.type`` composes with them:
 
-    python -m robot_stack.train.run_train \\
+    python -m pace_bench.train.run_train \\
         --dataset.repo_id=HuggingFaceVLA/libero --policy.type=act \\
         --method.type=demospeedup --method.labels_path=outputs/labels \\
         --output_dir=outputs/train/speedup
@@ -20,7 +20,7 @@ from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts import lerobot_train
 
-from robot_stack.methods.config import MethodConfig, NoMethod
+from pace_bench.methods.config import MethodConfig, NoMethod
 
 
 @dataclass
@@ -97,6 +97,6 @@ if __name__ == "__main__":
     # Under `python -m`, this file is executed as `__main__`, so SpeedupTrainConfig
     # would be a *different* class object from the one draccus resolves through the
     # package -- and the `--method.*` arguments silently vanish from the parser.
-    from robot_stack.train.run_train import main as packaged_main
+    from pace_bench.train.run_train import main as packaged_main
 
     packaged_main()

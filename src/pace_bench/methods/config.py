@@ -30,11 +30,11 @@ from dataclasses import dataclass, field, fields
 import draccus
 from lerobot.processor.pipeline import ProcessorStep
 
-from robot_stack.methods.demospeedup.labels import describe, load_labels
-from robot_stack.methods.demospeedup.processor import DemoSpeedupRetimeStep, episode_starts_from_metadata
-from robot_stack.methods.demospeedup.retime import HIGH_V, LOW_V
-from robot_stack.methods.pace.processor import PaceSpeedStep
-from robot_stack.methods.pace.speed import PaceConfig
+from pace_bench.methods.demospeedup.labels import describe, load_labels
+from pace_bench.methods.demospeedup.processor import DemoSpeedupRetimeStep, episode_starts_from_metadata
+from pace_bench.methods.demospeedup.retime import HIGH_V, LOW_V
+from pace_bench.methods.pace.processor import PaceSpeedStep
+from pace_bench.methods.pace.speed import PaceConfig
 
 
 @dataclass
@@ -94,7 +94,7 @@ class NoMethod(MethodConfig):
 @MethodConfig.register_subclass("pace")
 @dataclass
 class PaceMethod(MethodConfig):
-    """Eval-time speed modulation. See :mod:`robot_stack.methods.pace.speed`.
+    """Eval-time speed modulation. See :mod:`pace_bench.methods.pace.speed`.
 
     Fields mirror :class:`PaceConfig` one-for-one so the CLI surface and the
     algorithm cannot drift apart; :meth:`to_pace_config` is checked against that at

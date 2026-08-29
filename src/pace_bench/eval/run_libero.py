@@ -8,9 +8,9 @@ env so its actuator can reach the simulator.
 One task per output directory, matching the layout of the recorded results this is
 compared against.
 
-    python -m robot_stack.eval.run_libero --out outputs/baseline           # no method
+    python -m pace_bench.eval.run_libero --out outputs/baseline           # no method
 
-    python -m robot_stack.eval.run_libero --out outputs/pace \\
+    python -m pace_bench.eval.run_libero --out outputs/pace \\
         --method.type=pace --method.max_speed=1.5 --method.action_stride=2 \\
         --method.n_lookahead=4 --method.lookahead_agg=cumulative_bending \\
         --method.lookahead_target=angle
@@ -34,12 +34,12 @@ from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.random_utils import set_seed
 
-from robot_stack.eval.pace_policy import attach_pace
-from robot_stack.eval.sim_time import wrap_vector_env
-from robot_stack.methods.config import DemoSpeedupMethod, MethodPipelineConfig, NoMethod
-from robot_stack.methods.demospeedup.actuator import DemoSpeedupTrackingActuator
-from robot_stack.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
-from robot_stack.methods.pace.processor import PaceSpeedStep
+from pace_bench.eval.pace_policy import attach_pace
+from pace_bench.eval.sim_time import wrap_vector_env
+from pace_bench.methods.config import DemoSpeedupMethod, MethodPipelineConfig, NoMethod
+from pace_bench.methods.demospeedup.actuator import DemoSpeedupTrackingActuator
+from pace_bench.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
+from pace_bench.methods.pace.processor import PaceSpeedStep
 
 logger = logging.getLogger(__name__)
 

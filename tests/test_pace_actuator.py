@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from robot_stack.methods.pace.actuator import RobosuiteSpeedActuator
+from pace_bench.methods.pace.actuator import RobosuiteSpeedActuator
 
 
 class FakeController:

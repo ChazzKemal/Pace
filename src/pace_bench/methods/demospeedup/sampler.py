@@ -1,6 +1,6 @@
 """Draw several action chunks from one observation, so entropy has something to measure.
 
-:mod:`robot_stack.methods.demospeedup.entropy` needs ``num_samples`` *different*
+:mod:`pace_bench.methods.demospeedup.entropy` needs ``num_samples`` *different*
 answers to the same question. Getting them means reaching for whatever randomness a
 policy family already has and that its deterministic inference path suppresses --
 ACT's VAE latent, a diffusion policy's noise, a flow-matching policy's initial
@@ -199,10 +199,14 @@ class _BroadcastChunkSampler:
 
     @torch.no_grad()
     def __call__(self, batch: dict[str, Tensor]) -> Tensor:
-        # Reset first, so each frame is judged on its own. Both policies keep
-        # observation queues for the online control loop; letting those carry over
-        # would make the entropy at one frame depend on which frames happened to be
-        # visited before it, and a labelling pass visits every frame.
+        # Reset first, so each frame is judged on its own. Diffusion keeps a queue of
+        # the last n_obs_steps observations for the online control loop, and
+        # predict_action_chunk reads its input from that queue whenever it is
+        # non-empty -- so a carried-over queue would make the entropy at one frame
+        # depend on which frames happened to be visited before it, and a labelling
+        # pass visits every frame. xVLA queues only actions (it conditions on a
+        # single frame), so the reset is a no-op there; it costs nothing and keeps
+        # one rule for every family.
         self.policy.reset()
         batch = self.prepare(dict(batch))
         return self.policy.predict_action_chunk(broadcast(batch, self.num_samples))

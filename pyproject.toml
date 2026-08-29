@@ -1,5 +1,5 @@
 [project]
-name = "robot-stack"
+name = "pace-bench"
 version = "0.1.0"
 description = "Speedup methods for LeRobot policies: PACE, DemoSpeedup, B-spline. Sim (LIBERO/xVLA) and real (UR10e/ACT,Diffusion)."
 requires-python = ">=3.12"
@@ -34,7 +34,7 @@ dependencies = [
   # in the agent. Worth revisiting if the fork is ever made public or upstreamed.
   "robosuite @ git+ssh://git@github.com/ChazzKemal/robosuite@71ee4f30c3032fbb0afa716f20be656ee48bfa16",
 
-  # DemoSpeedup's entropy labelling (`robot_stack.label.run_label`). Both are what
+  # DemoSpeedup's entropy labelling (`pace_bench.methods.demospeedup.run_label`). Both are what
   # the reference implementation -- lingxiao-guo/DemoSpeedup @ 34bd43a -- uses, and
   # `hdbscan` is deliberately the standalone package rather than scikit-learn's port
   # of the same algorithm: the two agree on well-structured entropy traces but
@@ -61,7 +61,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/robot_stack"]
+packages = ["src/pace_bench"]
 
 [tool.ruff]
 line-length = 110

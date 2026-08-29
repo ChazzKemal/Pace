@@ -6,7 +6,7 @@ for several action chunks and measures how much they disagree
 demonstrations, taking long strides where the disagreement was low
 (:mod:`.retime`).
 
-    python -m robot_stack.methods.demospeedup.run_label \\
+    python -m pace_bench.methods.demospeedup.run_label \\
         --policy_path=outputs/train/cups_act_base/checkpoints/last/pretrained_model \\
         --dataset_repo_id=local/stack_cups --dataset_root=/path/to/stack_cups \\
         --out=outputs/label/cups
@@ -32,18 +32,18 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.random_utils import set_seed
 
-from robot_stack.methods.demospeedup.entropy import kde_entropy
-from robot_stack.methods.demospeedup.sampler import (
+from pace_bench.methods.demospeedup.entropy import kde_entropy
+from pace_bench.methods.demospeedup.sampler import (
     ACTChunkSampler,
     DiffusionChunkSampler,
     XVLAChunkSampler,
 )
-from robot_stack.methods.demospeedup.segment import Rule, segment
+from pace_bench.methods.demospeedup.segment import Rule, segment
 
 logger = logging.getLogger(__name__)
 
 #: Which policy families can be sampled from. Adding one means implementing a
-#: :class:`~robot_stack.methods.demospeedup.sampler.ChunkSampler` for it, not
+#: :class:`~pace_bench.methods.demospeedup.sampler.ChunkSampler` for it, not
 #: probing the policy object for whatever randomness it happens to expose.
 SAMPLERS = {
     "act": ACTChunkSampler,

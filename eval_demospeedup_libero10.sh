@@ -14,13 +14,13 @@ PY=.venv/bin/python
 COMMON=(--use_peft=true --task_suite=libero_10 --tasks=0-9
         --seed=42 --n_episodes=20 --batch_size=10)
 
-"$PY" -m robot_stack.eval.run_libero \
+"$PY" -m pace_bench.eval.run_libero \
     --policy_path=outputs/train/ds_libero10_base/checkpoints/last/pretrained_model \
     --n_action_steps=30 --out=outputs/eval/ds_libero10_base \
     --method.type=none "${COMMON[@]}" \
     2>&1 | tee logs/eval_ds_libero10_base.log
 
-"$PY" -m robot_stack.eval.run_libero \
+"$PY" -m pace_bench.eval.run_libero \
     --policy_path=outputs/train/ds_libero10_speedup/checkpoints/last/pretrained_model \
     --n_action_steps=15 --out=outputs/eval/ds_libero10_speedup \
     --method.type=demospeedup --method.low_v=2 --method.high_v=4 "${COMMON[@]}" \

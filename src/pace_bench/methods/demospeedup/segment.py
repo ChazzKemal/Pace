@@ -1,6 +1,6 @@
 """Turn an entropy trace into per-frame precision labels.
 
-The trace out of :mod:`robot_stack.methods.demospeedup.entropy` is a noisy real
+The trace out of :mod:`pace_bench.methods.demospeedup.entropy` is a noisy real
 signal; retiming needs a binary one. DemoSpeedup gets there by clustering, not
 thresholding, and the reason is temporal: a threshold decides each frame alone and
 produces one-frame flickers that the retiming walk then has to step around, whereas

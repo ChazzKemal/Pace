@@ -2012,6 +2012,33 @@ wheels = [
 ]
 
 [[package]]
+name = "pace-bench"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "hdbscan" },
+    { name = "lerobot", extra = ["diffusion", "evaluation", "libero", "peft", "training", "xvla"] },
+    { name = "robosuite" },
+    { name = "scikit-learn" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "hdbscan", specifier = ">=0.8.44" },
+    { name = "lerobot", extras = ["xvla", "libero", "training", "evaluation", "peft", "diffusion"], git = "https://github.com/huggingface/lerobot?rev=bf31dd794ffb4f87380aba3912f64421e8352d3c" },
+    { name = "robosuite", git = "ssh://git@github.com/ChazzKemal/robosuite?rev=71ee4f30c3032fbb0afa716f20be656ee48bfa16" },
+    { name = "scikit-learn", specifier = ">=1.9.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2836,33 +2863,6 @@ dependencies = [
     { name = "scipy" },
     { name = "termcolor" },
 ]
-
-[[package]]
-name = "robot-stack"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "hdbscan" },
-    { name = "lerobot", extra = ["diffusion", "evaluation", "libero", "peft", "training", "xvla"] },
-    { name = "robosuite" },
-    { name = "scikit-learn" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "hdbscan", specifier = ">=0.8.44" },
-    { name = "lerobot", extras = ["xvla", "libero", "training", "evaluation", "peft", "diffusion"], git = "https://github.com/huggingface/lerobot?rev=bf31dd794ffb4f87380aba3912f64421e8352d3c" },
-    { name = "robosuite", git = "ssh://git@github.com/ChazzKemal/robosuite?rev=71ee4f30c3032fbb0afa716f20be656ee48bfa16" },
-    { name = "scikit-learn", specifier = ">=1.9.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "rpds-py"

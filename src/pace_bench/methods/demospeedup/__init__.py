@@ -1,11 +1,11 @@
 """DemoSpeedup: entropy-labelled variable-rate retiming of demonstrations."""
 
-from robot_stack.methods.demospeedup.labels import describe, load_labels
-from robot_stack.methods.demospeedup.processor import (
+from pace_bench.methods.demospeedup.labels import describe, load_labels
+from pace_bench.methods.demospeedup.processor import (
     DemoSpeedupRetimeStep,
     episode_starts_from_metadata,
 )
-from robot_stack.methods.demospeedup.retime import (
+from pace_bench.methods.demospeedup.retime import (
     HIGH_V,
     LOW_V,
     episode_keep_indices,

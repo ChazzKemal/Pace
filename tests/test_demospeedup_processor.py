@@ -14,9 +14,9 @@ import upstream_reference
 from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStepRegistry
 
-from robot_stack.methods.config import DemoSpeedupMethod
-from robot_stack.methods.demospeedup.processor import ACTION_IS_PAD, DemoSpeedupRetimeStep
-from robot_stack.methods.demospeedup.retime import keep_indices, retime_tail
+from pace_bench.methods.config import DemoSpeedupMethod
+from pace_bench.methods.demospeedup.processor import ACTION_IS_PAD, DemoSpeedupRetimeStep
+from pace_bench.methods.demospeedup.retime import keep_indices, retime_tail
 
 CHUNK, DIM = 20, 7
 

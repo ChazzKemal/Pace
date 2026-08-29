@@ -1,4 +1,4 @@
-# robot_stack — batch plan and state
+# pace_bench — batch plan and state
 
 One config-driven stack for LIBERO (sim) and the UR10e (real). Scope, user-fixed:
 sim = LIBERO-10 + xVLA; real = UR10e + ACT/Diffusion; methods = PACE, DemoSpeedup,
@@ -23,7 +23,7 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ⏳ not started |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/robot_stack/`, 239 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 239 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -53,7 +53,7 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `eval/sim_time.py` | `SimTimeRecorder` + vector-env re-arm (autoreset-safe per-episode sim durations) |
 | `real/` (repo root, **not** under `src/`) | deploy env: pixi manifest + lock pinning lerobot @ the shared SHA, crisp fork SHAs, numpy<2 override; site network scripts incl. the cv2 libjpeg preload |
 
-Outside this repo, load-bearing and NOT under robot_stack's git:
+Outside this repo, load-bearing and NOT under pace_bench's git:
 - crisp forks `ChazzKemal/crisp_{gym,py}` branch `robot-stack-pin`
   (`45dbb06` / `47b3d23`): byte-verified lab snapshots, pinned by `real/pixi.toml`.
   (Verified 2026-08-29: both branch heads still match those SHAs exactly.)
@@ -83,13 +83,30 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   treated as precision) is what the fork used and what both pipeline scripts pass.
   Verified on the real cups checkpoint: `rule=mean` gives 20.4% non-precision with
   runs of ~12.7 frames, against the fork's recorded 18.4% / 13.9.
-- **Diffusion labelling needs an `n_obs_steps=1` proxy** — `DiffusionChunkSampler`
-  refuses anything else at construction: per-frame labelling has no observation
-  history to condition on, and the runner reads one frame per query. Note
-  `DiffusionConfig`'s default is **2**, and the cups pipeline's diffusion stage does
-  not override it — so that baseline cannot double as an oracle the way the ACT
-  baseline does. Either train the proxy with `--policy.n_obs_steps=1` or extend the
-  runner to read a window of frames per query.
+- **Diffusion labelling needs an `n_obs_steps=1` proxy** — resolved 2026-08-29 by
+  passing `--policy.n_obs_steps=1` in the cups diffusion stage, which is both the
+  upstream configuration and what makes that baseline its own DP oracle.
+  `DiffusionChunkSampler` refuses anything else at construction: per-frame labelling
+  has no observation history to give, and the runner reads one frame per query.
+  `DiffusionConfig`'s default is **2**, so any new diffusion stage must override it.
+  Upstream is single-frame in both instantiations: robobase (which has priority) sets
+  `frame_stack: 1` in `cfgs/launch/dp_pixel_bigym.yaml` and has no per-policy obs-step
+  notion — history there would be a FrameStack env wrapper folded into channels
+  (`method/utils.py:86`), supplied for free because `Workspace.label()` replays each
+  demo through a wrapped env rather than indexing frames; aloha says it outright
+  (`n_obs_steps: 1  # Now only support for 1 obs_step`, with the time-axis slice
+  commented out of `diffusion_unet_hybrid_image_policy.py:177`). Reading a 2-frame
+  window in the runner remains possible but would be a LeRobot-native choice, not
+  upstream parity. Caveat: the wider DP literature uses 2 frames, so this baseline is
+  slightly weaker than a stock DP.
+- **Diffusion is verified but untrained.** Smoked 2026-08-29 on stack_cups: the
+  baseline config trains (278M params), an `n_obs_steps=1` proxy labels episode 0
+  end-to-end through `run_label` (437 frames, 0.13 s/frame — the first time the
+  diffusion sampler ran on a real checkpoint rather than in unit tests), and
+  DemoSpeedup+diffusion trains with `pad_mode=hold`. `pad_mode=zero` is rejected at
+  construction: Diffusion's `do_mask_loss_for_padding=False` would train the zero
+  tail as real targets, so the ACT scripts' `pad_mode=zero` does not transfer.
+  No diffusion policy has been trained to completion on any dataset.
 - **No controlled cross-oracle comparison exists.** ACT is trained on stack_cups and
   xVLA on LIBERO, so their precision fractions (79.6% / 84.1%, episode 0, `rule=mean`)
   differ by dataset as much as by policy. Comparing oracles properly needs two
@@ -125,6 +142,11 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 
 ## Conventions that bit us (do not relearn)
 
+- wandb naming (user decision 2026-08-29): project `pace_benchmark_<task>`
+  (`stack_cups` / `pickplace` / `libero10`), run `<policy>_<addon>` —
+  `act_demospeedup`, `xvla_baseline`, `diffusion_baseline`. Run names are kept
+  independent of the output dirs, which keep their old names: `--job_name` is
+  what wandb shows, and coupling the two means a rename orphans a checkpoint.
 - Verify pipeline claims by running the pipeline's entry point, not its
   components (a 1-episode `lerobot-label` smoke would have saved a night).
 - Check log timestamps before believing a tail; stale logs have caused two

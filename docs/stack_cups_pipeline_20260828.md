@@ -17,11 +17,11 @@ waypoints absorb the motion. Small set: expect a modest policy, not a broken pip
 
 | # | what | env | output | ETA |
 |---|---|---|---|---|
-| 1 | ACT baseline (doubles as stage-2 proxy) — chunk 100, batch 32, 30k steps | robot_stack | `outputs/train/cups_act_base` | ~2h10 |
+| 1 | ACT baseline (doubles as stage-2 proxy) — chunk 100, batch 32, 30k steps | pace_bench | `outputs/train/cups_act_base` | ~2h10 |
 | 2 | Fork-compatible checkpoint copy (strips `use_peft`, `pretrained_revision` — the fork's strict draccus rejects them) | — | `.../cups_act_base/forkcompat` | s |
 | 3 | Entropy labelling — fork's `lerobot-label`, ACT CVAE oracle (`sample_action_chunks`, 10 samples/step, temporal aggregation, KDE + HDBSCAN) | fork (conda `lerobot`) | `outputs/label/stack_cups/speedup_labels/episode_{0..11}.npy` + plots | ~30 min |
-| 4 | DemoSpeedup ACT — chunk 100→50, `pad_mode=zero` (ACT's loss is masked by `action_is_pad`) | robot_stack | `outputs/train/cups_act_speedup` | ~2h |
-| 5 | Diffusion baseline — batch 64 | robot_stack | `outputs/train/cups_diffusion_base` | ~2h |
+| 4 | DemoSpeedup ACT — chunk 100→50, `pad_mode=zero` (ACT's loss is masked by `action_is_pad`) | pace_bench | `outputs/train/cups_act_speedup` | ~2h |
+| 5 | Diffusion baseline — batch 64 | pace_bench | `outputs/train/cups_diffusion_base` | ~2h |
 
 Each stage gates on the previous one (stage 3 additionally checks 12/12 label files);
 a failure prints `STAGE<N> FAILED` and stops the chain. `PIPELINE_EXIT=0` in the tmux

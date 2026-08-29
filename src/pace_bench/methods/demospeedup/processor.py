@@ -33,7 +33,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 from lerobot.utils.constants import ACTION
 
-from robot_stack.methods.demospeedup.retime import HIGH_V, LOW_V, retime_tail
+from pace_bench.methods.demospeedup.retime import HIGH_V, LOW_V, retime_tail
 
 ACTION_IS_PAD = f"{ACTION}_is_pad"
 

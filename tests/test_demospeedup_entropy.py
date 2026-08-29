@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from robot_stack.methods.demospeedup.entropy import gaussian_kernel, kde_entropy
+from pace_bench.methods.demospeedup.entropy import gaussian_kernel, kde_entropy
 
 
 def upstream_kde_entropy(x: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:

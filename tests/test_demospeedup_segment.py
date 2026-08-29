@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import upstream_reference
 
-from robot_stack.methods.demospeedup.segment import (
+from pace_bench.methods.demospeedup.segment import (
     NON_PRECISION,
     PRECISION,
     remove_outliers,

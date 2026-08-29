@@ -12,9 +12,9 @@ from dataclasses import dataclass, fields
 import draccus
 import pytest
 
-from robot_stack.methods.config import MethodConfig, MethodPipelineConfig, NoMethod, PaceMethod
-from robot_stack.methods.pace.processor import PaceSpeedStep
-from robot_stack.methods.pace.speed import PaceConfig
+from pace_bench.methods.config import MethodConfig, MethodPipelineConfig, NoMethod, PaceMethod
+from pace_bench.methods.pace.processor import PaceSpeedStep
+from pace_bench.methods.pace.speed import PaceConfig
 
 
 @dataclass
@@ -214,7 +214,7 @@ def test_tail_walk_fills_every_slot_mid_episode():
     import numpy as np
     import torch
 
-    from robot_stack.methods.demospeedup.retime import retime_tail
+    from pace_bench.methods.demospeedup.retime import retime_tail
 
     chunk, high_v = 15, 4
     rng = np.random.default_rng(0)

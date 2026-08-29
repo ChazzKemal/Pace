@@ -23,8 +23,8 @@ from collections import deque
 
 import torch
 
-from robot_stack.methods.pace.actuator import SpeedActuator
-from robot_stack.methods.pace.processor import PaceSpeedStep
+from pace_bench.methods.pace.actuator import SpeedActuator
+from pace_bench.methods.pace.processor import PaceSpeedStep
 
 
 def attach_pace(policy, pace: PaceSpeedStep, actuator: SpeedActuator | None = None):

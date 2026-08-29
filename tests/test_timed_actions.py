@@ -10,9 +10,9 @@ import pytest
 import torch
 from lerobot.lerobot_types import TransitionKey
 
-from robot_stack.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
-from robot_stack.methods.pace.processor import SPEED_KEY, PaceSpeedStep
-from robot_stack.timed import DT_KEY, TimedActions
+from pace_bench.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
+from pace_bench.methods.pace.processor import SPEED_KEY, PaceSpeedStep
+from pace_bench.timed import DT_KEY, TimedActions
 
 CONTROL_DT = 0.05
 
