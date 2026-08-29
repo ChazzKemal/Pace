@@ -1,9 +1,8 @@
 """Segmentation: parity with upstream, and the meaning of the two cluster rules."""
 
-from pathlib import Path
-
 import numpy as np
 import pytest
+import upstream_reference
 
 from robot_stack.methods.demospeedup.segment import (
     NON_PRECISION,
@@ -12,33 +11,65 @@ from robot_stack.methods.demospeedup.segment import (
     segment,
 )
 
-GOLDEN = Path(__file__).parent / "assets" / "segment_golden.npz"
+
+def reference_traces() -> dict[str, np.ndarray]:
+    """Entropy traces spanning the shapes a real labelling run produces."""
+    rng = np.random.default_rng(0)
+    traces = {}
+
+    # Mostly precision, with stretches of confident transit. The shape a good
+    # proxy policy gives on a manipulation demo.
+    a = rng.normal(1.0, 0.25, 300)
+    for start in (30, 120, 210):
+        a[start : start + 45] = rng.normal(3.2, 0.4, 45)
+    traces["precision_majority"] = a
+
+    # The inverse: a policy unsure almost everywhere, certain in three places.
+    b = rng.normal(3.0, 0.4, 300)
+    for start in (40, 140, 240):
+        b[start : start + 30] = rng.normal(1.0, 0.25, 30)
+    traces["transit_majority"] = b
+
+    # A long tail, which is what drives HDBSCAN to call points noise.
+    traces["heavy_tail"] = np.abs(rng.standard_cauchy(250)) + 0.5
+
+    # No structure at all -- the degenerate case the clustering has to survive.
+    traces["unstructured"] = rng.normal(2.0, 1.0, 200)
+
+    # A single ramp: every frame in its own neighbourhood, no plateau to cluster.
+    traces["monotonic_ramp"] = np.linspace(0.5, 4.0, 180)
+
+    # Short episode, near the min_cluster_size floor.
+    traces["short_episode"] = rng.normal(1.5, 0.6, 40)
+
+    return traces
 
 
-def golden_cases():
-    data = np.load(GOLDEN)
-    for name in sorted({key.split("__")[0] for key in data.files}):
-        yield pytest.param(data[f"{name}__trace"], data[f"{name}__labels"], id=name)
+CASES = reference_traces()
 
 
-@pytest.mark.parametrize(("trace", "expected"), list(golden_cases()))
-def test_matches_upstream(trace, expected):
-    """Bit-exact against lingxiao-guo/DemoSpeedup's own `hdbscan_with_custom_merge`.
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_matches_upstream(name):
+    """Bit-exact against upstream's own `hdbscan_with_custom_merge`.
 
-    The vectors were produced by executing upstream's function out of a clone, with
-    its own `hdbscan` backend -- see `tests/assets/gen_segment_golden.py`. Only the
-    IsolationForest seed is pinned, which upstream leaves to chance.
+    Run live against the verbatim copy in `tests/upstream_reference.py`, not
+    against recorded expectations: the reference executes on every run, so a change
+    to either side shows up as a disagreement rather than as a stale fixture.
     """
+    trace = CASES[name]
+    expected = np.abs(upstream_reference.hdbscan_with_custom_merge(trace, dir=None, rollout_id=0, plot=False))
     assert np.array_equal(segment(trace, rule="upstream", seed=0), expected)
 
 
-def test_golden_is_not_vacuous():
-    """Guard against a golden file of all-zeros silently passing everything."""
-    data = np.load(GOLDEN)
-    labels = [data[k] for k in data.files if k.endswith("__labels")]
-    assert len(labels) >= 6
-    assert any(NON_PRECISION in lab for lab in labels), "no case exercises non-precision"
-    assert any(PRECISION in lab for lab in labels), "no case exercises precision"
+def test_the_reference_cases_are_not_vacuous():
+    """Guard against a case set that agrees only because nothing is ever labelled."""
+    labelled = [
+        np.abs(upstream_reference.hdbscan_with_custom_merge(t, dir=None, rollout_id=0, plot=False))
+        for t in CASES.values()
+    ]
+    assert len(labelled) >= 6
+    assert any(NON_PRECISION in lab for lab in labelled), "no case exercises non-precision"
+    assert any(PRECISION in lab for lab in labelled), "no case exercises precision"
 
 
 # --- the two cluster rules are genuinely different algorithms ----------------
