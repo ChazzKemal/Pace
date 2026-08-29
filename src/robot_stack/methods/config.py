@@ -189,6 +189,12 @@ class DemoSpeedupMethod(MethodConfig):
     # Halve the policy's chunk: 15 retimed waypoints span the motion of the original
     # 30. Mirrors upstream's bigym halving and the fork's `speedup_halve_chunk`.
     halve_chunk: bool = True
+    # The chunk geometry as it stood BEFORE halving. Recorded automatically on the
+    # first apply and serialized with the rest of the config, so a resumed run --
+    # which parses its own checkpoint's already-halved policy config -- halves from
+    # the original rather than from the halved value. Not meant to be set by hand.
+    source_chunk: int | None = None
+    source_executed: int | None = None
 
     def __post_init__(self):
         if self.pad_mode not in ("zero", "hold"):
@@ -262,13 +268,25 @@ class DemoSpeedupMethod(MethodConfig):
                 f"DemoSpeedup does not know the chunk fields of policy type {policy_type!r}; "
                 f"add it to POLICY_CHUNK_FIELDS (known: {sorted(POLICY_CHUNK_FIELDS)})."
             )
-        chunk = getattr(policy_cfg, fields.chunk)
+        # Halve from the geometry recorded on the first apply, never from whatever
+        # the config happens to hold now. A resumed run is parsed from its own
+        # checkpoint's train_config.json, whose policy chunk is ALREADY halved and
+        # whose method is still demospeedup -- halving that again would quarter it
+        # (30 -> 15 -> 7). Computing the target from a recorded invariant makes
+        # re-applying a no-op by construction rather than by a guard that has to
+        # guess whether it has run before.
+        chunk = self.source_chunk if self.source_chunk is not None else getattr(policy_cfg, fields.chunk)
+        executed = (
+            self.source_executed
+            if self.source_executed is not None
+            else getattr(policy_cfg, fields.executed)
+        )
+        self.source_chunk, self.source_executed = chunk, executed
         setattr(policy_cfg, fields.chunk, chunk // 2)
+        setattr(policy_cfg, fields.executed, executed // 2)
         # The retime step must emit chunks of exactly the trained length: ACT
         # consumes its action input at chunk_size, no truncation.
         self._trained_chunk = chunk // 2
-        executed = getattr(policy_cfg, fields.executed)
-        setattr(policy_cfg, fields.executed, executed // 2)
         logging.info(
             "DemoSpeedup: halved %s to %d, %s to %d (policy type %r)",
             fields.chunk, chunk // 2, fields.executed, executed // 2, policy_type,

@@ -144,6 +144,65 @@ def test_halving_uses_the_typed_registry_not_attribute_probing():
     assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
 
 
+def test_halving_is_idempotent_so_a_resumed_run_does_not_re_halve():
+    """Re-applying must land on the same chunk, not halve again.
+
+    `save_checkpoint` writes the config AFTER this hook has mutated it, so a
+    checkpoint's train_config.json records the already-halved chunk together with
+    `method=demospeedup`. Resuming from it re-runs this hook, and halving the
+    halved value would quarter the chunk (30 -> 15 -> 7) -- silently training a
+    policy a quarter the intended length.
+    """
+
+    @dataclass
+    class ActShaped:
+        type: str = "act"
+        chunk_size: int = 30
+        n_action_steps: int = 30
+
+    method = parse(["--method.type=demospeedup"]).method
+    knobs = ActShaped()
+    method.adjust_policy_after_datasets(knobs)
+    assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
+
+    method.adjust_policy_after_datasets(knobs)
+    assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
+    assert method._trained_chunk == 15
+
+
+def test_the_pre_halve_geometry_survives_a_config_round_trip():
+    """The guard only works if `source_chunk` reaches the resumed process.
+
+    A resume parses a fresh config object out of the checkpoint's JSON, so an
+    in-memory marker would be lost; this pins that the recorded geometry is a real
+    serialized field and that a config carrying it halves from the original.
+    """
+
+    @dataclass
+    class ActShaped:
+        type: str = "act"
+        chunk_size: int = 30
+        n_action_steps: int = 30
+
+    method = parse(["--method.type=demospeedup"]).method
+    method.adjust_policy_after_datasets(ActShaped())
+    encoded = draccus.encode(method)
+    assert encoded["source_chunk"] == 30
+    assert encoded["source_executed"] == 30
+
+    # What the resumed process sees: this config, and an already-halved policy.
+    resumed = parse(
+        [
+            "--method.type=demospeedup",
+            f"--method.source_chunk={encoded['source_chunk']}",
+            f"--method.source_executed={encoded['source_executed']}",
+        ]
+    ).method
+    knobs = ActShaped(chunk_size=15, n_action_steps=15)
+    resumed.adjust_policy_after_datasets(knobs)
+    assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
+
+
 def test_tail_walk_fills_every_slot_mid_episode():
     """Upstream's property, now by construction: mid-episode chunks have no pads.
 
