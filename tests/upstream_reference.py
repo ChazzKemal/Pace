@@ -5,15 +5,16 @@ commit ``34bd43a832e19ac7aaa64acb5f19dce983075181``:
 
   * ``remove_outliers_isolation_forest``  robobase/robobase/utils.py
   * ``hdbscan_with_custom_merge``         robobase/robobase/utils.py
+  * ``process_action_label``              aloha/act/act_utils.py
 
 Copied rather than depended on. DemoSpeedup is a research repo, not a
 distribution: its root has no ``pyproject.toml`` or ``setup.py``, ``robobase``
 resolves through an SSH-only Gymnasium fork whose own manifest will not parse and
 pins ``numpy<2`` against this project's numpy 2.x, and ``aloha``'s ``setup.py``
 reads ``pkg_resources`` at build time without declaring it. None of the three
-installs. These two functions are the entire surface this project still checks
-itself against, so they live here and nothing else in the repo knows that
-upstream exists.
+installs. These three functions are the entire surface this project checks itself
+against, so they live here and nothing else in the repo knows that upstream
+exists.
 
 **Do not tidy this code.** It is the reference the ports are compared to, so its
 value is being unchanged: upstream's spelling, its dead assignments, its
@@ -28,10 +29,10 @@ and could not be asserted against. The name is bound below to a seeded partial;
 the function bodies are untouched.
 """
 
-# F841: upstream assigns `cluster_points` inside `split_large_clusters` and never
-# reads it. That dead assignment is part of what is being copied; silencing the
-# lint is correct here and editing it out is not.
-# ruff: noqa: F841
+# Upstream leaves two values unused: `cluster_points` inside `split_large_clusters`
+# (F841) and `dim` unpacked from `action.shape` (RUF059). Both are part of what is
+# being copied; silencing the lint is correct here and editing them out is not.
+# ruff: noqa: F841, RUF059
 
 import functools
 import os
@@ -39,6 +40,7 @@ import os
 import hdbscan
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from sklearn.ensemble import IsolationForest as _IsolationForest
 
 #: Seeded so a comparison can be an equality rather than a distribution test.
@@ -172,3 +174,45 @@ def hdbscan_with_custom_merge(entropy, dir, rollout_id, plot=True):
         plt.savefig(os.path.join(dir, f"plot/rollout{rollout_id}-hdbscan-refine.png"))
         plt.close()
     return np.abs(refined_labels)
+
+
+def process_action_label(action, label, is_pad):
+    low_v = 2
+    high_v = 4
+    horizon, dim = action.shape
+    new_actions = torch.zeros_like(action)
+    new_labels = torch.zeros_like(label)
+    new_is_pad = torch.zeros_like(is_pad)
+
+    current_action = action  # Shape: (horizon, dim)
+    current_label = label  # Shape: (horizon,)
+    current_is_pad = is_pad
+
+    indices = []
+    i = -1
+    while i < horizon:
+        if current_label[i] == 0 and i+low_v < horizon:
+            i += low_v  # Skip next element
+            indices.append(i)
+        elif current_label[i] == 1:
+            # Check the next high_v elements if they exist
+            if i + high_v < horizon and torch.all(current_label[i:i + high_v] == 1):
+                i += high_v  # Skip the next 3 elements
+                indices.append(i)
+            else:
+                # Find the next 0 element if it exists
+                next_zero = (current_label[i + 1:] == 0).nonzero(as_tuple=True)[0]
+                if len(next_zero) > 0:
+                    i = i + 1 + next_zero[0].item()
+                    indices.append(i)
+                else:
+                    break  # No more 0s, stop
+        else:
+            i += 1
+    
+    # Use the indices to extract new action and label
+    new_actions[:len(indices)] = current_action[indices]
+    new_labels[:len(indices)] = current_label[indices]
+    new_is_pad[:len(indices)] = current_is_pad[indices]
+
+    return new_actions, new_is_pad

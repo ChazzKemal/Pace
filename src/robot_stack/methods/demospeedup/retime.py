@@ -44,11 +44,10 @@ def keep_indices(labels, low_v: int = LOW_V, high_v: int = HIGH_V, start: int = 
     beginning of a precision segment. That guard is the whole safety argument: speed
     is only taken where the label says the entire jump is uninformative.
 
-    ``start=-1`` reproduces the loop in the DemoSpeedup paper's code, whose first
-    consulted label is ``labels[-1]`` -- the *last* frame, almost certainly a slip.
-    Everything here uses ``start=0``, and nothing calls it with ``-1`` any more: the
-    parity suite that did was retired when the project stopped tracking that repo.
-    Kept only so the difference stays written down rather than becoming folklore.
+    ``start=-1`` reproduces upstream's literal loop, whose first consulted label is
+    ``labels[-1]`` -- the *last* frame, almost certainly a slip. Everything here uses
+    ``start=0``; the option exists so the difference is testable rather than
+    folklore, and the parity test against the copied reference uses it.
     """
     labels = np.asarray(labels)
     horizon = len(labels)

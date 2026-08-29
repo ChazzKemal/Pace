@@ -10,12 +10,13 @@ carefully than the maths.
 import numpy as np
 import pytest
 import torch
+import upstream_reference
 from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStepRegistry
 
 from robot_stack.methods.config import DemoSpeedupMethod
 from robot_stack.methods.demospeedup.processor import ACTION_IS_PAD, DemoSpeedupRetimeStep
-from robot_stack.methods.demospeedup.retime import retime_tail
+from robot_stack.methods.demospeedup.retime import keep_indices, retime_tail
 
 CHUNK, DIM = 20, 7
 
@@ -213,3 +214,34 @@ def test_out_len_emits_the_trained_chunk_not_the_window(episodes):
     )
     torch.testing.assert_close(got[0], expected, rtol=0, atol=0)  # substituted row
     torch.testing.assert_close(got[1], actions[1, : CHUNK // 2], rtol=0, atol=0)  # pass-through row
+
+
+def test_the_stride_walk_matches_upstream_exactly():
+    """`keep_indices` reproduces the paper's walk on 500 random label sequences.
+
+    Upstream returns the kept rows, not their indices, so the indices are recovered
+    by matching rows back to the input. Its loop starts at ``i = -1``, which is what
+    ``start=-1`` exists for; everything in this project runs the ``start=0``
+    convention instead. Compared against the verbatim copy in
+    `tests/upstream_reference.py` -- see that module for why it is copied.
+    """
+    rng = np.random.default_rng(0)
+    for _ in range(500):
+        horizon = int(rng.integers(6, 60))
+        labels = torch.from_numpy(rng.integers(0, 2, horizon).astype(np.int64))
+        actions = torch.randn(horizon, 7)
+        is_pad = torch.zeros(horizon, dtype=torch.bool)
+        is_pad[-2:] = True
+
+        kept, _ = upstream_reference.process_action_label(
+            actions.clone(), labels.clone(), is_pad.clone()
+        )
+        theirs = []
+        for row in kept:
+            hits = (actions == row).all(-1).nonzero()
+            if len(hits) == 0:
+                break  # a zero-filled tail row: past the end of the kept region
+            theirs.append(int(hits[0]))
+
+        mine = keep_indices(labels.numpy(), 2, 4, start=-1)
+        assert mine[: len(theirs)] == theirs, f"diverged on labels={labels.tolist()}"

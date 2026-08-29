@@ -16,22 +16,21 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 1 | PACE speed step (`methods/pace/speed.py`, `processor.py`) | bit-exact parity vs the fork's `select_speed`, 90 golden cases | ✅ committed |
 | 2 | SpeedActuator + eval runner (`run_libero.py`) | 3-seed look4cb+skip@1.5× reproduces recorded SR/TPR | ✅ committed; **gate parked by user** (`git show 2789b0e` era `run_gate_b2.sh` reconstructs it) |
 | 3 | `--method.type` config (`methods/config.py`) | baseline unchanged through the new plumbing | ✅ committed |
-| 4 | DemoSpeedup training step (tail-walk retiming) | on-the-fly == labels; recorded-dataset reconstruction. **The upstream-parity gate is retired** (see below) | ✅ committed (`0b31a80` + follow-ups) |
+| 4 | DemoSpeedup training step (tail-walk retiming) | walk parity vs the copied reference (500 sequences, runs by default) + on-the-fly == labels; recorded-dataset reconstruction | ✅ committed (`0b31a80` + follow-ups) |
 | 5 | `TimedActions` contract (`timed.py`) | baseline dt=1/fps is a byte-level no-op | ✅ committed (`432b712`) |
 | 6 | real env: crisp forks referenced, same LeRobot SHA (`real/pixi.toml`) | full pixi solve; NEP 50 in installed env | ✅ committed (`b303153`); fake-mode diff **deferred to deploy day** |
 | 7 | B-spline, real (ACT) | matches `merged_bspline_20260528` reconstruction | ⏳ not started; source = github.com/B-spline-policy/bspline-policy (user decision), Yunfei impl archived at crisp_gym fork `45dbb06` |
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ⏳ not started |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/robot_stack/`, 238 passed, 0 skipped)
+## Implementation state (`src/robot_stack/`, 239 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
-two functions worth checking against are copied verbatim into
-`tests/upstream_reference.py` with their provenance, and the segmentation parity
-test executes them live. **The retiming walk's upstream-parity suite was deleted
-outright** — `keep_indices` is now checked only by its own unit tests and by the
-recorded-dataset reconstruction, not against the paper's implementation.
+three functions worth checking against are copied verbatim into
+`tests/upstream_reference.py` with their provenance, and both parity tests execute
+them live — segmentation in `test_demospeedup_segment.py`, the stride walk (500
+random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 
 | module | what it is |
 |---|---|
@@ -39,7 +38,7 @@ recorded-dataset reconstruction, not against the paper's implementation.
 | `methods/pace/speed.py` | pure PACE decision math, bit-exact vs the fork (90 golden cases; `test_pace_parity.py` totals 94 tests — the other 4 guard the golden set itself) |
 | `methods/pace/processor.py` | `PaceSpeedStep` (`pace_speed` registry name): per-chunk speeds + stride; publishes `SPEED_KEY` and, given `control_dt`, per-step `DT_KEY` |
 | `methods/pace/actuator.py` | `RobosuiteSpeedActuator`: substep exhaust (quantized 25/n grid), gripper stroke ×speed×stride, kp∝s^exp / kd∝s^(exp/2); `apply_dt` (TimedActions view) |
-| `methods/demospeedup/retime.py` | the stride walk (`keep_indices`; its `start=-1` upstream convention is now uncalled), `episode_keep_indices` (episode-level variant, kept to check the recorded real dataset), `retime_tail` (episode-tail walk → exactly one chunk, truncation not padding), `retime_chunk` (chunk-level reference) |
+| `methods/demospeedup/retime.py` | the stride walk (`keep_indices`, parity-tested against the copied reference at its `start=-1` convention), `episode_keep_indices` (episode-level variant, kept to check the recorded real dataset), `retime_tail` (episode-tail walk → exactly one chunk, truncation not padding), `retime_chunk` (chunk-level reference) |
 | `methods/demospeedup/processor.py` | `DemoSpeedupRetimeStep` (`demospeedup_retime`): receives the preloaded episode action table (built by `config.py`, first row) and substitutes each sample's chunk with its tail walk; runs pre-normalizer; construction-time label/action validation; `out_len` = trained chunk (ACT does not truncate) |
 | `methods/demospeedup/labels.py` | label loading: `episode_<i>.npy` dir or parquet sidecar, auto-detected |
 | `methods/demospeedup/entropy.py` | KDE entropy of sampled action chunks — the uncertainty DemoSpeedup labels on. Upstream's arithmetic minus its dead bandwidth-estimation branch and unused teacher-action return |
