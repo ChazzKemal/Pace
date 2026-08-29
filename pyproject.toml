@@ -18,7 +18,6 @@ dependencies = [
   # Bumping this pin is a deliberate, reviewed change: it is the one place the
   # whole stack's LeRobot version is decided, for sim and robot alike.
   "lerobot[xvla,libero,training,evaluation,peft,diffusion] @ git+https://github.com/huggingface/lerobot@bf31dd794ffb4f87380aba3912f64421e8352d3c",
-
   # Patched robosuite, pinned by SHA for the same reason as LeRobot above.
   #
   # PACE's *actuation* half needs simulator hooks that stock robosuite 1.4.0 does
@@ -34,6 +33,19 @@ dependencies = [
   # SSH rather than HTTPS because the repo is private: installing needs a GitHub key
   # in the agent. Worth revisiting if the fork is ever made public or upstreamed.
   "robosuite @ git+ssh://git@github.com/ChazzKemal/robosuite@71ee4f30c3032fbb0afa716f20be656ee48bfa16",
+
+  # DemoSpeedup's entropy labelling (`robot_stack.label.run_label`). Both are what
+  # the reference implementation -- lingxiao-guo/DemoSpeedup @ 34bd43a -- uses, and
+  # `hdbscan` is deliberately the standalone package rather than scikit-learn's port
+  # of the same algorithm: the two agree on well-structured entropy traces but
+  # diverge on traces with no cluster structure, far enough to change the labels
+  # (52% agreement on a monotonic ramp). Labels decide how demonstrations are
+  # retimed, so the reference backend is the one to match.
+  #
+  # Both are imported lazily, inside the functions that need them: nothing on the
+  # training or evaluation path pays for them.
+  "hdbscan>=0.8.44",
+  "scikit-learn>=1.9.0",
 ]
 
 [dependency-groups]
