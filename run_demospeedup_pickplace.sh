@@ -7,15 +7,16 @@
 # different training stack, and as A-arm it would compare across stacks.
 #
 #   1. ACT baseline (doubles as the labelling proxy), 100k steps (~103 epochs)
-#   2. fork-compatible copy (strip keys the fork's strict draccus rejects)
-#   3. entropy labelling (fork lerobot-label, this baseline as CVAE oracle)
-#      + label-signal check
-#   4. DemoSpeedup ACT from scratch, chunk 100 -> 50, pad_mode=zero, 100k steps
+#   2. entropy labelling (this baseline as CVAE oracle) + label-signal check
+#   3. DemoSpeedup ACT from scratch, chunk 100 -> 50, pad_mode=zero, 100k steps
+#
+# All in-repo: labelling used to run in the lerobot_uncertainty fork under conda,
+# against a checkpoint copy with config keys stripped for the fork's older draccus.
+# robot_stack.label.run_label replaced both.
 set -uo pipefail
 cd /home/batur/Coding/robot_stack
 export VIDEO_BACKEND=pyav PYTHONUNBUFFERED=1
 PY=.venv/bin/python
-FORK_PY=/home/batur/miniconda3/envs/lerobot/bin/python
 DATA=(--dataset.repo_id=local/pickplace
       --dataset.root=/home/batur/Coding/data/pickplace_cart7_v2_angleaxis_nogrip
       --dataset.video_backend=pyav)
@@ -36,29 +37,17 @@ done_already pickplace_act_base || "$PY" -m robot_stack.train.run_train "${DATA[
     2>&1 | tee logs/pickplace_act_base.log
 [ -d outputs/train/pickplace_act_base/checkpoints/last ] || { echo "STAGE1 FAILED"; exit 1; }
 
-stage "2: fork-compatible proxy copy"
-rm -rf outputs/train/pickplace_act_base/forkcompat
-cp -r outputs/train/pickplace_act_base/checkpoints/last/pretrained_model outputs/train/pickplace_act_base/forkcompat
-python3 - <<'PYEOF'
-import json
-p = "outputs/train/pickplace_act_base/forkcompat/config.json"
-c = json.load(open(p))
-for k in ("use_peft", "pretrained_revision"):
-    c.pop(k, None)
-json.dump(c, open(p, "w"), indent=2)
-print("stripped fork-incompatible keys")
-PYEOF
-
-stage "3: entropy labelling (oracle = the stage-1 baseline)"
+stage "2: entropy labelling (oracle = the stage-1 baseline)"
 if [ "$(ls outputs/label/pickplace/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq 45 ]; then
     echo "labels already present, skipping"
 else
-    VIDEO_BACKEND=pyav "$FORK_PY" -m lerobot.scripts.lerobot_label \
-        --policy.path="$PWD/outputs/train/pickplace_act_base/forkcompat" \
-        "${DATA[@]}" \
-        --num_action_samples=10 --temporal_aggregation=true \
-        --kde_bandwidth=1.0 --hdbscan_min_cluster_size=5 --hdbscan_max_cluster_size=25 \
-        --save_plots=true --output_dir=outputs/label/pickplace \
+    "$PY" -m robot_stack.label.run_label \
+        --policy_path="$PWD/outputs/train/pickplace_act_base/checkpoints/last/pretrained_model" \
+        --dataset_repo_id=local/pickplace \
+        --dataset_root=/home/batur/Coding/data/pickplace_cart7_v2_angleaxis_nogrip \
+        --num_action_samples=10 --temporal_aggregation=true --kde_bandwidth=1.0 \
+        --min_cluster_size=5 --max_cluster_size=25 --rule=mean \
+        --out=outputs/label/pickplace \
         2>&1 | tee logs/pickplace_label.log
 fi
 N=$(ls outputs/label/pickplace/speedup_labels/episode_*.npy 2>/dev/null | wc -l)
@@ -88,7 +77,7 @@ print(f"mean fast-run length {mean_run:.2f} vs {expected_random:.2f} expected if
 print("SIGNAL:", "OK" if mean_run > 3 * expected_random else "SUSPICIOUS - review plots before trusting")
 PYEOF
 
-stage "4: DemoSpeedup ACT (chunk 100 -> 50, 100k steps)"
+stage "3: DemoSpeedup ACT (chunk 100 -> 50, 100k steps)"
 done_already pickplace_act_speedup || "$PY" -m robot_stack.train.run_train "${DATA[@]}" "${WANDB[@]}" \
     --policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100 \
     --policy.device=cuda --policy.push_to_hub=false \
