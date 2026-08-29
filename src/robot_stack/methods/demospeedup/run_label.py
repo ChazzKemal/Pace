@@ -2,11 +2,11 @@
 This is DemoSpeedup's second stage and the input to its third. Stage 1 trains an
 ordinary policy on the demonstrations; this stage asks that policy, at every frame,
 for several action chunks and measures how much they disagree
-(:mod:`~robot_stack.methods.demospeedup.entropy`); stage 3 retimes the
+(:mod:`.entropy`); stage 3 retimes the
 demonstrations, taking long strides where the disagreement was low
-(:mod:`~robot_stack.methods.demospeedup.retime`).
+(:mod:`.retime`).
 
-    python -m robot_stack.label.run_label \\
+    python -m robot_stack.methods.demospeedup.run_label \\
         --policy_path=outputs/train/cups_act_base/checkpoints/last/pretrained_model \\
         --dataset_repo_id=local/stack_cups --dataset_root=/path/to/stack_cups \\
         --out=outputs/label/cups

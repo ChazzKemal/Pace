@@ -7,7 +7,7 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.modeling_act import ACT, ACTPolicy
 
-from robot_stack.label.run_label import episode_entropy
+from robot_stack.methods.demospeedup.run_label import episode_entropy
 from robot_stack.methods.demospeedup.sampler import (
     ACTChunkSampler,
     DiffusionChunkSampler,
@@ -184,7 +184,7 @@ def test_temporal_aggregation_pools_every_covering_chunk():
         seen.append(x.shape[1])
         return torch.zeros(x.shape[0])
 
-    from robot_stack.label import run_label
+    from robot_stack.methods.demospeedup import run_label
 
     original = run_label.kde_entropy
     run_label.kde_entropy = spy

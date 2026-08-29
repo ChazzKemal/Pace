@@ -9,7 +9,7 @@
 #
 # Every stage runs in this repo's env. Labelling used to shell out to the
 # lerobot_uncertainty fork under conda, against a checkpoint copy with config keys
-# stripped to satisfy the fork's older draccus; robot_stack.label.run_label removed
+# stripped to satisfy the fork's older draccus; robot_stack.methods.demospeedup.run_label removed
 # both the fork and the copy.
 #
 # Steps: 30k (~100 epochs on 8875 frames) rather than the cart7 recipe's literal
@@ -45,7 +45,7 @@ stage "2: entropy labelling (ACT CVAE oracle)"
 if [ "$(ls outputs/label/stack_cups/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq 12 ]; then
     echo "labels already present, skipping"
 else
-"$PY" -m robot_stack.label.run_label \
+"$PY" -m robot_stack.methods.demospeedup.run_label \
     --policy_path="$PWD/outputs/train/cups_act_base/checkpoints/last/pretrained_model" \
     --dataset_repo_id=local/stack_cups \
     --dataset_root=/home/batur/Coding/data/stack_cups_20260828 \

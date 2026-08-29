@@ -12,7 +12,7 @@
 #
 # All in-repo: labelling used to run in the lerobot_uncertainty fork under conda,
 # against a checkpoint copy with config keys stripped for the fork's older draccus.
-# robot_stack.label.run_label replaced both.
+# robot_stack.methods.demospeedup.run_label replaced both.
 set -uo pipefail
 cd /home/batur/Coding/robot_stack
 export VIDEO_BACKEND=pyav PYTHONUNBUFFERED=1
@@ -41,7 +41,7 @@ stage "2: entropy labelling (oracle = the stage-1 baseline)"
 if [ "$(ls outputs/label/pickplace/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq 45 ]; then
     echo "labels already present, skipping"
 else
-    "$PY" -m robot_stack.label.run_label \
+    "$PY" -m robot_stack.methods.demospeedup.run_label \
         --policy_path="$PWD/outputs/train/pickplace_act_base/checkpoints/last/pretrained_model" \
         --dataset_repo_id=local/pickplace \
         --dataset_root=/home/batur/Coding/data/pickplace_cart7_v2_angleaxis_nogrip \
