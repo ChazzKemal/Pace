@@ -120,27 +120,27 @@ def test_halving_uses_the_typed_registry_not_attribute_probing():
 
     method = parse(["--method.type=demospeedup"]).method
     knobs = ActShaped()
-    method.adjust_policy_after_datasets(knobs)
+    method.adjust_policy(knobs)
     assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
     assert method._trained_chunk == 15
 
     knobs = DiffusionShaped()
-    parse(["--method.type=demospeedup", "--method.pad_mode=hold"]).method.adjust_policy_after_datasets(
+    parse(["--method.type=demospeedup", "--method.pad_mode=hold"]).method.adjust_policy(
         knobs
     )
     assert (knobs.horizon, knobs.n_action_steps) == (8, 4)
 
     with pytest.raises(ValueError, match="POLICY_CHUNK_FIELDS"):
-        method.adjust_policy_after_datasets(UnknownPolicy())
+        method.adjust_policy(UnknownPolicy())
 
     knobs = ActShaped()
-    parse(["--method.type=demospeedup", "--method.halve_chunk=false"]).method.adjust_policy_after_datasets(
+    parse(["--method.type=demospeedup", "--method.halve_chunk=false"]).method.adjust_policy(
         knobs
     )
     assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
 
     knobs = ActShaped()
-    parse([]).method.adjust_policy_after_datasets(knobs)  # NoMethod: untouched
+    parse([]).method.adjust_policy(knobs)  # NoMethod: untouched
     assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
 
 
@@ -162,10 +162,10 @@ def test_halving_is_idempotent_so_a_resumed_run_does_not_re_halve():
 
     method = parse(["--method.type=demospeedup"]).method
     knobs = ActShaped()
-    method.adjust_policy_after_datasets(knobs)
+    method.adjust_policy(knobs)
     assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
 
-    method.adjust_policy_after_datasets(knobs)
+    method.adjust_policy(knobs)
     assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
     assert method._trained_chunk == 15
 
@@ -185,7 +185,7 @@ def test_the_pre_halve_geometry_survives_a_config_round_trip():
         n_action_steps: int = 30
 
     method = parse(["--method.type=demospeedup"]).method
-    method.adjust_policy_after_datasets(ActShaped())
+    method.adjust_policy(ActShaped())
     encoded = draccus.encode(method)
     assert encoded["source_chunk"] == 30
     assert encoded["source_executed"] == 30
@@ -199,7 +199,7 @@ def test_the_pre_halve_geometry_survives_a_config_round_trip():
         ]
     ).method
     knobs = ActShaped(chunk_size=15, n_action_steps=15)
-    resumed.adjust_policy_after_datasets(knobs)
+    resumed.adjust_policy(knobs)
     assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
 
 

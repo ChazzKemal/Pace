@@ -47,12 +47,17 @@ def attach_method_steps(method: MethodConfig):
     captured: dict = {}
 
     def make_datasets(cfg, *args, **kwargs):
+        # Adjust the policy config FIRST. The loader derives its action window from
+        # that config (ACT and xVLA take `range(chunk_size)`, Diffusion `horizon`),
+        # so halving before construction makes the window the trained chunk instead
+        # of twice it -- the dataset stops fetching and decoding actions that the
+        # retiming step would only discard. Both orderings produce byte-identical
+        # retimed chunks; this one just reads half as much.
+        method.adjust_policy(cfg.policy)
         # The processor factory is not handed the dataset, but DemoSpeedup preloads
-        # episode action trajectories from it -- captured here. The chunk halving
-        # also happens at this point, before the policy is built.
+        # episode action trajectories from it -- captured here.
         datasets = original_make_datasets(cfg, *args, **kwargs)
         captured["dataset"] = datasets[0]
-        method.adjust_policy_after_datasets(cfg.policy)
         return datasets
 
     def patched(*args, **kwargs):

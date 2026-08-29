@@ -67,11 +67,16 @@ class MethodConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore[misc]
         """Steps to insert after the policy."""
         return []
 
-    def adjust_policy_after_datasets(self, policy_cfg) -> None:
-        """Mutate the policy config after the datasets are built, before the policy is.
+    def adjust_policy(self, policy_cfg) -> None:
+        """Mutate the policy config before the datasets and the policy are built.
 
-        Exists for methods that change the chunk the policy trains (DemoSpeedup's
-        halving). No-op by default.
+        Exists for methods that change the geometry the policy trains (DemoSpeedup's
+        chunk halving). Running before the datasets is deliberate: the loader derives
+        its action window from this config, so a method that changes the chunk here
+        changes what the loader fetches.
+
+        Called for every method, so it must stay a no-op by default -- PACE and the
+        baseline contribute nothing here and must be unaffected by it.
         """
 
 
@@ -243,14 +248,15 @@ class DemoSpeedupMethod(MethodConfig):
                 out_len=getattr(self, "_trained_chunk", None),
             )
         ]
-    def adjust_policy_after_datasets(self, policy_cfg) -> None:
+    def adjust_policy(self, policy_cfg) -> None:
         """Halve the chunk the policy trains; also guard the pad_mode/loss pairing.
 
         Field names come from :data:`POLICY_CHUNK_FIELDS`, keyed on the policy's
-        registered ``type``. The dataset's own action window no longer matters --
-        the retiming step substitutes chunks from its preloaded episode table -- so
-        ordering relative to dataset creation is not load-bearing; this hook is
-        simply where the trainer calls us.
+        registered ``type``. Running before the datasets are built means the loader's
+        action window is the halved chunk, so it stops fetching the half that the
+        retiming step would discard. The retimed output is the same either way --
+        the step substitutes chunks from its own preloaded episode table, and the
+        first half of a full window is exactly a half-length window.
         """
         if self.pad_mode == "zero" and getattr(policy_cfg, "do_mask_loss_for_padding", True) is False:
             raise ValueError(
