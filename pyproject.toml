@@ -17,7 +17,7 @@ dependencies = [
   #
   # Bumping this pin is a deliberate, reviewed change: it is the one place the
   # whole stack's LeRobot version is decided, for sim and robot alike.
-  "lerobot[xvla,libero,training,evaluation,peft] @ git+https://github.com/huggingface/lerobot@bf31dd794ffb4f87380aba3912f64421e8352d3c",
+  "lerobot[xvla,libero,training,evaluation,peft,diffusion] @ git+https://github.com/huggingface/lerobot@bf31dd794ffb4f87380aba3912f64421e8352d3c",
 
   # Patched robosuite, pinned by SHA for the same reason as LeRobot above.
   #

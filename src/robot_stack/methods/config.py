@@ -143,6 +143,27 @@ class MethodPipelineConfig:
     method: MethodConfig = field(default_factory=NoMethod)
 
 
+@dataclass(frozen=True)
+class ChunkFields:
+    """Which config fields hold a policy family's chunk geometry.
+
+    An explicit registry, keyed on the policy config's registered ``type`` --
+    never inferred by probing attribute names, which treats an interface as a
+    coincidence of naming. A policy family outside the registry is a loud error,
+    not a silent no-op.
+    """
+
+    chunk: str  # length of the action sequence the policy trains/predicts
+    executed: str  # steps executed per query before re-planning
+
+
+POLICY_CHUNK_FIELDS: dict[str, ChunkFields] = {
+    "act": ChunkFields(chunk="chunk_size", executed="n_action_steps"),
+    "diffusion": ChunkFields(chunk="horizon", executed="n_action_steps"),
+    "xvla": ChunkFields(chunk="chunk_size", executed="n_action_steps"),
+}
+
+
 @MethodConfig.register_subclass("demospeedup")
 @dataclass
 class DemoSpeedupMethod(MethodConfig):
@@ -213,16 +234,17 @@ class DemoSpeedupMethod(MethodConfig):
                 low_v=self.low_v,
                 high_v=self.high_v,
                 pad_mode=self.pad_mode,
+                out_len=getattr(self, "_trained_chunk", None),
             )
         ]
     def adjust_policy_after_datasets(self, policy_cfg) -> None:
         """Halve the chunk the policy trains; also guard the pad_mode/loss pairing.
 
-        hasattr guards because the fields differ per policy family: xVLA/ACT carry
-        ``chunk_size`` and ``n_action_steps``, Diffusion a ``horizon``. The dataset's
-        own action window no longer matters -- the retiming step substitutes chunks
-        from its preloaded episode table -- so ordering relative to dataset creation
-        is no longer load-bearing; this hook is simply where the trainer calls us.
+        Field names come from :data:`POLICY_CHUNK_FIELDS`, keyed on the policy's
+        registered ``type``. The dataset's own action window no longer matters --
+        the retiming step substitutes chunks from its preloaded episode table -- so
+        ordering relative to dataset creation is not load-bearing; this hook is
+        simply where the trainer calls us.
         """
         if self.pad_mode == "zero" and getattr(policy_cfg, "do_mask_loss_for_padding", True) is False:
             raise ValueError(
@@ -233,8 +255,21 @@ class DemoSpeedupMethod(MethodConfig):
             )
         if not self.halve_chunk:
             return
-        for name in ("chunk_size", "horizon", "n_action_steps"):
-            value = getattr(policy_cfg, name, None)
-            if value is not None:
-                setattr(policy_cfg, name, value // 2)
-                logging.info("DemoSpeedup: halved %s to %d", name, value // 2)
+        policy_type = policy_cfg.type
+        fields = POLICY_CHUNK_FIELDS.get(policy_type)
+        if fields is None:
+            raise ValueError(
+                f"DemoSpeedup does not know the chunk fields of policy type {policy_type!r}; "
+                f"add it to POLICY_CHUNK_FIELDS (known: {sorted(POLICY_CHUNK_FIELDS)})."
+            )
+        chunk = getattr(policy_cfg, fields.chunk)
+        setattr(policy_cfg, fields.chunk, chunk // 2)
+        # The retime step must emit chunks of exactly the trained length: ACT
+        # consumes its action input at chunk_size, no truncation.
+        self._trained_chunk = chunk // 2
+        executed = getattr(policy_cfg, fields.executed)
+        setattr(policy_cfg, fields.executed, executed // 2)
+        logging.info(
+            "DemoSpeedup: halved %s to %d, %s to %d (policy type %r)",
+            fields.chunk, chunk // 2, fields.executed, executed // 2, policy_type,
+        )

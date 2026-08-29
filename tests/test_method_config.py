@@ -91,26 +91,56 @@ def test_round_trips_through_draccus():
     assert restored == original
 
 
-def test_halving_touches_only_demospeedup_policies():
-    """The method halves the trained chunk; NoMethod and halve_chunk=false do not."""
+def test_halving_uses_the_typed_registry_not_attribute_probing():
+    """Chunk fields come from POLICY_CHUNK_FIELDS keyed on the policy type.
+
+    An xVLA/ACT-shaped config halves chunk_size; a diffusion-shaped one halves
+    horizon; a policy type outside the registry is a loud error, never a silent
+    no-op or a lucky attribute match.
+    """
 
     @dataclass
-    class PolicyKnobs:
+    class ActShaped:
+        type: str = "act"
         chunk_size: int = 30
         n_action_steps: int = 30
 
-    knobs = PolicyKnobs()
-    parse(["--method.type=demospeedup"]).method.adjust_policy_after_datasets(knobs)
-    assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
+    @dataclass
+    class DiffusionShaped:
+        type: str = "diffusion"
+        horizon: int = 16
+        n_action_steps: int = 8
+        do_mask_loss_for_padding: bool = True
 
-    knobs = PolicyKnobs()
+    @dataclass
+    class UnknownPolicy:
+        type: str = "groot"
+        chunk_size: int = 30
+        n_action_steps: int = 30
+
+    method = parse(["--method.type=demospeedup"]).method
+    knobs = ActShaped()
+    method.adjust_policy_after_datasets(knobs)
+    assert (knobs.chunk_size, knobs.n_action_steps) == (15, 15)
+    assert method._trained_chunk == 15
+
+    knobs = DiffusionShaped()
+    parse(["--method.type=demospeedup", "--method.pad_mode=hold"]).method.adjust_policy_after_datasets(
+        knobs
+    )
+    assert (knobs.horizon, knobs.n_action_steps) == (8, 4)
+
+    with pytest.raises(ValueError, match="POLICY_CHUNK_FIELDS"):
+        method.adjust_policy_after_datasets(UnknownPolicy())
+
+    knobs = ActShaped()
     parse(["--method.type=demospeedup", "--method.halve_chunk=false"]).method.adjust_policy_after_datasets(
         knobs
     )
     assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
 
-    knobs = PolicyKnobs()
-    parse([]).method.adjust_policy_after_datasets(knobs)
+    knobs = ActShaped()
+    parse([]).method.adjust_policy_after_datasets(knobs)  # NoMethod: untouched
     assert (knobs.chunk_size, knobs.n_action_steps) == (30, 30)
 
 

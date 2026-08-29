@@ -70,6 +70,7 @@ class DemoSpeedupRetimeStep(ProcessorStep):
         low_v: int = LOW_V,
         high_v: int = HIGH_V,
         pad_mode: str = "zero",
+        out_len: int | None = None,
     ):
         """
         Args:
@@ -84,6 +85,11 @@ class DemoSpeedupRetimeStep(ProcessorStep):
             pad_mode: ``"zero"`` only when the policy's loss is masked by
                 ``action_is_pad`` (ACT); ``"hold"`` for unmasked chunk losses (xVLA,
                 Diffusion under its defaults). Reached only at episode ends.
+            out_len: The chunk length the POLICY trains -- after halving, smaller
+                than the loader's window. The step must emit exactly this length:
+                xVLA truncates over-length action inputs, but ACT's VAE encoder
+                consumes the sequence at exactly chunk_size and a mismatch is a
+                shape error. ``None`` keeps the incoming window length.
         """
         self.labels = labels or {}
         self.episode_actions = episode_actions or {}
@@ -91,6 +97,7 @@ class DemoSpeedupRetimeStep(ProcessorStep):
         self.low_v = low_v
         self.high_v = high_v
         self.pad_mode = pad_mode
+        self.out_len = out_len
 
         # A labelled episode without its actions -- or with actions of a different
         # length -- cannot be retimed and must not silently train as a baseline.
@@ -127,15 +134,18 @@ class DemoSpeedupRetimeStep(ProcessorStep):
         frame_index = self._frame_indices(complementary, episode_index)
 
         is_pad = complementary.get(ACTION_IS_PAD)
-        actions = actions.clone()
+        chunk_len = min(self.out_len or actions.shape[1], actions.shape[1])
+        # Truncating to the trained chunk is correct for pass-through rows too: a
+        # chunk-`out_len` policy fed from a chunk-`out_len` window would have seen
+        # exactly these first `out_len` actions.
+        actions = actions[:, :chunk_len].clone()
         # Rows we substitute get a freshly constructed mask; rows we pass through
         # keep whatever the dataset said (all-False when it said nothing).
         is_pad = (
-            is_pad.clone()
+            is_pad[:, :chunk_len].clone()
             if is_pad is not None
             else torch.zeros(actions.shape[:2], dtype=torch.bool, device=actions.device)
         )
-        chunk_len = actions.shape[1]
 
         for i in range(actions.shape[0]):
             ep = int(episode_index[i])
@@ -185,7 +195,7 @@ class DemoSpeedupRetimeStep(ProcessorStep):
 
     def get_config(self) -> dict[str, Any]:
         """Labels and actions are data, not configuration -- only the knobs serialize."""
-        return {"low_v": self.low_v, "high_v": self.high_v, "pad_mode": self.pad_mode}
+        return {"low_v": self.low_v, "high_v": self.high_v, "pad_mode": self.pad_mode, "out_len": self.out_len}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

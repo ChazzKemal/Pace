@@ -189,3 +189,27 @@ def test_method_without_labels_still_builds_a_step():
 def test_method_contributes_no_postprocessor_steps():
     """DemoSpeedup acts on training targets; it has nothing to say at inference."""
     assert DemoSpeedupMethod().postprocessor_steps() == []
+
+
+def test_out_len_emits_the_trained_chunk_not_the_window(episodes):
+    """After halving, the policy trains a shorter chunk than the loader's window.
+
+    The step must emit exactly the trained length: xVLA truncates over-length
+    action inputs, but ACT's VAE encoder consumes the sequence at chunk_size and
+    a mismatch is a hard shape error (position embedding 102 vs 52 -- the crash
+    this test pins). Pass-through rows are truncated too, which is what a
+    chunk-out_len window would have delivered.
+    """
+    labels, ep_actions = episodes
+    step = build(labels, ep_actions, out_len=CHUNK // 2)
+    actions = torch.randn(2, CHUNK, DIM)
+    out = step(transition(actions.clone(), [0, 99], frame_index=[10, 0]))
+
+    got = out[TransitionKey.ACTION]
+    assert got.shape == (2, CHUNK // 2, DIM)
+    assert out[TransitionKey.COMPLEMENTARY_DATA][ACTION_IS_PAD].shape == (2, CHUNK // 2)
+    expected, _ = retime_tail(
+        torch.from_numpy(ep_actions[0][10:]), labels[0][10:], CHUNK // 2, 2, 4, "zero"
+    )
+    torch.testing.assert_close(got[0], expected, rtol=0, atol=0)  # substituted row
+    torch.testing.assert_close(got[1], actions[1, : CHUNK // 2], rtol=0, atol=0)  # pass-through row

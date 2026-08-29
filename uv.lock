@@ -594,6 +594,26 @@ wheels = [
 ]
 
 [[package]]
+name = "diffusers"
+version = "0.39.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "filelock" },
+    { name = "httpx" },
+    { name = "huggingface-hub" },
+    { name = "importlib-metadata" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "regex" },
+    { name = "requests" },
+    { name = "safetensors" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1a/81/6095237b86a3116c4789f28c4435d5296c00c0fc74ffde99008fd6b3a36c/diffusers-0.39.0.tar.gz", hash = "sha256:14bb1d98c85a0e463d734c99aaa73b480a7bc9bad22af30fbf730ef8f09c1d67", size = 4651240, upload-time = "2026-07-03T08:48:47.904Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/3f/7469c46e9d22307ea686bab687d70e6bf328722952f9d10339f5e913e608/diffusers-0.39.0-py3-none-any.whl", hash = "sha256:912aca51b5787365110806e984d5555735bf8a461073bb8459029d0bca7870ef", size = 5631176, upload-time = "2026-07-03T08:48:45.337Z" },
+]
+
+[[package]]
 name = "dill"
 version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1103,6 +1123,18 @@ wheels = [
 ]
 
 [[package]]
+name = "importlib-metadata"
+version = "9.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "zipp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6f/7e/1e7e8dc30634b93ebb3d58a3dea569ad146e656218d3960ab04f62047b29/importlib_metadata-9.0.1.tar.gz", hash = "sha256:ab830580bc0ef3db61ce8fae716389e5462b67e033018bab6d8f80ef17172f99", size = 59124, upload-time = "2026-08-28T15:30:34.646Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/55/ecca97ae19075f1fac62def77731e7f535e6c1fb8f92ff08160c5e6dade8/importlib_metadata-9.0.1-py3-none-any.whl", hash = "sha256:bba5600596a7e21f3eef53281cf28d6a5195634d2f2b78ff9501a3272c6eaab0", size = 27920, upload-time = "2026-08-28T15:30:33.433Z" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1276,6 +1308,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+diffusion = [
+    { name = "diffusers" },
+]
 evaluation = [
     { name = "av" },
 ]
@@ -2766,7 +2801,7 @@ name = "robot-stack"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "lerobot", extra = ["evaluation", "libero", "peft", "training", "xvla"] },
+    { name = "lerobot", extra = ["diffusion", "evaluation", "libero", "peft", "training", "xvla"] },
     { name = "robosuite" },
 ]
 
@@ -2777,7 +2812,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "lerobot", extras = ["xvla", "libero", "training", "evaluation", "peft"], git = "https://github.com/huggingface/lerobot?rev=bf31dd794ffb4f87380aba3912f64421e8352d3c" },
+    { name = "lerobot", extras = ["xvla", "libero", "training", "evaluation", "peft", "diffusion"], git = "https://github.com/huggingface/lerobot?rev=bf31dd794ffb4f87380aba3912f64421e8352d3c" },
     { name = "robosuite", git = "ssh://git@github.com/ChazzKemal/robosuite?rev=71ee4f30c3032fbb0afa716f20be656ee48bfa16" },
 ]
 
