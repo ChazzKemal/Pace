@@ -74,6 +74,13 @@ class LabelConfig:
     # frame predicted the same way from ten different observations is genuinely
     # unambiguous, which is the property the labels are meant to capture.
     temporal_aggregation: bool = True
+    # Frames sampled per policy call. 1 reproduces the original one-frame-at-a-time
+    # loop exactly. Higher only helps a family whose sampler implements
+    # `sample_frames` (diffusion today): a diffusion chunk costs 100 sequential
+    # denoising steps whatever the batch width, so the card sits idle at width 10.
+    # Measured on pickplace, 31k frames: 4.76h at 1, 1.35h at 32. Above ~32 it
+    # plateaus -- the denoiser is latency-bound, not throughput-bound.
+    batch_frames: int = 32
 
     # --- segmentation --- see segment.Rule; "upstream" is the reference behaviour.
     rule: Rule = "upstream"
@@ -82,6 +89,29 @@ class LabelConfig:
     outlier_contamination: float = 0.1
 
     rename_map: dict[str, str] = field(default_factory=dict)
+
+
+def _sample_stream(dataset, sampler, preprocessor, start, length, batch_frames):
+    """Yield each frame's ``(num_samples, chunk, dim)`` stack, in frame order.
+
+    Sampling is batched where the family supports it; the frames still come out one
+    at a time, so the aggregation below is unchanged by how they were produced. A
+    sampler without ``sample_frames`` (ACT, which drives the model directly and is
+    fast enough not to need this) takes the original path.
+    """
+    batched = getattr(sampler, "sample_frames", None)
+    if batched is None or batch_frames <= 1:
+        for t in range(length):
+            yield sampler(preprocessor(dataset[start + t]))
+        return
+    for begin in range(0, length, batch_frames):
+        block = [
+            preprocessor(dataset[start + t])
+            for t in range(begin, min(begin + batch_frames, length))
+        ]
+        stacked = batched(block)
+        for i in range(len(block)):
+            yield stacked[i]
 
 
 def episode_entropy(
@@ -93,6 +123,7 @@ def episode_entropy(
     *,
     bandwidth: float,
     temporal_aggregation: bool,
+    batch_frames: int = 1,
 ) -> np.ndarray:
     """The entropy trace of one episode, one value per frame.
 
@@ -108,10 +139,8 @@ def episode_entropy(
     trace = np.zeros(length, dtype=np.float64)
     recent: deque[torch.Tensor] | None = None
 
-    for t in range(length):
-        batch = preprocessor(dataset[start + t])
-        samples = sampler(batch)  # (num_samples, chunk_length, action_dim)
-
+    stream = _sample_stream(dataset, sampler, preprocessor, start, length, batch_frames)
+    for t, samples in enumerate(stream):  # samples: (num_samples, chunk_length, action_dim)
         if not temporal_aggregation:
             pooled = samples[:, 0, :]
         else:
@@ -194,6 +223,7 @@ def main(cfg: LabelConfig) -> None:
             dataset, sampler, preprocessor, start, length,
             bandwidth=cfg.kde_bandwidth,
             temporal_aggregation=cfg.temporal_aggregation,
+            batch_frames=cfg.batch_frames,
         )
         np.save(labels_dir / f"entropy_{episode}.npy", trace)
 

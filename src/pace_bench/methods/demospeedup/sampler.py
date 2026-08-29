@@ -181,6 +181,52 @@ def broadcast(value, num_samples: int):
     return value
 
 
+def collate(batches: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+    """Stack single-observation batches into one batch of ``len(batches)`` rows.
+
+    Each input is what the preprocessor returns for one frame: every tensor batched
+    to a single row. Concatenating along that dim gives the policy several frames in
+    one call, which is the whole point -- a diffusion chunk costs 100 sequential
+    denoising steps no matter how wide the batch is, so the only way to use the card
+    is to make it wider.
+    """
+    if len(batches) == 1:
+        return batches[0]
+    out: dict[str, Tensor] = {}
+    for key in batches[0]:
+        values = [b[key] for b in batches]
+        first = values[0]
+        if isinstance(first, Tensor):
+            # Scalars are not indexed by batch element (frame index, timestamp, a
+            # task id); broadcast() already passes them through, so keep the first.
+            out[key] = first if first.ndim == 0 else torch.cat(values, dim=0)
+        elif isinstance(first, list):
+            out[key] = [v for value in values for v in value]
+        else:
+            out[key] = first
+    return out
+
+
+def repeat_frames(value, num_samples: int):
+    """Repeat every row ``num_samples`` times, keeping each frame's copies adjacent.
+
+    ``repeat_interleave`` rather than ``repeat``: row order decides which frame a
+    returned chunk belongs to, and the caller reshapes the result to
+    ``(frames, num_samples, ...)``. Tiling instead of interleaving would still
+    return the right chunks in the wrong slots -- entropy would be measured against
+    the wrong observation, and nothing downstream would notice.
+    """
+    if isinstance(value, Tensor):
+        return value if value.ndim == 0 else value.repeat_interleave(num_samples, dim=0)
+    if isinstance(value, list):
+        if value and not isinstance(value[0], Tensor):
+            return [v for v in value for _ in range(num_samples)]
+        return [repeat_frames(v, num_samples) for v in value]
+    if isinstance(value, dict):
+        return {k: repeat_frames(v, num_samples) for k, v in value.items()}
+    return value
+
+
 class _BroadcastChunkSampler:
     """Sampler for policies whose ``predict_action_chunk`` is already stochastic.
 
@@ -210,6 +256,22 @@ class _BroadcastChunkSampler:
         self.policy.reset()
         batch = self.prepare(dict(batch))
         return self.policy.predict_action_chunk(broadcast(batch, self.num_samples))
+
+    @torch.no_grad()
+    def sample_frames(self, batches: list[dict[str, Tensor]]) -> Tensor:
+        """Sample for several frames at once. Returns ``(frames, num_samples, chunk, dim)``.
+
+        Same answer as calling ``__call__`` per frame -- the rows are independent
+        either way -- but one policy call instead of ``len(batches)`` of them. The
+        draws differ from the one-at-a-time path because the noise comes from one
+        wider ``randn``, which is a different point in the RNG stream, not a
+        different distribution.
+        """
+        self.policy.reset()
+        frames = len(batches)
+        batch = self.prepare(collate(batches))
+        chunks = self.policy.predict_action_chunk(repeat_frames(batch, self.num_samples))
+        return chunks.reshape(frames, self.num_samples, *chunks.shape[1:])
 
     def prepare(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Last shaping before broadcasting. Identity unless a family needs more."""
@@ -245,6 +307,46 @@ class DiffusionChunkSampler(_BroadcastChunkSampler):
                 "Label with an n_obs_steps=1 proxy, or extend the runner to read a "
                 "window of frames per query."
             )
+
+    @torch.no_grad()
+    def sample_frames(self, batches: list[dict[str, Tensor]]) -> Tensor:
+        """Batched sampling that runs the vision encoder once per *frame*.
+
+        The ``num_samples`` chunks of one frame condition on the same observation,
+        so the generic path -- repeat the observation, hand the policy N identical
+        images -- pays for the ResNet N times over. Only the denoising is per-sample.
+
+        This splits ``generate_actions`` at its own seam: encode the distinct frames
+        into ``(frames, cond_dim)``, repeat *that* into the denoiser, and slice the
+        result exactly as upstream does. Measured on the pickplace card it is worth
+        little in wall-clock (100 sequential DDPM steps dominate) but ~6x in memory,
+        which is what makes a wide frame batch affordable at all.
+
+        The two bypassed lines of ``predict_action_chunk`` are reproduced here: the
+        queue branch (dead -- ``reset()`` empties them) and the image stacking.
+        """
+        self.policy.reset()
+        frames = len(batches)
+        batch = self.prepare(collate(batches))
+
+        config = self.policy.config
+        if config.image_features:
+            batch = dict(batch)
+            for key in config.image_features:
+                if batch[key].ndim == 4:
+                    batch[key] = batch[key].unsqueeze(1)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in config.image_features], dim=-4)
+
+        model = self.policy.diffusion
+        global_cond = model._prepare_global_conditioning(batch)  # (frames, cond_dim)
+        chunks = model.conditional_sample(
+            frames * self.num_samples,
+            global_cond=global_cond.repeat_interleave(self.num_samples, dim=0),
+        )
+        # generate_actions' own slice: the chunk starts at the current observation.
+        start = config.n_obs_steps - 1
+        chunks = chunks[:, start : start + config.n_action_steps]
+        return chunks.reshape(frames, self.num_samples, *chunks.shape[1:])
 
     def prepare(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Give the state an observation-step axis.
