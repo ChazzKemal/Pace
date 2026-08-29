@@ -127,7 +127,7 @@ deployment. See `docs/PLAN.md` for what is trained, what is not, and why.
 pytest
 ```
 
-239 tests, no network, no external checkouts, nothing skipped. They include parity
+245 tests, no network, no external checkouts, nothing skipped. They include parity
 checks of the DemoSpeedup ports against that paper's own code, which is copied
 verbatim into `tests/upstream_reference.py` with its provenance.
 
