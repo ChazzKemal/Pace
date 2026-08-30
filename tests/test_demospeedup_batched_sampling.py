@@ -161,8 +161,8 @@ def test_dedup_matches_generate_actions_exactly(dp_policy):
     the denoising iterations, so pinning only the prior leaves the two runs on
     different points of the RNG stream. Seeded alike they draw the same
     `randn(frames * samples, horizon, dim)` prior and the same per-step noise, so
-    any remaining difference is the dedup's own doing -- a wrong slice, a tiled
-    instead of interleaved repeat, a dropped observation step.
+    any difference beyond float32 noise is the dedup's own doing -- a wrong slice, a
+    tiled instead of interleaved repeat, a dropped observation step.
     """
     samples, frames = 3, 2
     batches = [dp_frame(i) for i in range(frames)]
@@ -187,6 +187,17 @@ def test_dedup_matches_generate_actions_exactly(dp_policy):
     out = sampler.sample_frames([dict(b) for b in batches])
 
     assert out.shape == (frames, samples, dp_policy.config.n_action_steps, D_ACT)
-    assert torch.allclose(out.reshape(frames * samples, -1, D_ACT), reference, atol=1e-6), (
+    # The tolerance is set by float32, not by the dedup. Deduplicating is the whole
+    # point here, so the two paths necessarily run the vision encoder over batches of
+    # different widths -- `frames` rows here against `frames * samples` upstream -- and
+    # conv/GEMM results depend on batch width in the last bits, which the denoising
+    # loop then amplifies. Measured across weight seeds that gap is 1e-6 to 3e-5, so
+    # atol=1e-6 fails intermittently on arithmetic noise and did: 3 of 8 full-suite
+    # runs on 2026-08-30, while passing in isolation. Nothing is lost by loosening it,
+    # because the defects this test exists to catch move whole actions rather than
+    # their last bits: a tiled instead of interleaved repeat swaps the frame and sample
+    # axes, and a wrong slice reads a different chunk entirely. Both are O(1) against
+    # actions normalized to [-1, 1], so 1e-4 catches every one of them.
+    assert torch.allclose(out.reshape(frames * samples, -1, D_ACT), reference, atol=1e-4), (
         "encoder-dedup diverged from generate_actions on an identical RNG stream"
     )

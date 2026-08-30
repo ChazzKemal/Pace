@@ -23,7 +23,7 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ⏳ not started |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/pace_bench/`, 239 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 259 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -43,12 +43,13 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `methods/demospeedup/labels.py` | label loading: `episode_<i>.npy` dir or parquet sidecar, auto-detected |
 | `methods/demospeedup/entropy.py` | KDE entropy of sampled action chunks — the uncertainty DemoSpeedup labels on. Upstream's arithmetic minus its dead bandwidth-estimation branch and unused teacher-action return |
 | `methods/demospeedup/segment.py` | entropy trace → binary labels: z-score, IsolationForest outlier interpolation, HDBSCAN over `(time, entropy)`, oversize-cluster splitting. `rule=` picks the cluster verdict (see below) |
-| `methods/demospeedup/sampler.py` | one sampler per policy family. **ACT** is the only one needing machinery: its inference path pins the CVAE latent to `z=0`, so `LatentSamplingACT(ACT)` puts a forward-pre-hook on `encoder_latent_input_proj` to swap in a prior draw — upstream's `forward` runs unmodified, weights load `strict=True`. **xVLA** and **Diffusion** keep their randomness (flow-matching `x1=randn`, denoising prior), so `XVLAChunkSampler` / `DiffusionChunkSampler` just `broadcast()` the observation to N rows and call the policy's public `predict_action_chunk`, resetting first so each frame is judged alone |
-| `methods/demospeedup/run_label.py` | draccus labelling runner: checkpoint's own preprocessor, per-frame chunk sampling, temporal aggregation over every chunk covering a frame, `speedup_labels/episode_<i>.npy` + the raw `entropy_<i>.npy` trace, `run_config.yaml` |
+| `methods/demospeedup/sampler.py` | one sampler per policy family. **ACT** is the only one needing machinery: its inference path pins the CVAE latent to `z=0`, so `LatentSamplingACT(ACT)` puts a forward-pre-hook on `encoder_latent_input_proj` to swap in a prior draw — upstream's `forward` runs unmodified, weights load `strict=True`. **xVLA** and **Diffusion** keep their randomness (flow-matching `x1=randn`, denoising prior), so `XVLAChunkSampler` / `DiffusionChunkSampler` just `broadcast()` the observation to N rows and call the policy's public `predict_action_chunk`, resetting first so each frame is judged alone. `sample_frames` on `_BroadcastChunkSampler` answers several frames in one policy call (same distribution, different point in the RNG stream); `DiffusionChunkSampler` overrides it to run the vision encoder once per *frame* rather than once per sample, which is what lets a wide frame batch fit in memory |
+| `methods/demospeedup/run_label.py` | draccus labelling runner: checkpoint's own preprocessor, per-frame chunk sampling, temporal aggregation over every chunk covering a frame, `speedup_labels/episode_<i>.npy` + the raw `entropy_<i>.npy` trace, `run_config.yaml`; `--batch_frames` (default 32) routes through `sample_frames` for families that implement it, and ACT keeps the one-frame-at-a-time path |
 | `methods/demospeedup/actuator.py` | `DemoSpeedupTrackingActuator`: constant gains+gripper ×low_v, time untouched (upstream's high-gain-XML recipe + arm gains); per-step re-application (reset-proof) |
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
 | `train/run_train.py` | upstream `lerobot-train` + `--method.*`: wraps `make_train_eval_datasets` (capture dataset, halve chunk) and `make_pre_post_processors` (insert method steps pre-normalizer); calls `train.__wrapped__` (subclass fails upstream's identity check) |
 | `eval/run_libero.py` | draccus eval runner, one task per output dir: method steps attached, actuator per method (PACE per-step / DemoSpeedup constant / none), env↔checkpoint ImageNet dedupe, IDENTITY-stats guard, sim-time recording, `run_config.yaml` |
+| `eval/run_offline.py` | open-loop A/B against the demonstrations themselves — the only score a real-robot checkpoint can get without a robot. Every arm is scored on the same frames in one pass (decoded once, handed to each policy in turn), so parity is by construction rather than by two runs agreeing on a seed. Two metric families: **own-target** error (each arm against the chunk it was trained to produce — `arm_target` rebuilds the speedup arm's stride walk, checked against `retime_tail`), which is a training loss and so is *not* comparable between arms; and **path deviation** (`point_to_polyline`), distance from each predicted waypoint to the demonstrated polyline over the raw frames that chunk spans — blind to sampling rate, and therefore the one number that means the same thing for a 50-step and a 100-step chunk. Headline stats are taken over frames where *every* arm has a complete chunk, since near the episode end each arm truncates differently and the rate collapses toward 1 |
 | `eval/pace_policy.py` | `attach_pace`: instance-level select_action/reset rebinding (upstream rejects wrapper objects), speed queue, applied-speed log |
 | `eval/sim_time.py` | `SimTimeRecorder` + vector-env re-arm (autoreset-safe per-episode sim durations) |
 | `real/` (repo root, **not** under `src/`) | deploy env: pixi manifest + lock pinning lerobot @ the shared SHA, crisp fork SHAs, numpy<2 override; site network scripts incl. the cv2 libjpeg preload |
@@ -99,25 +100,56 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   window in the runner remains possible but would be a LeRobot-native choice, not
   upstream parity. Caveat: the wider DP literature uses 2 frames, so this baseline is
   slightly weaker than a stock DP.
-- **Diffusion is verified but untrained.** Smoked 2026-08-29 on stack_cups: the
+- **Diffusion is training for the first time.** Smoked 2026-08-29 on stack_cups: the
   baseline config trains (278M params), an `n_obs_steps=1` proxy labels episode 0
   end-to-end through `run_label` (437 frames, 0.13 s/frame — the first time the
   diffusion sampler ran on a real checkpoint rather than in unit tests), and
   DemoSpeedup+diffusion trains with `pad_mode=hold`. `pad_mode=zero` is rejected at
   construction: Diffusion's `do_mask_loss_for_padding=False` would train the zero
   tail as real targets, so the ACT scripts' `pad_mode=zero` does not transfer.
-  No diffusion policy has been trained to completion on any dataset.
-- **No controlled cross-oracle comparison exists.** ACT is trained on stack_cups and
-  xVLA on LIBERO, so their precision fractions (79.6% / 84.1%, episode 0, `rule=mean`)
-  differ by dataset as much as by policy. Comparing oracles properly needs two
-  families trained on one dataset; nothing schedules that.
-- **xVLA labelling is ~28x slower per frame than ACT, and that now blocks LIBERO.**
-  Measured 2026-08-29 on `ds_libero10_base`: 0.88 s/frame vs ACT's 0.032 s/frame, so
-  a full `HuggingFaceVLA/libero` pass (1693 episodes, 273465 frames) is **~67 h**.
-  The cause is the tiling: Florence2 encodes all N rows instead of encoding once and
-  broadcasting its output. The fix is a ~5-line `forward_vlm` override on an
-  `XVLAModel` subclass (encode row 0, expand to N), which leaves upstream's flow-
-  matching loop untouched. Not done; profiling now justifies it.
+  `pickplace_diffusion_base` is the first diffusion run to go past a smoke test and
+  is in flight now (see below); no diffusion policy has yet reached a checkpoint at
+  its full step budget.
+- **The controlled cross-oracle comparison is now running, not yet available.**
+  ACT is trained on stack_cups and xVLA on LIBERO, so their precision fractions
+  (79.6% / 84.1%, episode 0, `rule=mean`) differ by dataset as much as by policy.
+  Comparing oracles properly needs two families trained on one dataset, which is
+  exactly what `run_demospeedup_pickplace.sh` schedules: the ACT half is done
+  (17.1% non-precision) and the diffusion half is training. Until its labelling
+  stage runs, no two oracles have been compared on one dataset.
+- **LIBERO's labels are the one stage still taken on trust from the fork.**
+  `data/labels/xvla_libero10_ee6d/speedup_labels` holds all 400 episodes
+  (`episode_<i>.npy` + `entropy_<i>.npy`), produced by the fork's stage-2 run;
+  `run_demospeedup_libero10.sh:32` consumes them via `--method.labels_path` behind a
+  `require` guard, and the completed LIBERO A/B rests on them. So nothing is blocked
+  operationally — every other LIBERO stage runs in this repo, and this one has its
+  input on disk. What is missing is the check that pace_bench's own `run_label`
+  reproduces them: the real pipeline has been end-to-end verified on stack_cups and
+  pickplace, never on LIBERO.
+- **Regenerating those labels is expensive, because xVLA still encodes per *sample*.**
+  Two wins were available and one has been taken. Taken (`b53798a`): `--batch_frames`
+  batches several *frames* into one policy call, and diffusion additionally got a
+  specialised path that encodes each frame once instead of once per sample — worth
+  ~6× in memory, which is what makes a wide frame batch fit. That took pickplace
+  diffusion labelling from 4.8 h at `--batch_frames=1` to **1.4 h** at 32, plateauing
+  past ~32 because the denoiser is latency- not throughput-bound. Not taken: xVLA
+  still lets Florence2 encode all N rows (`XVLAChunkSampler` inherits the generic
+  `sample_frames` and adds nothing). The fix remains a ~5-line `forward_vlm` override
+  on an `XVLAModel` subclass (encode row 0, expand to N), leaving upstream's
+  flow-matching loop untouched. At the measured 0.60 s/frame, re-deriving the 400
+  ee6d episodes (102033 frames) is ~17 h — an overnight job, not an interactive one,
+  which is why it keeps not happening. **xVLA's gain from `--batch_frames` alone has
+  not been measured** — that timing predates the flag — so how much the encoder
+  override would add on top is unquantified.
+- **The offline evaluator is not wired into any pipeline script.** `run_offline` was
+  run by hand for the pickplace ACT A/B; `run_demospeedup_pickplace.sh` ends at
+  training and labelling. Nothing regenerates `outputs/eval/pickplace_act` if the
+  checkpoints change, and the diffusion arms have no eval stage waiting for them.
+- **No closed-loop number exists for any real-robot arm.** There is no UR10e
+  simulator, so `run_offline` scores the opening chunk against the demonstration and
+  nothing scores what happens after the robot acts on it. Path deviation is a real
+  measurement of a real quantity, but it is not a success rate, and the A/B's
+  conclusion is about trajectory fidelity, not about task completion.
 - **Fake-mode dataset diff** — deploy-day gate on the lab machine, where the
   baseline env exists (user decision 2026-08-28).
 - **Real-inference gripper postprocessors** — PACE: speed=1 during gripper motion;
@@ -126,19 +158,44 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **Batch 2's 3-seed PACE gate** — parked; upstream xVLA has a known ~10pp task-1
   deficit vs the fork that would confound absolute-SR comparison.
 
-## Experiments state (2026-08-29 ~17:00, all runs STOPPED by user)
+## Experiments state (2026-08-30 ~12:40; diffusion baseline RUNNING)
 
 - **LIBERO A/B (xVLA)**: complete. Baseline 92.0% SR / 13.28 s vs DemoSpeedup
   86.5% / 6.99 s = 1.90× at −5.5 pp; task 2 (−30 pp) is the known speed-intolerant
   task. `outputs/eval/ds_libero10_*`.
+- **pickplace ACT A/B: complete, and it is the project's first real-robot result.**
+  Both arms trained to 100k × 32 in bf16 (`pickplace_act_base` finished 05:27,
+  `pickplace_act_speedup` 11:44), labels from the ACT baseline's own checkpoint
+  (45 episodes, 31178 frames, **17.1% non-precision**, mean fast-run 11.97 frames vs
+  1.21 if random — real signal, same shape as cups). Scored open-loop by
+  `run_offline` over all 45 episodes at stride 1, 26359 of 31178 frames having a
+  complete chunk in both arms:
+
+  | arm | own-target | rot | path deviation | max dev | demo rate |
+  |---|---|---|---|---|---|
+  | baseline (chunk 100) | 9.7 mm | 1.41° | **6.26 mm** | 15.2 mm | 1.00× |
+  | demospeedup (chunk 50) | 10.8 mm | 1.51° | **6.72 mm** | 16.5 mm | **2.16×** |
+
+  Read it as: retiming buys 2.16× at +0.46 mm (+7%) of mean path deviation. The
+  own-target columns are each arm's own training loss and are *not* comparable
+  across arms — the speedup arm's waypoints are ~2× further apart, so equal relative
+  accuracy shows up as a larger number. `outputs/eval/pickplace_act/summary.json`,
+  per-frame tables in `*_frames.npz`.
+- **pickplace diffusion: baseline in flight.** `pickplace_diffusion_base`
+  (`--policy.n_obs_steps=1`, bf16, 100k × 32) started ~11:45, at ~19k/100k as of
+  12:38, 6.5 step/s, ETA ~16:10. The script then labels from it (`pickplace_dp`) and
+  trains `pickplace_diffusion_speedup`, completing the 2×2 and with it the
+  cross-oracle comparison. Nothing evaluates those arms yet — see gaps.
 - **stack_cups**: ACT baseline ✅ (`outputs/train/cups_act_base`, 30k), labels ✅
-  (12/12, 18.4% non-precision, run-length 13.9 vs 1.23 random — real signal),
-  DemoSpeedup ACT ❌ not trained (crashed pre-fix, stale dir),
-  Diffusion baseline ❌ not trained. Resume: `./run_demospeedup_stackcups.sh`
-  (skip-guards resume at first unfinished stage).
-- **pickplace**: nothing trained; `./run_demospeedup_pickplace.sh` runs the full
-  fresh-baseline chain (baseline 100k → label → speedup 100k). The Yunfei oracle
-  is deliberately NOT used (user decision 2026-08-29).
+  (12/12, 18.4% non-precision, run-length 13.9 vs 1.23 random), Diffusion baseline
+  ❌ not trained. **DemoSpeedup ACT ❌ still not trained**: the 2026-08-29 23:36
+  attempt died with a CUDA OOM (`logs/cups_act_speedup.log`) — 23.5 GB card, another
+  process holding 14.2 GB, so it is a scheduling collision, not a config fault.
+  `outputs/train/cups_act_speedup/` exists with no checkpoint, so the script's
+  skip-guard will correctly retry it. Resume: `./run_demospeedup_stackcups.sh`, but
+  not while pickplace has the card.
+
+Runtimes for every stage above are tabulated in the README (`## Runtimes`).
 
 ## Conventions that bit us (do not relearn)
 
@@ -168,6 +225,21 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   in the argument parser with a bare `TypeError: must be called with a dataclass`.
 - `logging.basicConfig` is a no-op once lerobot's import has installed a root
   handler — pass `force=True` or the run prints no progress at all.
+- An equivalence test between two batch widths cannot assert bit-equality. The
+  diffusion encoder-dedup test asserted `atol=1e-6` and failed 3 of 8 full-suite runs
+  on arithmetic noise alone (measured gap 1e-6 to 3e-5): float32 conv/GEMM results
+  depend on batch width, and a denoising loop amplifies that. Size such a tolerance
+  from the defect being caught, not from zero — a swapped frame/sample axis moves
+  whole actions, so 1e-4 catches it and noise does not trip it. Verified by mutation:
+  tiling instead of interleaving still fails at the looser tolerance.
+- A heredoc binds to the *last* command of a pipeline. `"$PY" - ... | tee log <<'EOF'`
+  feeds the script to `tee`, which echoes it, while python reads the real stdin
+  (`/dev/null` under nohup), sees EOF and runs nothing — silently, if the check
+  gates no exit. Put the `<<'EOF'` on the command that must read it. Cost us the
+  pickplace label-signal check, whose log holds its own source instead of an answer.
+- Background helpers must run under `$PY`, not `python3`: this box's `python3` is
+  3.8 and the checkpoint pruner annotates with PEP 585 generics. Backgrounded, its
+  `ImportError` surfaces nowhere and the first symptom is a full disk hours later.
 - Batch shape cannot be inferred by counting dimensions: a batched camera image and
   an unbatched action chunk are both 3-D. Reshape against the policy config's
   declared feature shapes, the same way chunk fields come from
