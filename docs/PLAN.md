@@ -23,7 +23,7 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ⏳ not started |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/pace_bench/`, 259 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 245 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -49,7 +49,6 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
 | `train/run_train.py` | upstream `lerobot-train` + `--method.*`: wraps `make_train_eval_datasets` (capture dataset, halve chunk) and `make_pre_post_processors` (insert method steps pre-normalizer); calls `train.__wrapped__` (subclass fails upstream's identity check) |
 | `eval/run_libero.py` | draccus eval runner, one task per output dir: method steps attached, actuator per method (PACE per-step / DemoSpeedup constant / none), env↔checkpoint ImageNet dedupe, IDENTITY-stats guard, sim-time recording, `run_config.yaml` |
-| `eval/run_offline.py` | open-loop A/B against the demonstrations themselves — the only score a real-robot checkpoint can get without a robot. Every arm is scored on the same frames in one pass (decoded once, handed to each policy in turn), so parity is by construction rather than by two runs agreeing on a seed. Two metric families: **own-target** error (each arm against the chunk it was trained to produce — `arm_target` rebuilds the speedup arm's stride walk, checked against `retime_tail`), which is a training loss and so is *not* comparable between arms; and **path deviation** (`point_to_polyline`), distance from each predicted waypoint to the demonstrated polyline over the raw frames that chunk spans — blind to sampling rate, and therefore the one number that means the same thing for a 50-step and a 100-step chunk. Headline stats are taken over frames where *every* arm has a complete chunk, since near the episode end each arm truncates differently and the rate collapses toward 1 |
 | `eval/pace_policy.py` | `attach_pace`: instance-level select_action/reset rebinding (upstream rejects wrapper objects), speed queue, applied-speed log |
 | `eval/sim_time.py` | `SimTimeRecorder` + vector-env re-arm (autoreset-safe per-episode sim durations) |
 | `real/` (repo root, **not** under `src/`) | deploy env: pixi manifest + lock pinning lerobot @ the shared SHA, crisp fork SHAs, numpy<2 override; site network scripts incl. the cv2 libjpeg preload |
@@ -141,15 +140,19 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   which is why it keeps not happening. **xVLA's gain from `--batch_frames` alone has
   not been measured** — that timing predates the flag — so how much the encoder
   override would add on top is unquantified.
-- **The offline evaluator is not wired into any pipeline script.** `run_offline` was
-  run by hand for the pickplace ACT A/B; `run_demospeedup_pickplace.sh` ends at
-  training and labelling. Nothing regenerates `outputs/eval/pickplace_act` if the
-  checkpoints change, and the diffusion arms have no eval stage waiting for them.
-- **No closed-loop number exists for any real-robot arm.** There is no UR10e
-  simulator, so `run_offline` scores the opening chunk against the demonstration and
-  nothing scores what happens after the robot acts on it. Path deviation is a real
-  measurement of a real quantity, but it is not a success rate, and the A/B's
-  conclusion is about trajectory fidelity, not about task completion.
+- **No real-robot arm has a number, and the offline substitute was rejected**
+  (user decision 2026-08-30). There is no UR10e simulator, so the real arms cannot be
+  scored without the robot. An open-loop evaluator was built and then dropped
+  (`eval/run_offline.py`, `tests/test_offline_eval.py`, deleted; results left in
+  `outputs/eval/pickplace_act/`, which is gitignored): it scored each policy's
+  predicted chunk against the demonstrations, and every one of those demonstrations
+  was in that policy's training set. With no held-out split it largely measures how
+  well each arm memorised its own targets, so it cannot separate a policy that
+  generalises from one that overfits — and "path deviation" reads as a
+  trajectory-fidelity claim that the construction does not support. Neither does it
+  say anything about the thing the benchmark is for: whether the task succeeds when
+  the robot runs faster. **Do not rebuild it.** The real-arm question stays open until
+  the UR10e runs both arms and success rates are counted; that is deploy-day work.
 - **Fake-mode dataset diff** — deploy-day gate on the lab machine, where the
   baseline env exists (user decision 2026-08-28).
 - **Real-inference gripper postprocessors** — PACE: speed=1 during gripper motion;
@@ -163,24 +166,15 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **LIBERO A/B (xVLA)**: complete. Baseline 92.0% SR / 13.28 s vs DemoSpeedup
   86.5% / 6.99 s = 1.90× at −5.5 pp; task 2 (−30 pp) is the known speed-intolerant
   task. `outputs/eval/ds_libero10_*`.
-- **pickplace ACT A/B: complete, and it is the project's first real-robot result.**
-  Both arms trained to 100k × 32 in bf16 (`pickplace_act_base` finished 05:27,
-  `pickplace_act_speedup` 11:44), labels from the ACT baseline's own checkpoint
-  (45 episodes, 31178 frames, **17.1% non-precision**, mean fast-run 11.97 frames vs
-  1.21 if random — real signal, same shape as cups). Scored open-loop by
-  `run_offline` over all 45 episodes at stride 1, 26359 of 31178 frames having a
-  complete chunk in both arms:
-
-  | arm | own-target | rot | path deviation | max dev | demo rate |
-  |---|---|---|---|---|---|
-  | baseline (chunk 100) | 9.7 mm | 1.41° | **6.26 mm** | 15.2 mm | 1.00× |
-  | demospeedup (chunk 50) | 10.8 mm | 1.51° | **6.72 mm** | 16.5 mm | **2.16×** |
-
-  Read it as: retiming buys 2.16× at +0.46 mm (+7%) of mean path deviation. The
-  own-target columns are each arm's own training loss and are *not* comparable
-  across arms — the speedup arm's waypoints are ~2× further apart, so equal relative
-  accuracy shows up as a larger number. `outputs/eval/pickplace_act/summary.json`,
-  per-frame tables in `*_frames.npz`.
+- **pickplace ACT: both arms trained, neither evaluated.** 100k × 32 in bf16
+  (`pickplace_act_base` finished 05:27, `pickplace_act_speedup` 11:44), labels from
+  the ACT baseline's own checkpoint (45 episodes, 31178 frames, **17.1%
+  non-precision**, mean fast-run 11.97 frames vs 1.21 if random — real signal, same
+  shape as cups). The retiming reaches ~2.16 raw frames per executed step, which is
+  what the labels imply and is a property of the labels, not a result. There is no
+  score for either arm: the offline evaluator that produced one was rejected as
+  unprincipled (see gaps), and the honest statement is that these checkpoints are
+  waiting on the robot.
 - **pickplace diffusion: baseline in flight.** `pickplace_diffusion_base`
   (`--policy.n_obs_steps=1`, bf16, 100k × 32) started ~11:45, at ~19k/100k as of
   12:38, 6.5 step/s, ETA ~16:10. The script then labels from it (`pickplace_dp`) and
