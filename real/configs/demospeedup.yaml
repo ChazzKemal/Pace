@@ -1,0 +1,10 @@
+# A demospeedup arm. low_v is read from the checkpoint's built pipeline unless
+# overridden here, so it cannot drift from what the weights were trained against.
+method:
+  type: demospeedup
+  low_v: 2
+  high_v: 4
+env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec
+fps: 20.0
+gripper:
+  slowdown_frames: 5

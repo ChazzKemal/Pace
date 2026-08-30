@@ -1,0 +1,7 @@
+# No method: bit-identical to the pre-method deploy path.
+method:
+  type: none
+env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec
+fps: 20.0
+gripper:
+  slowdown_frames: 5

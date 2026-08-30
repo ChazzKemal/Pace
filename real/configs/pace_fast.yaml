@@ -1,0 +1,12 @@
+# PACE is an eval-time choice: nothing in a checkpoint selects it, so every knob is
+# stated here. Applies to any checkpoint, baseline ones included.
+method:
+  type: pace
+  max_speed: 2.0
+  min_speed: 1.0
+  clamp_deg: 5.0
+  n_lookahead: 2
+env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec
+fps: 20.0
+gripper:
+  slowdown_frames: 5

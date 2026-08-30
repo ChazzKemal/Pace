@@ -88,8 +88,8 @@ dependency-overrides = { numpy = ">=1.26,<2" }
 # The lab's crisp state, pinned by SHA on the `robot-stack-pin` branches -- diverged
 # dependencies handled exactly like the robosuite fork in the sim environment:
 # referenced, never vendored. The branch commits document the delta vs upstream.
-crisp_gym = { git = "https://github.com/ChazzKemal/crisp_gym", rev = "45dbb0664a32796bba39b32df5d71a28b4450e9e" }
-crisp_python = { git = "https://github.com/ChazzKemal/crisp_py", rev = "47b3d23cfa465911f7aea3bc18868e74eb69d85c" }
+crisp_gym = { git = "https://github.com/ChazzKemal/crisp_gym", rev = "5d98e22cad33107f68afbbf4f501582b66d39afd" }
+crisp_python = { git = "https://github.com/ChazzKemal/crisp_py", rev = "ab281ef800427c2bbc55593dd14501884c6a823d" }
 
 # (crisp_gym's `configure` task lives with its checkout; deploy entry scripts --
 # examples/17_replay_dataset.py, 19_deploy_policy.py -- run from a clone of the
