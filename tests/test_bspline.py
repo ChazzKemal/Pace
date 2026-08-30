@@ -258,3 +258,41 @@ class TestPaddedChunkEndpoint:
             np.linspace(knots[DEGREE], knots[-(DEGREE + 1)], 9)
         )
         np.testing.assert_allclose(decode_chunk(parameters, 9), raw, atol=1e-9)
+
+
+class TestMonotonicKnots:
+    """A predicted knot vector need not be ordered; a B-spline requires it to be.
+
+    Upstream applies this at deployment (`safer_knots`). Nothing in any of the losses
+    constrains the order -- the network emits N numbers and their ordering is
+    something it has to learn -- so decoding has to tolerate a violation rather than
+    raise or return nonsense.
+    """
+
+    def test_an_ordered_vector_is_untouched(self, path):
+        from pace_bench.methods.bspline import monotonic_knots
+
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        for parameters in chunk_parameters(spline, CHUNK, stride=1)[:5]:
+            np.testing.assert_array_equal(monotonic_knots(parameters[:, 0]), parameters[:, 0])
+
+    def test_violations_are_nudged_not_sorted(self):
+        """A sort would move control points relative to their knots, changing which
+        part of the trajectory each one governs. A nudge keeps them in place."""
+        from pace_bench.methods.bspline import monotonic_knots
+
+        fixed = monotonic_knots(np.array([0.0, 5.0, 3.0, 9.0]))
+        assert (np.diff(fixed) >= 0).all()
+        np.testing.assert_allclose(fixed[:2], [0.0, 5.0])
+        assert fixed[2] == pytest.approx(5.0, abs=1e-5)  # nudged up to its predecessor
+        np.testing.assert_allclose(fixed[3], 9.0)
+
+    def test_a_scrambled_prediction_still_decodes(self, path):
+        """The failure this prevents: scipy refusing, or silently returning nonsense,
+        on a chunk the policy predicted slightly out of order."""
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        parameters = chunk_parameters(spline, CHUNK, stride=1)[2].copy()
+        parameters[6, 0], parameters[7, 0] = parameters[7, 0], parameters[6, 0]  # swap
+        decoded = decode_chunk(parameters, 12)
+        assert np.isfinite(decoded).all()
+        assert decoded.shape == (12, path.shape[1])

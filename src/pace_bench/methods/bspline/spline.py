@@ -218,6 +218,26 @@ def decode_relative_knots(parameters: np.ndarray, degree: int = DEGREE) -> np.nd
     return result
 
 
+def monotonic_knots(knots: np.ndarray, epsilon: float = 1e-6) -> np.ndarray:
+    """Force a knot vector to be non-decreasing, nudging each violation upwards.
+
+    Upstream's `safer_knots`, applied at deployment in both of its policy scripts.
+    It is needed because nothing in the loss constrains a predicted knot column to be
+    ordered -- the network emits 16 numbers and their order is a property it has to
+    learn -- while a B-spline is undefined on an unordered knot vector.
+
+    Deliberately a nudge rather than a sort: a sort would silently reorder the curve's
+    control points relative to its knots, changing which part of the trajectory each
+    control point governs. Nudging keeps every control point where it was and only
+    collapses the offending span to zero length.
+    """
+    knots = np.asarray(knots, dtype=np.float64).copy()
+    for index in range(1, len(knots)):
+        if knots[index] < knots[index - 1]:
+            knots[index] = knots[index - 1] + epsilon
+    return knots
+
+
 def decode_chunk(
     parameters: np.ndarray,
     num_actions: int,
@@ -234,7 +254,13 @@ def decode_chunk(
     parameters = np.asarray(parameters, dtype=np.float64)
     if relative_knots:
         parameters = decode_relative_knots(parameters, degree=degree)
-    knots = parameters[:, 0]
+    # A knot vector must be non-decreasing. Nothing constrains a *predicted* one to
+    # be, and scipy will either refuse it or return nonsense -- so violations are
+    # nudged, which is what upstream does at deployment (`safer_knots`, in both its
+    # policy scripts). A no-op on any knot vector that came from a real fit.
+    knots = monotonic_knots(parameters[:, 0])
+    parameters = parameters.copy()
+    parameters[:, 0] = knots
     control_points = parameters[: -(degree + 1), 1:]
     start, end = knots[degree], knots[-(degree + 1)]
     if not end > start:

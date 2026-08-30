@@ -13,6 +13,7 @@ from pace_bench.methods.bspline.spline import (
     episode_parameter_chunks,
     fit_episode,
     from_spline_actions,
+    monotonic_knots,
     to_spline_actions,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "episode_parameter_chunks",
     "fit_episode",
     "from_spline_actions",
+    "monotonic_knots",
     "to_spline_actions",
 ]
