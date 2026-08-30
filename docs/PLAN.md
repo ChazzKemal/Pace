@@ -115,13 +115,13 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   `pickplace_diffusion_base` is the first diffusion run to go past a smoke test and
   is in flight now (see below); no diffusion policy has yet reached a checkpoint at
   its full step budget.
-- **The controlled cross-oracle comparison is now running, not yet available.**
-  ACT is trained on stack_cups and xVLA on LIBERO, so their precision fractions
-  (79.6% / 84.1%, episode 0, `rule=mean`) differ by dataset as much as by policy.
-  Comparing oracles properly needs two families trained on one dataset, which is
-  exactly what `run_demospeedup_pickplace.sh` schedules: the ACT half is done
-  (17.1% non-precision) and the diffusion half is training. Until its labelling
-  stage runs, no two oracles have been compared on one dataset.
+- **The controlled cross-oracle comparison exists** (2026-08-30). Both halves of the
+  pickplace 2x2 are labelled from their own family on the *same* 45 episodes: ACT
+  17.1% non-precision, Diffusion 14.7%. That replaces the earlier 79.6% / 84.1%
+  figures, which compared ACT-on-stack_cups against xVLA-on-LIBERO and so differed by
+  dataset as much as by policy. What is still missing is what the difference *means*:
+  neither arm is evaluated, so a 2.4 pp gap in how much of a demonstration each oracle
+  calls non-precision has no success rate attached to it.
 - **LIBERO's labels are the one stage still taken on trust from the fork.**
   `data/labels/xvla_libero10_ee6d/speedup_labels` holds all 400 episodes
   (`episode_<i>.npy` + `entropy_<i>.npy`), produced by the fork's stage-2 run;
@@ -324,25 +324,36 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **Batch 2's 3-seed PACE gate** — parked; upstream xVLA has a known ~10pp task-1
   deficit vs the fork that would confound absolute-SR comparison.
 
-## Experiments state (2026-08-30 ~12:40; diffusion baseline RUNNING)
+## Experiments state (2026-08-30 23:30; pickplace 2x2 complete, GPU idle)
 
 - **LIBERO A/B (xVLA)**: complete. Baseline 92.0% SR / 13.28 s vs DemoSpeedup
   86.5% / 6.99 s = 1.90× at −5.5 pp; task 2 (−30 pp) is the known speed-intolerant
   task. `outputs/eval/ds_libero10_*`.
-- **pickplace ACT: both arms trained, neither evaluated.** 100k × 32 in bf16
-  (`pickplace_act_base` finished 05:27, `pickplace_act_speedup` 11:44), labels from
-  the ACT baseline's own checkpoint (45 episodes, 31178 frames, **17.1%
-  non-precision**, mean fast-run 11.97 frames vs 1.21 if random — real signal, same
-  shape as cups). The retiming reaches ~2.16 raw frames per executed step, which is
-  what the labels imply and is a property of the labels, not a result. There is no
-  score for either arm: the offline evaluator that produced one was rejected as
-  unprincipled (see gaps), and the honest statement is that these checkpoints are
-  waiting on the robot.
-- **pickplace diffusion: baseline in flight.** `pickplace_diffusion_base`
-  (`--policy.n_obs_steps=1`, bf16, 100k × 32) started ~11:45, at ~19k/100k as of
-  12:38, 6.5 step/s, ETA ~16:10. The script then labels from it (`pickplace_dp`) and
-  trains `pickplace_diffusion_speedup`, completing the 2×2 and with it the
-  cross-oracle comparison. Nothing evaluates those arms yet — see gaps.
+- **pickplace 2x2: COMPLETE** (2026-08-30 23:27). All four arms trained to
+  100k x 32 in bf16 on `pickplace_cart7_v2_angleaxis_nogrip`, each labelled by its
+  own policy family, per the parity rule:
+
+  | arm | oracle | non-precision | state |
+  |---|---|---|---|
+  | `pickplace_act_base` | — | — | ✅ 100k |
+  | `pickplace_act_speedup` | ACT (its own baseline) | **17.1%** | ✅ 100k |
+  | `pickplace_diffusion_base` | — | — | ✅ 100k |
+  | `pickplace_diffusion_speedup` | Diffusion (`n_obs_steps=1`) | **14.7%** | ✅ 100k |
+
+  ACT labels: mean fast-run 11.97 frames against 1.21 if random — real signal.
+  Diffusion `pad_mode=hold` throughout, horizon halved 64→32 and n_action_steps
+  32→16. Final speedup-arm loss 0.003.
+  **This is the first controlled cross-oracle comparison in the project**: two policy
+  families labelling the *same* dataset, so 17.1% vs 14.7% differs by oracle and not
+  by task — the confound that made the earlier 79.6% / 84.1% figures uninterpretable.
+  **Nothing is evaluated.** These are real-robot arms and there is no evaluator: no
+  UR10e simulator, and the offline substitute was rejected. All four wait on the
+  robot.
+  One transient failure worth remembering: the first attempt at
+  `pickplace_diffusion_speedup` segfaulted before its first step (17:33, kernel
+  reported an instruction pointer on the stack — native-extension memory corruption,
+  not an OOM; 62 GB RAM with 53 free). It did not reproduce: a 5-step rerun was clean
+  and the full 100k then ran without incident.
 - **stack_cups**: ACT baseline ✅ (`outputs/train/cups_act_base`, 30k), labels ✅
   (12/12, 18.4% non-precision, run-length 13.9 vs 1.23 random), Diffusion baseline
   ❌ not trained. **DemoSpeedup ACT ❌ still not trained**: the 2026-08-29 23:36
