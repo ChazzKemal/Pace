@@ -169,6 +169,26 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   and the arrangement/action-space pair for xVLA below. ACT's
   `actions.sum(-1) == 0` pad heuristic is moot -- a B-spline chunk is fixed-size by
   construction and the step masks nothing.
+- **B-spline on xVLA reuses the pretrained head; nothing is trained from scratch.**
+  The action vector stays 20 wide, so `action_encoder` / `action_decoder` load
+  unchanged. Only the *meaning* of the columns moves: slots 0-9 keep xyz / rot6d /
+  gripper exactly (the arrangement puts the control point there, so the pretrained
+  head is already right for 10 of the 11 meaningful channels), slot 10 changes from
+  "arm-2 x" to "knot in seconds", and 11-19 stay zero. On `libero_10_ee6d` slot 10 is
+  identically zero in every frame — single-arm data padded to 20 — so the head had
+  learned to emit a constant there and we are writing signal into it. The capacity to
+  relearn comes from `full_training_modules`: `soft_prompt_hub`, `action_encoder` and
+  `action_decoder` are `DomainAwareLinear` (`nn.Embedding` tables) that LoRA cannot
+  target and are therefore fully fine-tuned, while LoRA adapts the trunk.
+  **Not taken:** `num_domains=30` and `domain_id` defaults to 0, so 29 head rows are
+  free and a B-spline arm could have its own. That keeps domain 0's ee6d head intact
+  but starts from a xavier-random row, discarding a head already correct for 10 of 11
+  channels — worth it only if one checkpoint must serve both a baseline and a
+  B-spline arm, which is not how the arms are trained.
+  **Untested:** whether the head actually learns the knot channel. 300 steps at batch
+  2 (0.6% of an epoch, still in LR warmup) left `knot_loss / KNOT_SCALE` at ~1.34 MSE
+  against a target variance of ~0.94 — no better than predicting the mean knot. That
+  is the first thing a real run has to show.
 - **xVLA needed a second construction, and one number in it is a guess.** xVLA reads
   its action vector *structurally* -- `POS_IDX_1 = (0,1,2)`, `ROT_IDX_1 = (3..8)`,
   gripper at 9 and 19, with per-group scales -- so upstream's knot-first matrix trains
