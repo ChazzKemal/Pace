@@ -169,6 +169,28 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   and the arrangement/action-space pair for xVLA below. ACT's
   `actions.sum(-1) == 0` pad heuristic is moot -- a B-spline chunk is fixed-size by
   construction and the step masks nothing.
+- **A B-spline xVLA arm is NOT comparable to the PACE and DemoSpeedup xVLA arms**
+  (raised by the user 2026-08-30; decision pending). Every LIBERO arm starts from a
+  checkpoint pretrained on *dense action chunks*, and the three methods ask different
+  amounts of that checkpoint. PACE does not touch training targets at all. DemoSpeedup
+  keeps the action space exactly -- slot k still means "ee6d pose at step k", only
+  which demonstration frames fill the slots changes -- so its head starts aligned.
+  B-spline reinterprets the tokens: the chunk axis stops indexing timesteps and starts
+  indexing control points, and a channel that was always zero becomes a time. The same
+  20k LoRA steps therefore buy the three arms different things, and a worse B-spline
+  number would be unattributable between "the representation is worse" and "20k steps
+  was not enough to repurpose a pretrained action head". Two mitigations: the
+  reinterpretation is not arbitrary (control point k is roughly where the arm is
+  around the k-th knot, and channels 0-9 keep their exact meaning), and the paper
+  never makes this claim -- it validates B-spline on Diffusion Policy and ACT, both
+  from scratch, so a pretrained VLA is our extrapolation. Options, ranked:
+  (1) make the **real-robot** comparison the headline, where ACT and Diffusion train
+  from scratch and no pretraining asymmetry exists, and report LIBERO B-spline
+  separately if at all; (2) equalise the handicap by reinitialising
+  `action_encoder`/`action_decoder` for *every* LIBERO arm, so all three start from a
+  pretrained trunk plus a fresh head -- a small change, since those modules are
+  already in `full_training_modules`, and it costs the baseline absolute SR in
+  exchange for comparability; (3) drop B-spline from the LIBERO axis entirely.
 - **B-spline on xVLA reuses the pretrained head; nothing is trained from scratch.**
   The action vector stays 20 wide, so `action_encoder` / `action_decoder` load
   unchanged. Only the *meaning* of the columns moves: slots 0-9 keep xyz / rot6d /
