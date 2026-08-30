@@ -157,19 +157,43 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **B-spline is ported but not yet a benchmark arm.** The maths is in and the
   reconstruction gate is met, but B-spline is a deeper integration than PACE or
   DemoSpeedup, both of which only reindex actions and leave the action space alone.
-  This one *replaces* it: the policy regresses a `(26, 11)` parameter matrix — a knot
-  column in frames beside control points in action units — and inference has to
-  decode before anything can be executed. Four things follow, none of them done:
+  This one *replaces* it: the policy regresses a `(chunk + 2*degree, 1 + dim)`
+  parameter matrix — a knot column in frames beside control points in action units —
+  and inference has to decode before anything can be executed. Open:
   (a) `adjust_policy` currently only halves a chunk; here it must rewrite the action
-  feature's shape *and* width, and the raw 7-dim cart7 space becomes the 10-dim
-  spline space; (b) ACT rebuilds its pad mask as `actions.sum(-1) == 0`, which is
-  meaningless against a parameter matrix, so `pad_mode` needs deciding for this arm
-  the way it was for diffusion; (c) normalisation — upstream takes per-element stats
-  over the whole matrix, which LeRobot's per-dim normaliser reproduces exactly *if*
-  the matrix is flattened to 286, and that is also how the recorded dataset stores
-  it; (d) a decode step at inference, plus the `num_actions` choice that is the whole
-  speed lever. Upstream is diffusion-only, so B-spline on ACT (batch 7) and on xVLA
-  (batch 8) are our constructions, not ports.
+  feature's shape *and* width; (b) ACT rebuilds its pad mask as
+  `actions.sum(-1) == 0`, meaningless against a parameter matrix, so `pad_mode` needs
+  deciding for this arm the way it was for diffusion; (c) normalisation — upstream
+  takes per-element stats over the whole matrix, which LeRobot's per-dim normaliser
+  reproduces exactly *if* the matrix is flattened, and that is also how the recorded
+  dataset stores it; (d) a decode step at inference, carrying the `num_actions`
+  choice that is the whole speed lever. Upstream is diffusion-only, so B-spline on
+  ACT (batch 7) and on xVLA (batch 8) are our constructions, not ports.
+- **B-spline needs no labelling stage** (user decision 2026-08-30). Its labels are
+  the fitted spline parameters, not anything the dataset carries — but unlike
+  DemoSpeedup's, they need no policy to produce, only geometry, so they are cheap
+  enough to build in the preprocessor at training time. Measured full passes:
+  **libero_10_ee6d 3.1 s** (400 eps, 102033 frames, 0.03 ms/frame) and
+  **pickplace 50.3 s** (45 eps, 31178 frames, 1.61 ms/frame), zero episodes missing
+  `max_error=0.01`. Against 1.9 h and 5.9 h of training that is free. So: no
+  `run_label` stage, no labels on disk (117 MB and 36 MB not written), and no
+  possibility of the labels-do-not-match-this-dataset class of bug that the
+  DemoSpeedup path has to guard against — the fit parameters live in the method
+  config and cannot drift from the run. Upstream caches to npz
+  (`make_bspline_sampler_cache_path`) because it hashes the settings; at these
+  timings a cache would cost more than it saves. Fit once at startup, the way
+  `config.py` already preloads episode action tables, and keep the per-episode
+  chunks plus a frame→chunk index rather than a matrix per frame (~12 MB for
+  pickplace instead of 36 MB, and it is what upstream's `all_actions` /
+  `timestep_to_chunk` pair does).
+- **The interpolable action layout is per dataset, not per method.** `to_spline_actions`
+  converts cart7 (xyz + angle-axis + gripper) to xyz + rot6d + gripper because
+  angle-axis cannot be interpolated across the pi wrap. But `libero_10_ee6d` is
+  *already* xyz + rot6d + gripper in its first 10 dims, followed by 10 zero-pad dims
+  that must be dropped before fitting and restored after decoding; a joint-space
+  dataset would need no conversion at all. So the layout is a dataset-level config
+  choice that every B-spline arm has to name, and getting it wrong is silent — a
+  transposed rotation still fits, still decodes, and is still wrong.
 - **Fake-mode dataset diff** — deploy-day gate on the lab machine, where the
   baseline env exists (user decision 2026-08-28).
 - **Real-inference gripper postprocessors** — PACE: speed=1 during gripper motion;
