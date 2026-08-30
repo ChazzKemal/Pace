@@ -167,3 +167,55 @@ class TestEpisodeChunks:
         assert len(chunks) == len(short)
         assert np.isfinite(chunks).all()
         assert (chunks[:, :, 1:] != 0).any(axis=(1, 2)).all()  # no frame left unfilled
+
+
+class TestRelativeKnots:
+    """The knot column as differences rather than absolute positions.
+
+    Why it exists: absolute knots are mostly determined by *which row* they are --
+    on the UR10e the column averages -7.7 at row 0 and +50.9 at row 25 -- so the one
+    per-column statistic LeRobot's normaliser computes leaves a deterministic ramp in
+    the target. Differences are stationary across rows, which is what makes per-column
+    normalisation appropriate and saves the step from owning normalisation itself.
+    """
+
+    def test_matches_upstream_both_ways(self, path):
+        from upstream_reference_bspline import (
+            decode_relative_knots as upstream_decode,
+        )
+        from upstream_reference_bspline import (
+            encode_relative_knots as upstream_encode,
+        )
+
+        from pace_bench.methods.bspline import decode_relative_knots, encode_relative_knots
+
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        parameters = chunk_parameters(spline, CHUNK, stride=1)[3]
+
+        np.testing.assert_allclose(
+            encode_relative_knots(parameters), upstream_encode(parameters.copy(), degree=DEGREE)
+        )
+        encoded = encode_relative_knots(parameters)
+        np.testing.assert_allclose(
+            decode_relative_knots(encoded), upstream_decode(encoded.copy(), degree=DEGREE)
+        )
+
+    def test_round_trip_recovers_the_absolute_knots(self, path):
+        from pace_bench.methods.bspline import decode_relative_knots, encode_relative_knots
+
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        for parameters in chunk_parameters(spline, CHUNK, stride=1)[:5]:
+            recovered = decode_relative_knots(encode_relative_knots(parameters))
+            np.testing.assert_allclose(recovered, parameters, atol=1e-12)
+
+    def test_decode_chunk_accepts_the_encoded_form(self, path):
+        """The curve is the same curve; only the storage of the knots changed."""
+        from pace_bench.methods.bspline import encode_relative_knots
+
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        parameters = chunk_parameters(spline, CHUNK, stride=1)[2]
+        np.testing.assert_allclose(
+            decode_chunk(encode_relative_knots(parameters), 20, relative_knots=True),
+            decode_chunk(parameters, 20),
+            atol=1e-9,
+        )

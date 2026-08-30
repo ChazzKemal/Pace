@@ -182,8 +182,47 @@ def episode_parameter_chunks(
     return assign_chunks_to_frames(chunks, len(actions), degree=degree), converged
 
 
+def encode_relative_knots(parameters: np.ndarray, degree: int = DEGREE) -> np.ndarray:
+    """Rewrite the knot column as first-valid-knot plus consecutive differences.
+
+    Absolute knots are a poor regression target because their value is mostly
+    decided by *which row* they are: on the UR10e the knot column averages -7.7 at
+    row 0 and +50.9 at row 25, so a single per-column normalisation statistic --
+    which is all LeRobot's normaliser computes -- leaves a deterministic ramp of
+    about 2.9 normalised units in the target, with the real per-sample signal only
+    0.44 of a unit on top of it. Differences are stationary across rows (row means
+    1.16 / 2.27 / 1.96), which puts the knot column on the same footing as the
+    control points and makes per-column normalisation the right thing.
+
+    Slot 0 holds the first *valid* knot (index ``degree``) so the absolute position
+    of the span survives; every later slot holds a step. Inverse of
+    :func:`decode_relative_knots`.
+    """
+    result = np.array(parameters, dtype=np.float64, copy=True)
+    original = result[..., 0].copy()
+    result[..., 0, 0] = original[..., degree]
+    result[..., 1:, 0] = original[..., 1:] - original[..., :-1]
+    return result
+
+
+def decode_relative_knots(parameters: np.ndarray, degree: int = DEGREE) -> np.ndarray:
+    """Invert :func:`encode_relative_knots`, rebuilding absolute knots."""
+    result = np.array(parameters, dtype=np.float64, copy=True)
+    encoded = result[..., 0].copy()
+    knots = result[..., 0]
+    knots[..., degree] = encoded[..., 0]
+    for index in range(degree - 1, -1, -1):
+        knots[..., index] = knots[..., index + 1] - encoded[..., index + 1]
+    for index in range(degree + 1, knots.shape[-1]):
+        knots[..., index] = knots[..., index - 1] + encoded[..., index]
+    return result
+
+
 def decode_chunk(
-    parameters: np.ndarray, num_actions: int, degree: int = DEGREE
+    parameters: np.ndarray,
+    num_actions: int,
+    degree: int = DEGREE,
+    relative_knots: bool = False,
 ) -> np.ndarray:
     """Evaluate one parameter matrix into ``(num_actions, dim)`` actions.
 
@@ -193,6 +232,8 @@ def decode_chunk(
     motion, so asking for fewer samples covers it in fewer executed steps.
     """
     parameters = np.asarray(parameters, dtype=np.float64)
+    if relative_knots:
+        parameters = decode_relative_knots(parameters, degree=degree)
     knots = parameters[:, 0]
     control_points = parameters[: -(degree + 1), 1:]
     start, end = knots[degree], knots[-(degree + 1)]

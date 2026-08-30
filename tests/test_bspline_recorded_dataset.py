@@ -26,6 +26,7 @@ import pytest
 from pace_bench.methods.bspline import (
     assign_chunks_to_frames,
     chunk_parameters,
+    encode_relative_knots,
     fit_episode,
     to_spline_actions,
 )
@@ -122,3 +123,39 @@ def test_the_fit_statistics_match_what_was_recorded(provenance, reconstruction):
     assert max(knots_per_frame) == pytest.approx(
         provenance["fit"]["knots_per_frame_max"], rel=1e-9
     )
+
+
+def test_relative_knots_flatten_the_row_ramp():
+    """Why a B-spline arm should train on `relative_knots=True`.
+
+    Absolute knots are mostly decided by which row they sit in -- the column averages
+    -7.7 at row 0 and +50.9 at row 25 -- so the single per-column statistic LeRobot's
+    normaliser computes leaves that ramp in the regression target. Encoding the column
+    as consecutive differences makes it stationary across rows, which is what lets the
+    stock normaliser be used instead of the step owning normalisation itself.
+
+    This lives with the recorded data rather than beside the synthetic parity tests
+    because it is a claim about *demonstrations*: a smooth synthetic path fits with
+    near-uniform knots, whose differences have almost no spread, and the ratio below
+    is then meaningless.
+    """
+    parameters = np.concatenate([
+        np.stack(pd.read_parquet(f)["action"].values)
+        for f in sorted(glob.glob(str(BSPLINE / "data" / "chunk-000" / "file-*.parquet")))
+    ]).astype(np.float64)
+    provenance = json.loads((BSPLINE / "meta" / "bspline.json").read_text())
+    parameters = parameters.reshape(
+        len(parameters), provenance["n_action_steps"], provenance["n_action_channels"]
+    )
+
+    def ramp(column):
+        """Row-to-row spread over within-row spread. >1 means row index dominates."""
+        return column.mean(axis=0).std() / column.std(axis=0).mean()
+
+    absolute = parameters[:, :, 0]
+    relative = encode_relative_knots(parameters, degree=provenance["degree"])[:, :, 0]
+
+    assert ramp(absolute) > 1.5, ramp(absolute)
+    assert ramp(relative) < 0.5, ramp(relative)
+    # and for scale: a control-point column has essentially no row dependence
+    assert ramp(parameters[:, :, 1]) < 0.1
