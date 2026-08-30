@@ -19,11 +19,11 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 4 | DemoSpeedup training step (tail-walk retiming) | walk parity vs the copied reference (500 sequences, runs by default) + on-the-fly == labels; recorded-dataset reconstruction | ✅ committed (`0b31a80` + follow-ups) |
 | 5 | `TimedActions` contract (`timed.py`) | baseline dt=1/fps is a byte-level no-op | ✅ committed (`432b712`) |
 | 6 | real env: crisp forks referenced, same LeRobot SHA (`real/pixi.toml`) | full pixi solve; NEP 50 in installed env | ✅ committed (`b303153`); fake-mode diff **deferred to deploy day** |
-| 7 | B-spline, real (ACT) | matches `merged_bspline_20260528` reconstruction | ⏳ not started; source = github.com/B-spline-policy/bspline-policy (user decision), Yunfei impl archived at crisp_gym fork `45dbb06` |
+| 7 | B-spline, real (ACT) | matches `merged_bspline_20260528` reconstruction | 🔨 **gate met**; maths ported and all 70 episodes reconstruct exactly (`methods/bspline/`). Training integration not started — see below |
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ⏳ not started |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/pace_bench/`, 245 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 263 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -46,6 +46,7 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `methods/demospeedup/sampler.py` | one sampler per policy family. **ACT** is the only one needing machinery: its inference path pins the CVAE latent to `z=0`, so `LatentSamplingACT(ACT)` puts a forward-pre-hook on `encoder_latent_input_proj` to swap in a prior draw — upstream's `forward` runs unmodified, weights load `strict=True`. **xVLA** and **Diffusion** keep their randomness (flow-matching `x1=randn`, denoising prior), so `XVLAChunkSampler` / `DiffusionChunkSampler` just `broadcast()` the observation to N rows and call the policy's public `predict_action_chunk`, resetting first so each frame is judged alone. `sample_frames` on `_BroadcastChunkSampler` answers several frames in one policy call (same distribution, different point in the RNG stream); `DiffusionChunkSampler` overrides it to run the vision encoder once per *frame* rather than once per sample, which is what lets a wide frame batch fit in memory |
 | `methods/demospeedup/run_label.py` | draccus labelling runner: checkpoint's own preprocessor, per-frame chunk sampling, temporal aggregation over every chunk covering a frame, `speedup_labels/episode_<i>.npy` + the raw `entropy_<i>.npy` trace, `run_config.yaml`; `--batch_frames` (default 32) routes through `sample_frames` for families that implement it, and ACT keeps the one-frame-at-a-time path |
 | `methods/demospeedup/actuator.py` | `DemoSpeedupTrackingActuator`: constant gains+gripper ×low_v, time untouched (upstream's high-gain-XML recipe + arm gains); per-step re-application (reset-proof) |
+| `methods/bspline/spline.py` | the B-spline action representation (`B-spline-policy/bspline-policy` @ `61ed5f4`, arXiv:2607.09648). `fit_episode` (adaptive least-squares fit: `generate_knots` grows the knot count until the spline is within `max_error`), `chunk_parameters` (cut the fit into `(chunk_size + 2*degree, 1 + dim)` windows of the *episode's* knot vector — only the first carries the clamped boundary), `assign_chunks_to_frames` (one matrix per frame, knots shifted to offsets from that frame), `decode_chunk` (evaluate the curve at `num_actions` points across its span — this is the speed knob), `to/from_spline_actions` (cart7 ↔ xyz+rot6d+gripper, with Gram-Schmidt back onto SO(3)). Parity against `tests/upstream_reference_bspline.py` |
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
 | `train/run_train.py` | upstream `lerobot-train` + `--method.*`: wraps `make_train_eval_datasets` (capture dataset, halve chunk) and `make_pre_post_processors` (insert method steps pre-normalizer); calls `train.__wrapped__` (subclass fails upstream's identity check) |
 | `eval/run_libero.py` | draccus eval runner, one task per output dir: method steps attached, actuator per method (PACE per-step / DemoSpeedup constant / none), env↔checkpoint ImageNet dedupe, IDENTITY-stats guard, sim-time recording, `run_config.yaml` |
@@ -153,6 +154,22 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   say anything about the thing the benchmark is for: whether the task succeeds when
   the robot runs faster. **Do not rebuild it.** The real-arm question stays open until
   the UR10e runs both arms and success rates are counted; that is deploy-day work.
+- **B-spline is ported but not yet a benchmark arm.** The maths is in and the
+  reconstruction gate is met, but B-spline is a deeper integration than PACE or
+  DemoSpeedup, both of which only reindex actions and leave the action space alone.
+  This one *replaces* it: the policy regresses a `(26, 11)` parameter matrix — a knot
+  column in frames beside control points in action units — and inference has to
+  decode before anything can be executed. Four things follow, none of them done:
+  (a) `adjust_policy` currently only halves a chunk; here it must rewrite the action
+  feature's shape *and* width, and the raw 7-dim cart7 space becomes the 10-dim
+  spline space; (b) ACT rebuilds its pad mask as `actions.sum(-1) == 0`, which is
+  meaningless against a parameter matrix, so `pad_mode` needs deciding for this arm
+  the way it was for diffusion; (c) normalisation — upstream takes per-element stats
+  over the whole matrix, which LeRobot's per-dim normaliser reproduces exactly *if*
+  the matrix is flattened to 286, and that is also how the recorded dataset stores
+  it; (d) a decode step at inference, plus the `num_actions` choice that is the whole
+  speed lever. Upstream is diffusion-only, so B-spline on ACT (batch 7) and on xVLA
+  (batch 8) are our constructions, not ports.
 - **Fake-mode dataset diff** — deploy-day gate on the lab machine, where the
   baseline env exists (user decision 2026-08-28).
 - **Real-inference gripper postprocessors** — PACE: speed=1 during gripper motion;
@@ -226,6 +243,11 @@ Runtimes for every stage above are tabulated in the README (`## Runtimes`).
   from the defect being caught, not from zero — a swapped frame/sample axis moves
   whole actions, so 1e-4 catches it and noise does not trip it. Verified by mutation:
   tiling instead of interleaving still fails at the looser tolerance.
+- The B-spline fit is the slowest thing in the suite: ~1.4 s per episode, because
+  `generate_knots` fits a spline per candidate knot vector. Fit once and reuse
+  (`fit_episode` + `chunk_parameters` + `assign_chunks_to_frames`) rather than
+  calling `episode_parameter_chunks` twice — that alone halved the recorded-dataset
+  gate from 195 s to 97 s.
 - A heredoc binds to the *last* command of a pipeline. `"$PY" - ... | tee log <<'EOF'`
   feeds the script to `tee`, which echoes it, while python reads the real stdin
   (`/dev/null` under nohup), sees EOF and runs nothing — silently, if the check
