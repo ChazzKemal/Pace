@@ -251,19 +251,17 @@ class BSplineDecodeStep(ProcessorStep):
         self.layout = layout
         self.arrangement = arrangement
 
-    def __call__(self, transition):
-        new_transition = transition.copy()
-        actions = new_transition.get(TransitionKey.ACTION)
-        if not isinstance(actions, torch.Tensor):
-            return new_transition
+    @torch.no_grad()
+    def decode_batch(self, matrices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, width, channels)`` of parameters -> ``(B, num_actions, dim)`` actions.
 
-        # A postprocessor sees a batch when it is driven from training code and a
-        # single chunk from a control loop; both shapes are the same object.
-        unbatched = actions.ndim == 2
-        matrices = (actions[None] if unbatched else actions).detach().cpu().numpy()
-
+        The tensor-level entry point, so the eval loop can decode a predicted chunk
+        without building a transition around it. Also returns the realised rate per
+        sample -- source frames advanced per executed action, which varies with the
+        span the policy predicted rather than being the constant the config asks for.
+        """
         decoded, rates = [], []
-        for emitted in matrices.astype(np.float64):
+        for emitted in matrices.detach().cpu().numpy().astype(np.float64):
             matrix = (
                 emitted
                 if self.arrangement is None or self.layout is None
@@ -278,13 +276,27 @@ class BSplineDecodeStep(ProcessorStep):
             decoded.append(samples)
             span = matrix[-(self.degree + 1), 0] - matrix[self.degree, 0]
             rates.append(span / max(self.num_actions - 1, 1))
+        actions = torch.from_numpy(np.stack(decoded)).to(
+            device=matrices.device, dtype=matrices.dtype
+        )
+        return actions, torch.tensor(rates, dtype=torch.float32, device=matrices.device)
 
-        out = torch.from_numpy(np.stack(decoded)).to(device=actions.device, dtype=actions.dtype)
-        new_transition[TransitionKey.ACTION] = out[0] if unbatched else out
+    def __call__(self, transition):
+        new_transition = transition.copy()
+        actions = new_transition.get(TransitionKey.ACTION)
+        if not isinstance(actions, torch.Tensor):
+            return new_transition
+
+        # A postprocessor sees a batch when driven from training code and a single
+        # chunk from a control loop; both shapes are the same object.
+        unbatched = actions.ndim == 2
+        decoded, rates = self.decode_batch(actions[None] if unbatched else actions)
+
+        new_transition[TransitionKey.ACTION] = decoded[0] if unbatched else decoded
         complementary = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = {
             **complementary,
-            "bspline_rate": torch.tensor(rates, dtype=torch.float32),
+            "bspline_rate": rates.cpu(),
         }
         return new_transition
 

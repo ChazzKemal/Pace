@@ -377,12 +377,45 @@ class BSplineMethod(MethodConfig):
     #: realised factor varies per chunk with the predicted span and is published as
     #: `bspline_rate`. Defaults to the matrix width, i.e. roughly demonstration speed.
     num_actions: int | None = None
+    #: Frame rate of the demonstrations, used to express knots in seconds for
+    #: arrangements that need it. A config field rather than something read off the
+    #: dataset, because evaluation has no dataset and must reconstruct the exact knot
+    #: scaling the checkpoint trained under. Checked against the dataset when there is
+    #: one, so a mismatch fails loudly instead of silently rescaling time.
+    fps: float = 20.0
 
     def __post_init__(self):
         if self.chunk_size < 2:
             raise ValueError(f"chunk_size must be >= 2, got {self.chunk_size}")
         if self.degree < 1:
             raise ValueError(f"degree must be >= 1, got {self.degree}")
+
+    def _arrange(self):
+        """The arrangement with its knot scale resolved, from config alone.
+
+        Independent of the dataset, so evaluation -- which has none -- rebuilds
+        exactly the scaling the checkpoint trained under.
+        """
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        arrangement = resolve_arrangement(self.arrangement)
+        if arrangement.channels is None:
+            return arrangement
+        # Knots in seconds, not frames: an arrangement exists because the policy reads
+        # its action vector structurally, and such a policy (xVLA) does not normalize
+        # it either, so raw magnitudes decide how much each channel counts.
+        return replace(arrangement, knot_scale=1.0 / self.fps)
+
+    def _resolved_layout(self):
+        """The action layout, from config alone wherever the name fixes the width."""
+        from pace_bench.methods.bspline.layout import LAYOUTS, resolve_layout
+
+        declared = LAYOUTS.get(self.layout)
+        if declared is None or declared.raw_dim is None:
+            # "identity" adopts the dataset's own width, so only a run that has a
+            # dataset can resolve it.
+            return getattr(self, "_layout", None)
+        return resolve_layout(self.layout, declared.raw_dim)
 
     @property
     def width(self) -> int:
@@ -399,11 +432,13 @@ class BSplineMethod(MethodConfig):
         raw_dim = int(dataset.meta.features[ACTION]["shape"][0])
         layout = resolve_layout(self.layout, raw_dim)
         arrangement = resolve_arrangement(self.arrangement)
-        if arrangement.channels is not None:
-            # Knots in seconds, not frames: an arrangement exists because the policy
-            # reads the action vector structurally, and such a policy (xVLA) does not
-            # normalize it either.
-            arrangement = replace(arrangement, knot_scale=1.0 / float(dataset.meta.fps))
+        if float(dataset.meta.fps) != self.fps:
+            raise ValueError(
+                f"--method.fps is {self.fps} but this dataset records "
+                f"{dataset.meta.fps}. The knot column is scaled by 1/fps, so a mismatch "
+                f"silently rescales time; set --method.fps={dataset.meta.fps}."
+            )
+        arrangement = self._arrange()
         if arrangement.name == "xvla_ee6d20":
             # Importing registers `ee6d_bspline` in xVLA's own action registry, which
             # `--policy.action_mode` then resolves. Done here rather than at package
@@ -563,8 +598,8 @@ class BSplineMethod(MethodConfig):
                 num_actions=self.num_actions or self.width,
                 degree=self.degree,
                 relative_knots=self.relative_knots,
-                layout=getattr(self, "_layout", None),
-                arrangement=getattr(self, "_arrangement", None),
+                layout=self._resolved_layout(),
+                arrangement=self._arrange(),
             )
         ]
 

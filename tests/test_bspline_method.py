@@ -399,3 +399,106 @@ class TestXVLABSplineActionSpace:
         for i, a in enumerate(groups):
             for b in groups[i + 1 :]:
                 assert not (a & b)
+
+
+class TestEvalPath:
+    """What it takes to score a B-spline checkpoint, which has no dataset to consult.
+
+    The bug this covers: `run_libero` builds the method's postprocessor step with no
+    dataset, and the step used to come back with `layout=None, arrangement=None`. For
+    an xVLA checkpoint that reads column 0 as the knot when the knot is in column 10 --
+    decoding a position as a time, silently.
+    """
+
+    def test_the_decode_step_resolves_itself_without_a_dataset(self):
+        method = BSplineMethod(layout="ee6d20", arrangement="xvla_ee6d20")
+        (step,) = method.postprocessor_steps()
+        assert step.layout is not None and step.layout.raw_dim == 20
+        assert step.arrangement is not None and step.arrangement.channels == 20
+
+    def test_the_knot_scale_is_reconstructed_from_config_not_the_dataset(self):
+        """It must match what the checkpoint trained under, and evaluation cannot ask
+        the dataset -- so fps is a config field."""
+        (step,) = BSplineMethod(arrangement="xvla_ee6d20", fps=20.0).postprocessor_steps()
+        assert step.arrangement.knot_scale == pytest.approx(0.05)
+        (other,) = BSplineMethod(arrangement="xvla_ee6d20", fps=50.0).postprocessor_steps()
+        assert other.arrangement.knot_scale == pytest.approx(0.02)
+
+    def test_knot_first_needs_no_arrangement_scaling(self):
+        (step,) = BSplineMethod(layout="cart7").postprocessor_steps()
+        assert step.arrangement.channels is None
+        assert step.arrangement.knot_scale == 1.0
+
+    def test_decode_batch_returns_actions_and_the_realised_rate(self, splines):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        matrices = torch.stack([
+            torch.from_numpy(splines.parameters(0, 5).astype(np.float32)),
+            torch.from_numpy(splines.parameters(0, 9).astype(np.float32)),
+        ])
+        actions, rates = BSplineDecodeStep(num_actions=9).decode_batch(matrices)
+        assert actions.shape == (2, 9, 10)
+        assert rates.shape == (2,)
+        assert (rates > 0).all()
+
+
+class TestAttachBSpline:
+    """Decoding attached to one policy object, the way `attach_pace` attaches PACE."""
+
+    class FakePolicy:
+        """Enough of a policy for the rebinding: a chunk source and a reset."""
+
+        def __init__(self, matrix):
+            self.matrix = matrix
+            self.queries = 0
+            self.resets = 0
+
+        def predict_action_chunk(self, batch):
+            self.queries += 1
+            return self.matrix
+
+        def reset(self):
+            self.resets += 1
+
+    def policy(self, splines, batch=2):
+        matrix = torch.from_numpy(splines.parameters(0, 5).astype(np.float32))
+        return self.FakePolicy(matrix.expand(batch, *matrix.shape).clone())
+
+    def test_one_query_serves_num_actions_steps(self, splines):
+        from pace_bench.eval.bspline_policy import attach_bspline
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        policy = attach_bspline(self.policy(splines), BSplineDecodeStep(num_actions=5))
+        actions = [policy.select_action({}) for _ in range(5)]
+        assert policy.queries == 1, "the chunk should be decoded once, not per step"
+        assert all(a.shape == (2, 10) for a in actions)
+        policy.select_action({})
+        assert policy.queries == 2, "a sixth step must trigger a fresh query"
+
+    def test_fewer_actions_means_fewer_queries_per_unit_of_motion(self, splines):
+        """The speed lever, seen from the eval loop: the same curve, traversed in
+        fewer executed steps."""
+        from pace_bench.eval.bspline_policy import attach_bspline
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        rates = {}
+        for num_actions in (4, 8):
+            policy = attach_bspline(
+                self.policy(splines), BSplineDecodeStep(num_actions=num_actions)
+            )
+            policy.select_action({})
+            rates[num_actions] = policy.bspline_rate_log[0]
+        assert rates[4] > rates[8]
+
+    def test_reset_drops_the_queue_and_still_resets_the_policy(self, splines):
+        from pace_bench.eval.bspline_policy import attach_bspline
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        policy = attach_bspline(self.policy(splines), BSplineDecodeStep(num_actions=6))
+        policy.select_action({})
+        assert len(policy.bspline_queue) == 5
+        policy.reset()
+        assert not policy.bspline_queue
+        assert policy.resets == 1
+        policy.select_action({})
+        assert policy.queries == 2, "after a reset the next step must re-query"

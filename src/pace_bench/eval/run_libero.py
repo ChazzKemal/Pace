@@ -34,9 +34,15 @@ from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.random_utils import set_seed
 
+from pace_bench.eval.bspline_policy import attach_bspline
 from pace_bench.eval.pace_policy import attach_pace
 from pace_bench.eval.sim_time import wrap_vector_env
-from pace_bench.methods.config import DemoSpeedupMethod, MethodPipelineConfig, NoMethod
+from pace_bench.methods.config import (
+    BSplineMethod,
+    DemoSpeedupMethod,
+    MethodPipelineConfig,
+    NoMethod,
+)
 from pace_bench.methods.demospeedup.actuator import DemoSpeedupTrackingActuator
 from pace_bench.methods.pace.actuator import DEFAULT_CONTROL_DT, RobosuiteSpeedActuator
 from pace_bench.methods.pace.processor import PaceSpeedStep
@@ -184,8 +190,23 @@ def main(cfg: LiberoEvalConfig) -> None:
             disable_gripper_speedup=cfg.actuation.disable_gripper_speedup,
         )
 
-    paced = attach_pace(policy, build_speed_step(cfg, stats), actuator)
-    logger.info("method=%s | %s", cfg.method.type, paced.pace.get_config())
+    if isinstance(cfg.method, BSplineMethod):
+        # B-spline predicts curve parameters, not actions, so the policy has to decode
+        # before anything can be executed. `num_actions` is the speed lever and is
+        # chosen here rather than baked into the checkpoint.
+        (decode,) = cfg.method.postprocessor_steps()
+        paced = attach_bspline(policy, decode)
+        logger.info("method=%s | %s", cfg.method.type, decode.get_config())
+        if actuator is not None:
+            logger.warning(
+                "B-spline has no actuator: its speed-up comes from decoding the same "
+                "curve at fewer points, not from changing the simulator. Ignoring "
+                "--actuation.*"
+            )
+            actuator = None
+    else:
+        paced = attach_pace(policy, build_speed_step(cfg, stats), actuator)
+        logger.info("method=%s | %s", cfg.method.type, paced.pace.get_config())
 
     cfg.out.mkdir(parents=True, exist_ok=True)
     # draccus.dump emits YAML -- name the file accordingly. (Its .json-named

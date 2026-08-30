@@ -23,7 +23,7 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ✅ trains (`--method.arrangement=xvla_ee6d20 --policy.action_mode=ee6d_bspline`); `KNOT_SCALE` untuned. Not trained to completion |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/pace_bench/`, 307 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 317 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -53,6 +53,7 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
 | `train/run_train.py` | upstream `lerobot-train` + `--method.*`: wraps `make_train_eval_datasets` (capture dataset, halve chunk) and `make_pre_post_processors` (insert method steps pre-normalizer); calls `train.__wrapped__` (subclass fails upstream's identity check) |
 | `eval/run_libero.py` | draccus eval runner, one task per output dir: method steps attached, actuator per method (PACE per-step / DemoSpeedup constant / none), env↔checkpoint ImageNet dedupe, IDENTITY-stats guard, sim-time recording, `run_config.yaml` |
+| `eval/bspline_policy.py` | `attach_bspline`: the same instance-level rebinding as `attach_pace`, and for the same reason (upstream's evaluator asserts `isinstance(policy, PreTrainedPolicy)`, so a wrapper is refused). A B-spline checkpoint predicts curve parameters rather than actions, so `select_action` decodes one predicted chunk into `num_actions` executable actions, serves them one per call, and logs the realised rate per query |
 | `eval/pace_policy.py` | `attach_pace`: instance-level select_action/reset rebinding (upstream rejects wrapper objects), speed queue, applied-speed log |
 | `eval/sim_time.py` | `SimTimeRecorder` + vector-env re-arm (autoreset-safe per-episode sim durations) |
 | `real/` (repo root, **not** under `src/`) | deploy env: pixi manifest + lock pinning lerobot @ the shared SHA, crisp fork SHAs, numpy<2 override; site network scripts incl. the cv2 libjpeg preload |
