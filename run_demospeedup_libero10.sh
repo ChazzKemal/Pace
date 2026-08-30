@@ -28,13 +28,19 @@ REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${LIBERO10_ROOT:-$DATA_ROOT/datasets/sim/libero_10_ee6d}
-POLICY_PATH=${XVLA_POLICY_PATH:-$DATA_ROOT/checkpoints/xvla_libero_patched}
+# The stock `lerobot/xvla-libero` checkpoint, by hub id rather than a local copy:
+# LeRobot at the pinned SHA loads it unmodified (it remaps the older vendored
+# Florence-2 key layout on load), and the hub cache is shared, so a 3.3GB second
+# copy under data/ bought nothing. Override with a path to pin a local one.
+POLICY_PATH=${XVLA_POLICY_PATH:-lerobot/xvla-libero}
 LABELS_PATH=${LIBERO10_LABELS_PATH:-$DATA_ROOT/labels/xvla_libero10_ee6d/speedup_labels}
 require () {  # require <path> <env var to override it>
     [ -e "$1" ] || { echo "missing $1 -- set $2 to its location"; exit 1; }
 }
 require "$DATASET_ROOT" LIBERO10_ROOT
-require "$POLICY_PATH" XVLA_POLICY_PATH
+# Only a local path can be checked for existence; a hub id is resolved by
+# huggingface_hub at load time, so requiring it here would always fail.
+case "$POLICY_PATH" in /*|./*|../*) require "$POLICY_PATH" XVLA_POLICY_PATH ;; esac
 require "$LABELS_PATH" LIBERO10_LABELS_PATH
 export MUJOCO_GL=egl PYTHONUNBUFFERED=1 VIDEO_BACKEND=pyav
 

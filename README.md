@@ -87,7 +87,7 @@ everything it does not produce from `data/` beside the checkout —
 data/                      (not in git; PACE_DATA_ROOT points elsewhere)
   datasets/real/           UR10e recordings
   datasets/sim/            libero_10_ee6d
-  checkpoints/             xvla_libero_patched — the pretrained xVLA
+  checkpoints/             (empty; xVLA loads from the hub as lerobot/xvla-libero)
   labels/                  DemoSpeedup stage-2 output, per labelling run
 ```
 
