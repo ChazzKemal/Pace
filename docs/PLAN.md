@@ -167,8 +167,9 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   takes per-element stats over the whole matrix, which LeRobot's per-dim normaliser
   reproduces exactly *if* the matrix is flattened, and that is also how the recorded
   dataset stores it; (d) a decode step at inference, carrying the `num_actions`
-  choice that is the whole speed lever. Upstream is diffusion-only, so B-spline on
-  ACT (batch 7) and on xVLA (batch 8) are our constructions, not ports.
+  choice that is the whole speed lever. The paper (§5) integrates with **both**
+  Diffusion Policy ("Diff.+BSP") and ACT ("Reg.+BSP"), so batch 7 is a reproduction;
+  only the released *code* is diffusion-only. xVLA (batch 8) is ours.
   **The gripper is not special-cased**, which is upstream's own choice
   (`_preprocess_chunks` fits `episode_actions[:, :n_dims]`, gripper included). It is
   safe because the fit tolerance is a max over every element, so a gripper edge is a
@@ -179,7 +180,15 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **B-spline needs no labelling stage** (user decision 2026-08-30). Its labels are
   the fitted spline parameters, not anything the dataset carries — but unlike
   DemoSpeedup's, they need no policy to produce, only geometry, so they are cheap
-  enough to build in the preprocessor at training time. Measured full passes:
+  enough to build in the preprocessor at training time. Cheap because nothing is
+  *optimised*: the paper's Algorithm 1 places knots by the classical FITPACK greedy
+  criterion (insert where the residual is worst) and, with the knots fixed, the
+  control points are a plain linear least-squares solve. Measured, that is 17-21
+  candidate knot vectors per episode at 0.23 ms (libero, 293 frames) to 1.05 ms
+  (pickplace, 1505 frames) per solve. scipy's `generate_knots` inserts several knots
+  per step rather than the paper's one — 8, 9, 11, 12, 14, 18, ... 73 — reaching the
+  same tolerance in ~20 candidates instead of ~70. Most of the wall clock is not even
+  the solve (4% of it on pickplace) but `generate_knots`' own residual analysis. Measured full passes:
   **libero_10_ee6d 3.1 s** (400 eps, 102033 frames, 0.03 ms/frame) and
   **pickplace 50.3 s** (45 eps, 31178 frames, 1.61 ms/frame), zero episodes missing
   `max_error=0.01`. Against 1.9 h and 5.9 h of training that is free. So: no
