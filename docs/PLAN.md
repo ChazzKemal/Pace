@@ -176,10 +176,11 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   keeps the action space exactly -- slot k still means "ee6d pose at step k", only
   which demonstration frames fill the slots changes -- so its head starts aligned.
   B-spline reinterprets the tokens: the chunk axis stops indexing timesteps and starts
-  indexing control points, and a channel that was always zero becomes a time. The same
-  20k LoRA steps therefore buy the three arms different things, and a worse B-spline
-  number would be unattributable between "the representation is worse" and "20k steps
-  was not enough to repurpose a pretrained action head". Two mitigations: the
+  indexing control points, and one channel becomes a time. **Weakened by the
+  domain-0 finding below**: the action head is random in every arm, so no arm inherits
+  an aligned decoder and the asymmetry is confined to the *trunk* — LoRA-adapted
+  blocks and a frozen `pos_emb`, both pretrained on dense action chunks. Real, but
+  much milder than "B-spline must repurpose a pretrained head" as first stated here. Two mitigations: the
   reinterpretation is not arbitrary (control point k is roughly where the arm is
   around the k-th knot, and channels 0-9 keep their exact meaning), and the paper
   never makes this claim -- it validates B-spline on Diffusion Policy and ACT, both
@@ -191,26 +192,24 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   pretrained trunk plus a fresh head -- a small change, since those modules are
   already in `full_training_modules`, and it costs the baseline absolute SR in
   exchange for comparability; (3) drop B-spline from the LIBERO axis entirely.
-- **B-spline on xVLA reuses the pretrained head; nothing is trained from scratch.**
-  The action vector stays 20 wide, so `action_encoder` / `action_decoder` load
-  unchanged. Only the *meaning* of the columns moves: slots 0-9 keep xyz / rot6d /
-  gripper exactly (the arrangement puts the control point there, so the pretrained
-  head is already right for 10 of the 11 meaningful channels), slot 10 changes from
-  "arm-2 x" to "knot in seconds", and 11-19 stay zero. On `libero_10_ee6d` slot 10 is
-  identically zero in every frame — single-arm data padded to 20 — so the head had
-  learned to emit a constant there and we are writing signal into it. The capacity to
-  relearn comes from `full_training_modules`: `soft_prompt_hub`, `action_encoder` and
-  `action_decoder` are `DomainAwareLinear` (`nn.Embedding` tables) that LoRA cannot
-  target and are therefore fully fine-tuned, while LoRA adapts the trunk.
-  **Not taken:** `num_domains=30` and `domain_id` defaults to 0, so 29 head rows are
-  free and a B-spline arm could have its own. That keeps domain 0's ee6d head intact
-  but starts from a xavier-random row, discarding a head already correct for 10 of 11
-  channels — worth it only if one checkpoint must serve both a baseline and a
-  B-spline arm, which is not how the arms are trained.
-  **Untested:** whether the head actually learns the knot channel. 300 steps at batch
-  2 (0.6% of an epoch, still in LR warmup) left `knot_loss / KNOT_SCALE` at ~1.34 MSE
-  against a target variance of ~0.94 — no better than predicting the mean knot. That
-  is the first thing a real run has to show.
+- **Every xVLA arm trains its action head from random init — including the baseline**
+  (verified against the checkpoint 2026-08-30). `action_encoder`, `action_decoder` and
+  `soft_prompt_hub` are `DomainAwareLinear` / `nn.Embedding` *tables* of 30 domains,
+  indexed per sample by `domain_id`. `lerobot/xvla-libero` has 9 genuinely pretrained
+  domains — rows 3 and 10-17, weight norms 11.6-25.8 with non-zero biases — and
+  **row 0 is at xavier initialization**: its biases are exactly 0.0 (the initializer)
+  and its weight norms sit at the median of the untouched rows. The checkpoint sets
+  `domain_feature_key=None` and `libero_10_ee6d` carries no `domain_id`, so
+  `_get_domain_id` returns 0 for every sample and every arm trains that untrained row.
+  It works: the baseline reached 92.0% SR that way. Consequences: (a) B-spline is
+  **not** disadvantaged at the head — no arm inherits an aligned action head, all three
+  learn what the tokens mean from scratch, which weakens the comparability objection
+  below to the trunk alone; (b) "give the B-spline arm its own domain" is moot, since
+  domain 0 is already a free row; (c) 2.8M parameters of pretrained action head sit
+  unused in every run.
+  **Untested:** whether the head learns the knot channel. 300 steps at batch 2 (0.6%
+  of an epoch, still in LR warmup) left `knot_loss / KNOT_SCALE` at ~1.34 MSE against
+  a target variance of ~0.94 — no better than predicting the mean knot.
 - **xVLA needed a second construction, and one number in it is a guess.** xVLA reads
   its action vector *structurally* -- `POS_IDX_1 = (0,1,2)`, `ROT_IDX_1 = (3..8)`,
   gripper at 9 and 19, with per-group scales -- so upstream's knot-first matrix trains
