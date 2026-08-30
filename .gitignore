@@ -2,6 +2,8 @@
 __pycache__/
 *.egg-info/
 outputs/
+# generated symlink view of outputs/train; rebuild with link_checkpoints.py
+checkpoints/
 
 # local scratch / editor
 testing.py

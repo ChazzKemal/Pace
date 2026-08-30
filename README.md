@@ -94,6 +94,42 @@ data/                      (not in git; PACE_DATA_ROOT points elsewhere)
 Each input is also individually overridable; a script names the variable to set when
 a directory is missing, and stops before training rather than part way through.
 
+## Runtimes
+
+All on one 24 GB card, from the run logs. Training:
+
+| run                                  | steps × batch | wall clock |
+| ------------------------------------ | ------------- | ---------- |
+| xVLA LoRA, LIBERO-10 (102k frames)   | 20k × 8       | 1.9 h      |
+| ACT, stack_cups (8.9k frames)        | 30k × 32      | 2.2 h      |
+| ACT, pickplace (31k frames), bf16    | 100k × 32     | 5.9 h *    |
+
+Labelling is the stage whose cost swings by orders of magnitude, because it queries
+the proxy policy once per frame:
+
+| proxy run                    | frames  | wall clock                                   |
+| ---------------------------- | ------- | -------------------------------------------- |
+| ACT, stack_cups              | 8 875   | 5.5 min (0.038 s/frame)                      |
+| Diffusion, pickplace         | 31 178  | 4.8 h at `--batch_frames=1` → **1.4 h** at 32 |
+| xVLA, libero_10_ee6d         | 102 033 | 17.1 h (0.60 s/frame, one frame per call)    |
+
+`*` projected from the observed rate, not run to completion.
+
+`--batch_frames` (default 32) samples several frames per policy call, for any family
+whose sampler implements `sample_frames`. Diffusion is where it pays: one chunk costs
+100 sequential denoising steps however wide the batch is, so the card idles at width
+10. Past ~32 it plateaus — the denoiser is latency-bound, not throughput-bound. ACT
+drives the model directly, is fast enough not to need it, and takes the original
+one-frame-at-a-time path. xVLA inherits the generic `sample_frames`, so the flag
+applies to it as well, but its gain has not been measured — the number above predates
+the batching. Only diffusion has the specialised path that encodes each frame once
+rather than once per sample, worth ~6× in memory, which is what makes a wide frame
+batch fit at all.
+
+The LIBERO labels in `data/labels/xvla_libero10_ee6d` came from the fork's stage-2
+run over those same 400 episodes and are consumed as given; at ~150 s per episode,
+regenerating them through `run_label` is an overnight job, not an interactive one.
+
 ## Layout
 
 ```
