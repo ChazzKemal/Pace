@@ -150,7 +150,27 @@ def validate_method(declared: str, facts: CheckpointFacts, *, force: bool = Fals
       compressed in the weights, well past anything that was evaluated.
     """
     trained = facts.method_type
-    if trained is None or trained == declared:
+    if trained == declared:
+        return
+
+    # Asking for a *training-time* method on a checkpoint that was not trained with
+    # it. demospeedup's compensation only makes sense against weights trained on
+    # retimed targets: applied to a baseline it slows the gripper for no reason and
+    # yields a benchmark number that means nothing. `pace` is exempt -- it is an
+    # eval-time choice and applies to any checkpoint.
+    if declared == "demospeedup" and trained != "demospeedup":
+        msg = (
+            f"--method.type=demospeedup was requested, but the checkpoint at "
+            f"{facts.path} was trained as {trained or 'a plain baseline (no method '
+            'recorded)'}. Its waypoints are not retimed, so the gripper "
+            "compensation would slow the grasp for no reason and the run would not "
+            "be comparable to a real demospeedup arm."
+        )
+        if not force:
+            raise MethodMismatch(msg + " Pass --force to override.")
+        return
+
+    if trained is None:
         return
     if trained == "demospeedup" and declared in ("none", "pace"):
         msg = (

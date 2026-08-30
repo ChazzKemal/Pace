@@ -10,11 +10,10 @@ CLI override. ``run_libero.py`` already dumps a re-parsable ``run_config.yaml`` 
 every run; this does the same, which matters more on hardware than in simulation
 because a robot run cannot be replayed from a seed.
 
-Status: the config, checkpoint validation and step construction below are complete
-and tested. Driving the robot needs ``main()``'s remaining ~737 lines of hardware
-bring-up (env construction, controller switch, gain scaling, sender startup) lifted
-out of ``19_deploy_policy.py`` into a reusable session object -- see
-``build_session()``.
+Status: complete, and unverified on hardware. Config, checkpoint validation, step
+construction and the bring-up sequence are all in place; what has not happened is a
+run on the arm, because the rig was down when this was written. The phase ordering is
+the one property no offline check covers.
 """
 
 from __future__ import annotations
@@ -70,27 +69,32 @@ class RealEvalConfig(MethodPipelineConfig):
         return 1.0 / max(self.fps, 1e-9)
 
 
-class _StepArgs:
-    """The handful of deploy-CLI values the crisp_gym steps read.
+def deploy_args(cfg: RealEvalConfig):
+    """crisp_gym's deploy vocabulary, seeded from its own CLI defaults.
 
-    crisp_gym's steps take the argparse namespace 19_deploy_policy.py builds. Rather
-    than reshape those steps for draccus, this presents the same attribute names --
-    the adapter stays in one place instead of spreading a second config vocabulary
-    through the actuation layer.
+    The actuation layer speaks the argparse namespace ``19_deploy_policy.py`` builds
+    -- some sixty flags whose defaults were tuned against this rig. Rather than
+    restate them in draccus and risk drift, the parser is asked for its own defaults
+    and only what this config actually exposes is overridden. A flag nobody has
+    thought about therefore keeps the value that was proven on hardware, instead of
+    silently getting a fresh one.
     """
+    from crisp_gym.deploy.cli import build_parser
 
-    def __init__(self, cfg: RealEvalConfig):
-        self.gripper_slowdown_frames = cfg.gripper.slowdown_frames
-        self.invert_gripper = cfg.gripper.invert
-        self.fps = cfg.fps
-        # HeuristicSpeed reads these; a method that supplies its own speeds ignores
-        # them, and method `none` reproduces the pre-method defaults exactly.
-        self.max_speed = 1.0
-        self.min_speed = 1.0
-        self.clamp_deg = 5.0
-        self.lookahead = 0
-        self.lookbehind = 0
-        self.cum_lookahead = 0
+    args = build_parser().parse_args([])
+    args.env_config = cfg.env_config
+    args.fps = cfg.fps
+    args.dry_run = cfg.dry_run
+    args.max_chunks = cfg.max_chunks
+    args.gripper_slowdown_frames = cfg.gripper.slowdown_frames
+    args.invert_gripper = cfg.gripper.invert
+    args.yes = True                  # the method and checkpoint were already validated
+    if cfg.n_action_steps is not None:
+        args.n_act = cfg.n_action_steps
+    # The method owns the speed decision, so the heuristic knobs stay neutral;
+    # method `none` then reproduces the pre-method defaults exactly.
+    args.max_speed = args.min_speed = 1.0
+    return args
 
 
 def resolve_method(cfg: RealEvalConfig) -> MethodConfig:
@@ -125,7 +129,7 @@ def resolve_method(cfg: RealEvalConfig) -> MethodConfig:
 def build_steps(cfg: RealEvalConfig, method: MethodConfig, dataset_stats=None) -> list:
     """The deploy pipeline this run will hand to crisp_gym's producer loop."""
     return deploy_steps(
-        method, args=_StepArgs(cfg),
+        method, args=deploy_args(cfg),
         n_action_steps=cfg.n_action_steps,
         control_dt=cfg.control_dt,
         dataset_stats=dataset_stats,
@@ -143,19 +147,75 @@ def dump_run_config(cfg: RealEvalConfig) -> Path:
     return path
 
 
-def build_session(cfg: RealEvalConfig, steps: list):
-    """Bring the robot up and run the loop. NOT YET IMPLEMENTED.
+def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
+    """Bring the robot up, run the method's pipeline, tear down.
 
-    Needs main()'s hardware bring-up lifted out of 19_deploy_policy.py into a
-    reusable session: env construction and readiness, controller switch, gain
-    scaling, GIL hygiene, sender startup and the startup delay. Once that exists
-    this becomes a handful of lines, because crisp_gym.deploy.loop already accepts
-    the `steps` list built above.
+    The phases run in the order the hardware requires -- controller switched before
+    anything is published, gains scaled before the first chunk, sender started and
+    matched before the producer. Teardown is in a ``finally`` because a live sender
+    thread and scaled controller gains outlive a crash.
     """
-    raise NotImplementedError(
-        "hardware bring-up still lives in 19_deploy_policy.py's main(); extract it "
-        "into crisp_gym.deploy.session before run_real can drive the robot"
-    )
+    from collections import deque
+    from datetime import datetime
+
+    import rclpy
+    from crisp_gym.deploy import session
+    from crisp_gym.deploy.loop import run_producer_loop
+    from crisp_gym.deploy.obs import _build_obs_schema, _get_obs_zerofill
+    from crisp_gym.deploy.sources import _LeRobotChunkSource
+    from crisp_gym.deploy.trace import RunRecord, write_run_artifacts
+
+    env = session.build_env(args)
+    src = _LeRobotChunkSource(pretrained_path=cfg.policy_path, env=env)
+    n_obs, n_act = src.n_obs, src.n_act
+
+    scaler = sender = None
+    try:
+        session.phase_home(env, args)
+        session.phase_switch_controller(env, args)
+        scaler = session.phase_scaler(env, args)
+        session.phase_pin_gripper_speed(env, args)
+        session.phase_gil_hygiene(env, args)
+        ch = session.phase_publish_channels(env, args)
+        sender, q = session.phase_start_sender(env, args, scaler, ch)
+        started_at, out_dir, recorders = session.phase_video_and_delay(
+            env, args, n_obs, n_act)
+
+        rec = RunRecord(out_dir=out_dir, run_started_at=started_at, duration_s=0.0,
+                        n_obs=n_obs, n_act=n_act, chunk_count=0, stopped_by="init")
+        schema = _build_obs_schema(env)
+        last = [None]
+        buf: deque = deque(maxlen=n_obs)
+        while len(buf) < n_obs:
+            buf.append(_get_obs_zerofill(env, schema, last))
+
+        run_producer_loop(
+            env=env, chunk_source=src, q=q, args=args, rec=rec,
+            dt_base=cfg.control_dt, obs_schema=schema,
+            gripper_enabled=ch.gripper_enabled,
+            gripper_unnormalize_fn=ch.gripper_unnormalize_fn,
+            obs_buf=buf, last_obs=last, lookbehind_buf=deque(maxlen=8),
+            steps=steps,
+        )
+        write_run_artifacts(rec, args, sender, None)
+    finally:
+        if sender is not None:
+            try:
+                q.put(None); sender.join(5.0)
+            except Exception:
+                logger.exception("sender shutdown")
+        try:
+            src.shutdown()
+        except Exception:
+            logger.exception("chunk source shutdown")
+        if scaler is not None:
+            scaler.restore()
+        try:
+            env.close()
+        except Exception:
+            logger.exception("env close")
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 @draccus.wrap()
@@ -167,7 +227,7 @@ def main(cfg: RealEvalConfig) -> None:
     logger.info("method=%s | steps=%s",
                 getattr(method, "type", "none"), [type(s).__name__ for s in steps])
     logger.info("run config -> %s", dump_run_config(cfg))
-    build_session(cfg, steps)
+    run_on_robot(cfg, steps, deploy_args(cfg))
 
 
 if __name__ == "__main__":

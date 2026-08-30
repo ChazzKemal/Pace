@@ -139,3 +139,27 @@ def test_force_overrides():
 def test_pace_on_an_untrained_checkpoint_is_fine():
     """PACE is an eval-time choice; nothing in a checkpoint forbids it."""
     validate_method("pace", facts(None))
+
+
+def test_demospeedup_on_a_baseline_checkpoint_is_refused():
+    """The gap found while checking what the local checkpoint permits.
+
+    Applying demospeedup's row replication to weights that were never trained on
+    retimed targets slows the grasp for no reason and produces a benchmark number
+    that is not comparable to a real demospeedup arm. Nothing about it is unsafe,
+    which is exactly why it needs to be caught -- it would look like it worked.
+    """
+    with pytest.raises(MethodMismatch, match="not retimed"):
+        validate_method("demospeedup", facts(None))
+    with pytest.raises(MethodMismatch, match="not retimed"):
+        validate_method("demospeedup", facts("none"))
+
+
+def test_demospeedup_on_a_baseline_can_be_forced():
+    validate_method("demospeedup", facts(None), force=True)
+
+
+def test_pace_stays_exempt():
+    """PACE is eval-time: no checkpoint forbids it, including a demospeedup one's peers."""
+    validate_method("pace", facts(None))
+    validate_method("pace", facts("none"))
