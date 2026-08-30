@@ -37,6 +37,7 @@ from lerobot.utils.random_utils import set_seed
 from pace_bench.eval.bspline_policy import attach_bspline
 from pace_bench.eval.pace_policy import attach_pace
 from pace_bench.eval.sim_time import wrap_vector_env
+from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
 from pace_bench.methods.config import (
     BSplineMethod,
     DemoSpeedupMethod,
@@ -195,15 +196,22 @@ def main(cfg: LiberoEvalConfig) -> None:
         # before anything can be executed. `num_actions` is the speed lever and is
         # chosen here rather than baked into the checkpoint.
         (decode,) = cfg.method.postprocessor_steps()
-        paced = attach_bspline(policy, decode)
-        logger.info("method=%s | %s", cfg.method.type, decode.get_config())
-        if actuator is not None:
-            logger.warning(
-                "B-spline has no actuator: its speed-up comes from decoding the same "
-                "curve at fewer points, not from changing the simulator. Ignoring "
-                "--actuation.*"
+        # Its actuation is upstream's: a constant arm-kp multiple, kd and gripper left
+        # nominal. Not PACE's per-step law and not DemoSpeedup's low_v scaling.
+        paced = attach_bspline(
+            policy,
+            decode,
+            BSplineTrackingActuator(
+                kp_scale=cfg.method.stiffness_kp_scale,
+                disable_kp_scaling=cfg.actuation.disable_kpkd_scaling,
             )
-            actuator = None
+            if actuate
+            else None,
+        )
+        logger.info(
+            "method=%s | %s | kp x%.2f",
+            cfg.method.type, decode.get_config(), cfg.method.stiffness_kp_scale,
+        )
     else:
         paced = attach_pace(policy, build_speed_step(cfg, stats), actuator)
         logger.info("method=%s | %s", cfg.method.type, paced.pace.get_config())

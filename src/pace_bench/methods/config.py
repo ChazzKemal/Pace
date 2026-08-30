@@ -383,6 +383,10 @@ class BSplineMethod(MethodConfig):
     #: scaling the checkpoint trained under. Checked against the dataset when there is
     #: one, so a mismatch fails loudly instead of silently rescaling time.
     fps: float = 20.0
+    #: Arm position-gain multiplier at eval, so the plant can track waypoints that
+    #: are further apart. Upstream's own default (`--stiffness-kp-scale`, 2.0); kd
+    #: and the gripper are deliberately left nominal, which is what upstream does.
+    stiffness_kp_scale: float = 2.0
 
     def __post_init__(self):
         if self.chunk_size < 2:
