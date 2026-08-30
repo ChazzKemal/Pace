@@ -169,6 +169,13 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   dataset stores it; (d) a decode step at inference, carrying the `num_actions`
   choice that is the whole speed lever. Upstream is diffusion-only, so B-spline on
   ACT (batch 7) and on xVLA (batch 8) are our constructions, not ports.
+  **The gripper is not special-cased**, which is upstream's own choice
+  (`_preprocess_chunks` fits `episode_actions[:, :n_dims]`, gripper included). It is
+  safe because the fit tolerance is a max over every element, so a gripper edge is a
+  hard constraint on the knot search: at `max_error=0.01` with a gripper in [0, 1]
+  the transition is tracked to 1% of stroke. Gripper edges therefore *drive* knot
+  density, which is what makes knot density a precision signal in its own right --
+  the quantity DemoSpeedup needs a policy and an entropy estimate to obtain.
 - **B-spline needs no labelling stage** (user decision 2026-08-30). Its labels are
   the fitted spline parameters, not anything the dataset carries — but unlike
   DemoSpeedup's, they need no policy to produce, only geometry, so they are cheap
@@ -198,7 +205,16 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   baseline env exists (user decision 2026-08-28).
 - **Real-inference gripper postprocessors** — PACE: speed=1 during gripper motion;
   DemoSpeedup: repeat gripper-moving actions ×low_v, truncate. Config-gated,
-  never serialized into checkpoints. See memory note; not implemented.
+  never serialized into checkpoints. See memory note; not implemented. Upstream
+  B-spline reaches the same fix independently and is worth copying rather than
+  reinventing (`scripts/policy_local_bspline.py`): on
+  `|gripper - last_gripper|.max() > 0.08` it sets a 7-step counter and ramps the
+  speed-up *linearly* back from 1.0 to full — `1 + (steps - remaining)/steps *
+  (speed_up_times - 1)` — scaling the time advance rather than the actions. A ramp,
+  not a step, and off by default (`gripper_slowdown_enabled=False`). It also drops
+  the gripper from the spline time-alignment distance unless
+  `consider_gripper_during_align` is set, because a near-binary channel is
+  misleading for "where am I along this path".
 - **Batch 2's 3-seed PACE gate** — parked; upstream xVLA has a known ~10pp task-1
   deficit vs the fork that would confound absolute-SR comparison.
 
