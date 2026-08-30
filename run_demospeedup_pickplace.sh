@@ -73,6 +73,11 @@ DATASET_ROOT=${PICKPLACE_ROOT:-$DATA_ROOT/datasets/real/pickplace_cart7_v2_angle
 # pruner only ever deletes numbered checkpoints strictly older than `last`, so the
 # checkpoint each labelling stage reads is never the one being removed. A missing
 # pruner is a warning, not a stop -- the queue still fits, with less headroom.
+#
+# Run it with the venv python, NOT the system python3: this box ships 3.8, and
+# the pruner annotates with PEP 585 generics (list[tuple[...]]) that need 3.9+.
+# Invoked as `python3` it dies on import, and because it runs in the background
+# nothing surfaces that -- the first symptom is a full disk hours later.
 PRUNER=${PACE_PRUNER:-$(dirname "$REPO_ROOT")/prune_checkpoints.py}
 KEEP=2
 [ -f "$PRUNER" ] || echo "WARNING: no pruner at $PRUNER (set PACE_PRUNER); keeping every checkpoint"
@@ -115,14 +120,14 @@ train () {  # train <output name> <wandb job name> <policy args...>
     done_already "$name" && return 0
     local pruner_pid=
     if [ -f "$PRUNER" ]; then
-        python3 "$PRUNER" "outputs/train/$name" --keep "$KEEP" --interval 300 \
+        "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --interval 300 \
             >"logs/${name}.prune.log" 2>&1 &
         pruner_pid=$!
     fi
     "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" "${BUDGET[@]}" "$@" \
         --job_name="$job" --output_dir="outputs/train/$name" \
         2>&1 | tee "logs/${name}.log"
-    [ -n "$pruner_pid" ] && { kill "$pruner_pid" 2>/dev/null; python3 "$PRUNER" "outputs/train/$name" --keep "$KEEP" --once >>"logs/${name}.prune.log" 2>&1; }
+    [ -n "$pruner_pid" ] && { kill "$pruner_pid" 2>/dev/null; "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --once >>"logs/${name}.prune.log" 2>&1; }
     [ -d "outputs/train/$name/checkpoints/last" ] || { echo "FAILED: $name produced no checkpoint"; exit 1; }
 }
 
@@ -147,7 +152,11 @@ label () {  # label <label dir> <oracle run name> <log tag>
     # marginal? Precision frames should come in runs; if the mean run length is no
     # longer than a coin flip with the same rate would give, the retiming is not
     # tracking anything about the demonstration.
-    "$PY" - "outputs/label/$out/speedup_labels" 2>&1 | tee "logs/${tag}_signal.log" <<'PYEOF'
+    # The heredoc must bind to $PY, not to the pipeline's last command: written
+    # after `tee` it feeds the python source to tee, which dutifully echoes it,
+    # while python reads the script's own stdin (/dev/null under nohup), sees EOF
+    # and runs nothing. Silent, because this check gates no exit.
+    "$PY" - "outputs/label/$out/speedup_labels" <<'PYEOF' 2>&1 | tee "logs/${tag}_signal.log"
 import glob
 import sys
 
