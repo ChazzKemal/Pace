@@ -159,3 +159,50 @@ def test_relative_knots_flatten_the_row_ramp():
     assert ramp(relative) < 0.5, ramp(relative)
     # and for scale: a control-point column has essentially no row dependence
     assert ramp(parameters[:, :, 1]) < 0.1
+
+
+def test_decoding_a_chunk_reproduces_the_demonstration_it_was_fitted_to():
+    """The loop closed, on real UR10e data: fit -> chunk -> decode -> cart7.
+
+    This is the claim the whole method rests on. If the fit, the chunk windowing, the
+    knot shift or the rotation round trip were wrong, every one of those failures
+    would still produce a plausible-looking trajectory.
+
+    The alignment is the subtle part and getting it wrong looks like a 10 cm error:
+    a chunk's valid domain runs from ``knots[degree]``, **not** from the sample's own
+    frame. Everything before that needs knots the window does not carry. So the curve
+    covers frames ``frame + knots[degree] ... frame + knots[-(degree+1)]``, which is
+    what the demonstration must be indexed at.
+    """
+    from pace_bench.methods.bspline import (
+        assign_chunks_to_frames,
+        decode_chunk,
+        from_spline_actions,
+    )
+
+    provenance = json.loads((BSPLINE / "meta" / "bspline.json").read_text())
+    degree = provenance["degree"]
+    worst = 0.0
+    for path in sorted(glob.glob(str(SOURCE / "data" / "chunk-000" / "file-*.parquet")))[:5]:
+        raw = np.stack(pd.read_parquet(path)["action"].values).astype(np.float64)
+        spline, converged = fit_episode(
+            to_spline_actions(raw), max_error=provenance["max_error"], degree=degree
+        )
+        assert converged
+        chunks = chunk_parameters(spline, provenance["chunk_size"], degree=degree, stride=1)
+        parameters = assign_chunks_to_frames(chunks, len(raw), degree=degree)
+
+        for frame in range(len(raw) - 1):
+            matrix = parameters[frame]
+            start, end = matrix[degree, 0], matrix[-(degree + 1), 0]
+            span = int(end - start)
+            if span < 2:
+                continue
+            decoded = from_spline_actions(decode_chunk(matrix, span + 1, degree=degree))
+            covered = (frame + start + np.arange(span + 1)).astype(int)
+            inside = covered < len(raw)
+            error = np.abs(decoded[inside, :3] - raw[covered[inside], :3]).max()
+            worst = max(worst, float(error))
+
+    # The fit tolerance is applied per element, in the dataset's units (metres here).
+    assert worst < provenance["max_error"], f"worst position error {worst:.4f} m"

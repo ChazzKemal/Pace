@@ -24,10 +24,11 @@ from __future__ import annotations
 import abc
 import logging
 import time
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 
 import draccus
 import numpy as np
+import torch
 from lerobot.processor.pipeline import ProcessorStep
 from lerobot.utils.constants import ACTION
 
@@ -91,6 +92,18 @@ class MethodConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore[misc]
 
         No-op by default: PACE, DemoSpeedup and the baseline all keep the dataset's
         own action space.
+        """
+
+    def adjust_processors(self, preprocessor, postprocessor) -> None:
+        """Correct the built pipelines, after the factory has made them.
+
+        Exists for the case `adjust_dataset` cannot reach: a policy loaded from a
+        checkpoint (`--policy.path`) gets its normalization buffers from that
+        checkpoint's saved processor, not from the dataset metadata. A method that
+        changed the action space has to overwrite them or the new columns are scaled
+        by statistics belonging to a different quantity.
+
+        No-op by default.
         """
 
 
@@ -342,6 +355,12 @@ class BSplineMethod(MethodConfig):
     max_error: float = 0.01
     #: Which columns of this dataset's action can be splined. See `bspline.layout`.
     layout: str = "cart7"
+    #: How the parameter matrix's columns sit in the tensor the policy sees.
+    #: "knot_first" is upstream's and suits ACT and Diffusion, which treat the action
+    #: as an undifferentiated vector. xVLA slices it by hardcoded index, so a knot at
+    #: column 0 trains as an x-coordinate -- use "xvla_ee6d20" there, together with
+    #: --policy.action_mode=ee6d_bspline.
+    arrangement: str = "knot_first"
     #: Store the knot column as consecutive differences instead of as offsets from
     #: the current frame. Off by default, matching every shipped upstream config and
     #: the recorded UR10e dataset. Note this concerns *time* only: the control points
@@ -352,6 +371,12 @@ class BSplineMethod(MethodConfig):
     #: row-to-row ramp, attenuating the per-sample knot signal about 2.3x relative to
     #: the control points. Turning this on removes the ramp if that ever matters.
     relative_knots: bool = False
+    #: Actions decoded from one predicted spline, at inference. The speed lever, and a
+    #: decode-time choice needing no retraining: the curve covers a fixed stretch of
+    #: demonstrated motion, so fewer samples cover it in fewer executed steps. The
+    #: realised factor varies per chunk with the predicted span and is published as
+    #: `bspline_rate`. Defaults to the matrix width, i.e. roughly demonstration speed.
+    num_actions: int | None = None
 
     def __post_init__(self):
         if self.chunk_size < 2:
@@ -368,11 +393,22 @@ class BSplineMethod(MethodConfig):
         """Fit every episode. Cached on the instance so the two hooks share one pass."""
         if getattr(self, "_splines", None) is not None:
             return self._splines, self._episode_starts
-        from pace_bench.methods.bspline.layout import resolve_layout
+        from pace_bench.methods.bspline.layout import resolve_arrangement, resolve_layout
         from pace_bench.methods.bspline.processor import EpisodeSplines
 
         raw_dim = int(dataset.meta.features[ACTION]["shape"][0])
         layout = resolve_layout(self.layout, raw_dim)
+        arrangement = resolve_arrangement(self.arrangement)
+        if arrangement.channels is not None:
+            # Knots in seconds, not frames: an arrangement exists because the policy
+            # reads the action vector structurally, and such a policy (xVLA) does not
+            # normalize it either.
+            arrangement = replace(arrangement, knot_scale=1.0 / float(dataset.meta.fps))
+        if arrangement.name == "xvla_ee6d20":
+            # Importing registers `ee6d_bspline` in xVLA's own action registry, which
+            # `--policy.action_mode` then resolves. Done here rather than at package
+            # import so that selecting any other method never pulls in xVLA.
+            import pace_bench.methods.bspline.xvla_action  # noqa: F401
         starts = episode_starts_from_metadata(dataset.meta)
         action_table = np.asarray(dataset.hf_dataset[ACTION], dtype=np.float64)
         episode_actions = {
@@ -389,7 +425,8 @@ class BSplineMethod(MethodConfig):
             len(episode_actions), time.perf_counter() - started, splines.nbytes() / 1e6,
             layout.name, raw_dim, layout.spline_dim, self.width, splines.channels,
         )
-        self._splines, self._episode_starts, self._layout = splines, starts, layout
+        self._splines, self._episode_starts = splines, starts
+        self._layout, self._arrangement = layout, arrangement
         return splines, starts
 
     def adjust_policy(self, policy_cfg) -> None:
@@ -451,16 +488,19 @@ class BSplineMethod(MethodConfig):
         # column 0 is affected (a shift cancels in the differences and never touches
         # a control point), but it is computed by replaying the step rather than by
         # reasoning about which columns move.
-        total = np.zeros(splines.channels, dtype=np.float64)
-        total_sq = np.zeros(splines.channels, dtype=np.float64)
-        low = np.full(splines.channels, np.inf)
-        high = np.full(splines.channels, -np.inf)
+        arrangement = self._arrangement
+        channels = arrangement.channels or splines.channels
+        total = np.zeros(channels, dtype=np.float64)
+        total_sq = np.zeros(channels, dtype=np.float64)
+        low = np.full(channels, np.inf)
+        high = np.full(channels, -np.inf)
         count = 0
         for episode, length in ((e, len(f)) for e, f in splines.frame_to_chunk.items()):
             for frame in range(length):
                 matrix = splines.parameters(episode, frame)
                 if self.relative_knots:
                     matrix = encode_relative_knots(matrix, self.degree)
+                matrix = arrangement.emit(matrix)
                 total += matrix.sum(axis=0)
                 total_sq += (matrix.astype(np.float64) ** 2).sum(axis=0)
                 low = np.minimum(low, matrix.min(axis=0))
@@ -469,22 +509,64 @@ class BSplineMethod(MethodConfig):
         mean = total / count
         std = np.sqrt(np.maximum(total_sq / count - mean**2, 0.0))
 
-        dataset.meta.features[ACTION] = {
-            **dataset.meta.features[ACTION],
-            "shape": (splines.channels,),
-        }
-        dataset.meta.stats[ACTION] = {
+        dataset.meta.features[ACTION] = {**dataset.meta.features[ACTION], "shape": (channels,)}
+        self._action_stats = {
             "mean": mean.astype(np.float32),
             "std": np.maximum(std, 1e-8).astype(np.float32),
             "min": low.astype(np.float32),
             "max": high.astype(np.float32),
             "count": np.array([count]),
         }
+        dataset.meta.stats[ACTION] = dict(self._action_stats)
         logging.info(
-            "B-spline: action metadata now %d-dim; knot column mean %.2f std %.2f, "
-            "control points |mean| <= %.3f",
-            splines.channels, mean[0], std[0], np.abs(mean[1:]).max(),
+            "B-spline: action metadata now %d-dim (%s, knot x%.4g); knot mean %.2f std %.2f",
+            channels, arrangement.name, arrangement.knot_scale,
+            mean[splines.channels - 1] if arrangement.channels else mean[0],
+            std[splines.channels - 1] if arrangement.channels else std[0],
         )
+
+    def adjust_processors(self, preprocessor, postprocessor) -> None:
+        """Install the parameter statistics into whatever normalizers were built.
+
+        A from-scratch policy gets them through the dataset metadata, but a pretrained
+        one (`--policy.path`, which is how every xVLA arm runs) carries its own saved
+        normalizer, whose action statistics describe the *dataset's* actions. On
+        LIBERO the knot column then lands in a slot the checkpoint recorded as
+        constant zero, so it is normalized by mean 0 / std 1 and reaches the loss at
+        its raw magnitude -- a knot loss of 7365 beside a position loss of 2.1.
+        """
+        stats = getattr(self, "_action_stats", None)
+        if stats is None:
+            return
+        installed = 0
+        for pipeline in (preprocessor, postprocessor):
+            for step in getattr(pipeline, "steps", []):
+                step_stats = getattr(step, "stats", None)
+                if isinstance(step_stats, dict) and ACTION in step_stats:
+                    step_stats[ACTION] = {
+                        key: torch.as_tensor(value) for key, value in stats.items()
+                    }
+                    installed += 1
+        logging.info("B-spline: installed parameter statistics into %d normalizer(s)", installed)
+
+    def postprocessor_steps(self) -> list[ProcessorStep]:
+        """Decode predicted parameters into executable actions.
+
+        Appended, so it runs *after* the unnormalizer: the knot column is a time in
+        source frames and the control points are poses, and both have to be in their
+        own units before the curve can be evaluated.
+        """
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        return [
+            BSplineDecodeStep(
+                num_actions=self.num_actions or self.width,
+                degree=self.degree,
+                relative_knots=self.relative_knots,
+                layout=getattr(self, "_layout", None),
+                arrangement=getattr(self, "_arrangement", None),
+            )
+        ]
 
     def preprocessor_steps(self, dataset=None) -> list[ProcessorStep]:
         from pace_bench.methods.bspline.processor import BSplineChunkStep
@@ -498,5 +580,6 @@ class BSplineMethod(MethodConfig):
                 episode_starts=starts,
                 relative_knots=self.relative_knots,
                 degree=self.degree,
+                arrangement=self._arrangement,
             )
         ]

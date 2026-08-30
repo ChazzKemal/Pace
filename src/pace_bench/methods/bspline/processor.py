@@ -28,11 +28,12 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 from lerobot.utils.constants import ACTION
 
-from pace_bench.methods.bspline.layout import ActionLayout
+from pace_bench.methods.bspline.layout import ActionLayout, MatrixArrangement
 from pace_bench.methods.bspline.spline import (
     DEGREE,
     MAX_ERROR,
     chunk_parameters,
+    decode_chunk,
     encode_relative_knots,
     fit_episode,
 )
@@ -126,11 +127,20 @@ class BSplineChunkStep(ProcessorStep):
         episode_starts: dict[int, int] | None = None,
         relative_knots: bool = False,
         degree: int = DEGREE,
+        arrangement: MatrixArrangement | None = None,
     ):
         self.splines = splines
         self.episode_starts = episode_starts or {}
         self.relative_knots = relative_knots
         self.degree = degree
+        self.arrangement = arrangement
+
+    @property
+    def channels(self) -> int:
+        """Emitted width: the arrangement's, or one knot column plus control points."""
+        if self.arrangement is not None and self.arrangement.channels is not None:
+            return self.arrangement.channels
+        return 0 if self.splines is None else self.splines.channels
 
     def __call__(self, transition):
         new_transition = transition.copy()
@@ -148,10 +158,12 @@ class BSplineChunkStep(ProcessorStep):
         frame_index = self._frame_indices(complementary, episode_index)
 
         batch = actions.shape[0]
-        out = np.empty((batch, self.splines.width, self.splines.channels), dtype=np.float32)
+        out = np.empty((batch, self.splines.width, self.channels), dtype=np.float32)
         for i in range(batch):
             matrix = self.splines.parameters(int(episode_index[i]), int(frame_index[i]))
-            out[i] = encode_relative_knots(matrix, self.degree) if self.relative_knots else matrix
+            if self.relative_knots:
+                matrix = encode_relative_knots(matrix, self.degree)
+            out[i] = matrix if self.arrangement is None else self.arrangement.emit(matrix)
 
         new_transition[TransitionKey.ACTION] = torch.from_numpy(out).to(
             device=actions.device, dtype=actions.dtype
@@ -184,7 +196,11 @@ class BSplineChunkStep(ProcessorStep):
 
     def get_config(self) -> dict[str, Any]:
         """The fits are data, not configuration -- only the knobs serialize."""
-        return {"relative_knots": self.relative_knots, "degree": self.degree}
+        return {
+            "relative_knots": self.relative_knots,
+            "degree": self.degree,
+            "arrangement": None if self.arrangement is None else self.arrangement.name,
+        }
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -194,7 +210,100 @@ class BSplineChunkStep(ProcessorStep):
             return features
         action_features = features.get(PipelineFeatureType.ACTION, {})
         for key, feature in list(action_features.items()):
-            action_features[key] = PolicyFeature(
-                type=feature.type, shape=(self.splines.channels,)
+            action_features[key] = PolicyFeature(type=feature.type, shape=(self.channels,))
+        return features
+
+
+@ProcessorStepRegistry.register("bspline_decode")
+class BSplineDecodeStep(ProcessorStep):
+    """Turn the policy's predicted spline parameters back into executable actions.
+
+    The inverse of :class:`BSplineChunkStep`, and the only reason a B-spline
+    checkpoint can be run at all: what the policy emits is a knot column beside
+    control points, which no robot can execute. This evaluates that curve and maps it
+    back to the dataset's own action space.
+
+    ``num_actions`` is the speed lever, and it is a *decode-time* choice needing no
+    retraining -- the paper's ``a_exec(t) = a(nt)``. The curve covers a fixed stretch
+    of demonstrated motion; asking for fewer samples covers that stretch in fewer
+    executed steps. The realised factor is published per sample as ``bspline_rate``
+    (source frames advanced per executed action), because it is a property of the
+    predicted span and so varies from chunk to chunk rather than being the constant
+    the config asks for.
+
+    Runs *after* the unnormalizer: it needs parameters in their own units, since the
+    knot column is a time in source frames and the control points are poses.
+    """
+
+    def __init__(
+        self,
+        num_actions: int = 16,
+        degree: int = DEGREE,
+        relative_knots: bool = False,
+        layout: ActionLayout | None = None,
+        arrangement: MatrixArrangement | None = None,
+    ):
+        if num_actions < 1:
+            raise ValueError(f"num_actions must be >= 1, got {num_actions}")
+        self.num_actions = num_actions
+        self.degree = degree
+        self.relative_knots = relative_knots
+        self.layout = layout
+        self.arrangement = arrangement
+
+    def __call__(self, transition):
+        new_transition = transition.copy()
+        actions = new_transition.get(TransitionKey.ACTION)
+        if not isinstance(actions, torch.Tensor):
+            return new_transition
+
+        # A postprocessor sees a batch when it is driven from training code and a
+        # single chunk from a control loop; both shapes are the same object.
+        unbatched = actions.ndim == 2
+        matrices = (actions[None] if unbatched else actions).detach().cpu().numpy()
+
+        decoded, rates = [], []
+        for emitted in matrices.astype(np.float64):
+            matrix = (
+                emitted
+                if self.arrangement is None or self.layout is None
+                else self.arrangement.recover(emitted, self.layout.spline_dim)
             )
+            samples = decode_chunk(
+                matrix, self.num_actions, degree=self.degree,
+                relative_knots=self.relative_knots,
+            )
+            if self.layout is not None:
+                samples = self.layout.from_spline(samples)
+            decoded.append(samples)
+            span = matrix[-(self.degree + 1), 0] - matrix[self.degree, 0]
+            rates.append(span / max(self.num_actions - 1, 1))
+
+        out = torch.from_numpy(np.stack(decoded)).to(device=actions.device, dtype=actions.dtype)
+        new_transition[TransitionKey.ACTION] = out[0] if unbatched else out
+        complementary = new_transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = {
+            **complementary,
+            "bspline_rate": torch.tensor(rates, dtype=torch.float32),
+        }
+        return new_transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "num_actions": self.num_actions,
+            "degree": self.degree,
+            "relative_knots": self.relative_knots,
+            "layout": None if self.layout is None else self.layout.name,
+            "arrangement": None if self.arrangement is None else self.arrangement.name,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """Back to the dataset's action width, which is what a robot consumes."""
+        if self.layout is None or self.layout.raw_dim is None:
+            return features
+        action_features = features.get(PipelineFeatureType.ACTION, {})
+        for key, feature in list(action_features.items()):
+            action_features[key] = PolicyFeature(type=feature.type, shape=(self.layout.raw_dim,))
         return features

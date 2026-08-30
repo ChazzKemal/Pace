@@ -208,3 +208,194 @@ class TestBSplineMethodConfig:
     def test_it_is_selectable_as_a_method_type(self):
         assert BSplineMethod().type == "bspline"
         assert ACTION  # the constant the metadata rewrite keys on still exists
+
+
+class TestBSplineDecodeStep:
+    """The inverse of the chunk step, and what makes a checkpoint executable at all."""
+
+    def matrix(self, splines, episode=0, frame=5):
+        return torch.from_numpy(splines.parameters(episode, frame).astype(np.float32))
+
+    def test_it_decodes_parameters_into_actions(self, splines):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        step = BSplineDecodeStep(num_actions=12)
+        out = step({
+            TransitionKey.ACTION: torch.stack([self.matrix(splines), self.matrix(splines, 0, 9)]),
+            TransitionKey.COMPLEMENTARY_DATA: {},
+        })
+        assert out[TransitionKey.ACTION].shape == (2, 12, 10)
+
+    def test_an_unbatched_chunk_stays_unbatched(self, splines):
+        """A control loop hands over one chunk, training code hands a batch."""
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        out = BSplineDecodeStep(num_actions=6)({
+            TransitionKey.ACTION: self.matrix(splines), TransitionKey.COMPLEMENTARY_DATA: {}
+        })
+        assert out[TransitionKey.ACTION].shape == (6, 10)
+
+    def test_fewer_actions_cover_the_same_span_faster(self, splines):
+        """The speed lever: `a_exec(t) = a(nt)`. The curve is a fixed stretch of
+        demonstrated motion, so halving the samples doubles the rate."""
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        rates = {}
+        for num_actions in (5, 9, 17):
+            out = BSplineDecodeStep(num_actions=num_actions)({
+                TransitionKey.ACTION: self.matrix(splines), TransitionKey.COMPLEMENTARY_DATA: {}
+            })
+            rates[num_actions] = float(out[TransitionKey.COMPLEMENTARY_DATA]["bspline_rate"][0])
+        assert rates[5] > rates[9] > rates[17]
+        assert rates[5] == pytest.approx(2 * rates[9], rel=1e-6)
+
+    def test_the_layout_maps_actions_back_to_the_dataset_space(self, splines):
+        """A robot consumes cart7, not the 10-dim space the spline lives in."""
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        out = BSplineDecodeStep(num_actions=4, layout=resolve_layout("cart7", 7))({
+            TransitionKey.ACTION: self.matrix(splines), TransitionKey.COMPLEMENTARY_DATA: {}
+        })
+        assert out[TransitionKey.ACTION].shape == (4, 7)
+
+    def test_decoding_at_the_demonstrated_rate_reproduces_the_curve(self, splines):
+        """Sampled at one point per source frame, the decode is the fit itself --
+        so any error here is the fit's, not the round trip's."""
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+        from pace_bench.methods.bspline.spline import decode_chunk
+
+        matrix = splines.parameters(0, 5)
+        span = int(matrix[-(DEGREE + 1), 0] - matrix[DEGREE, 0])
+        out = BSplineDecodeStep(num_actions=span + 1)({
+            TransitionKey.ACTION: torch.from_numpy(matrix.astype(np.float32)),
+            TransitionKey.COMPLEMENTARY_DATA: {},
+        })
+        np.testing.assert_allclose(
+            out[TransitionKey.ACTION].numpy(),
+            decode_chunk(matrix, span + 1).astype(np.float32),
+            atol=1e-4,
+        )
+        assert float(out[TransitionKey.COMPLEMENTARY_DATA]["bspline_rate"][0]) == pytest.approx(1.0)
+
+    def test_relative_knots_are_decoded_the_way_they_were_encoded(self, splines):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+        from pace_bench.methods.bspline.spline import encode_relative_knots
+
+        matrix = splines.parameters(0, 5)
+        absolute = BSplineDecodeStep(num_actions=8)({
+            TransitionKey.ACTION: torch.from_numpy(matrix.astype(np.float32)),
+            TransitionKey.COMPLEMENTARY_DATA: {},
+        })[TransitionKey.ACTION]
+        relative = BSplineDecodeStep(num_actions=8, relative_knots=True)({
+            TransitionKey.ACTION: torch.from_numpy(
+                encode_relative_knots(matrix, DEGREE).astype(np.float32)
+            ),
+            TransitionKey.COMPLEMENTARY_DATA: {},
+        })[TransitionKey.ACTION]
+        torch.testing.assert_close(relative, absolute, atol=1e-3, rtol=0)
+
+    def test_a_degenerate_sample_count_is_refused(self):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        with pytest.raises(ValueError, match="num_actions must be"):
+            BSplineDecodeStep(num_actions=0)
+
+    def test_the_method_contributes_it_with_the_configured_geometry(self):
+        method = BSplineMethod(chunk_size=10, num_actions=7, relative_knots=True)
+        (step,) = method.postprocessor_steps()
+        assert step.get_config()["num_actions"] == 7
+        assert step.get_config()["relative_knots"] is True
+        # defaulting to the matrix width is roughly demonstration speed
+        assert BSplineMethod().postprocessor_steps()[0].get_config()["num_actions"] == 16
+
+
+class TestMatrixArrangement:
+    """Where the knot column sits in the tensor the policy sees.
+
+    ACT and Diffusion read their action as an undifferentiated vector, so upstream's
+    knot-first layout is fine. xVLA slices by hardcoded index and does not normalize
+    at all, so it needs both a different column order and knots in seconds.
+    """
+
+    def test_knot_first_is_the_identity(self):
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        arrangement = resolve_arrangement("knot_first")
+        matrix = np.arange(16 * 11, dtype=np.float64).reshape(16, 11)
+        np.testing.assert_array_equal(arrangement.emit(matrix), matrix)
+        np.testing.assert_array_equal(arrangement.recover(matrix, 10), matrix)
+
+    def test_xvla_puts_the_control_point_where_the_structured_loss_expects_it(self):
+        """xVLA's POS_IDX_1 is (0,1,2) and ROT_IDX_1 is (3..8): a knot at column 0
+        is trained as an x-coordinate, which showed as position_loss 122840."""
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        arrangement = resolve_arrangement("xvla_ee6d20")
+        matrix = np.zeros((16, 11))
+        matrix[:, 0] = 7.0                       # knots
+        matrix[:, 1:] = np.arange(10) + 1.0      # control point
+        emitted = arrangement.emit(matrix)
+        assert emitted.shape == (16, 20)
+        np.testing.assert_array_equal(emitted[:, :10], matrix[:, 1:])
+        np.testing.assert_array_equal(emitted[:, 10], matrix[:, 0])
+        assert not emitted[:, 11:].any(), "slots 11..19 must stay zero for a single arm"
+
+    def test_the_round_trip_restores_the_matrix(self):
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        arrangement = resolve_arrangement("xvla_ee6d20")
+        rng = np.random.default_rng(0)
+        matrix = rng.normal(size=(16, 11))
+        np.testing.assert_allclose(arrangement.recover(arrangement.emit(matrix), 10), matrix)
+
+    def test_the_knot_scale_survives_the_round_trip(self):
+        """xVLA normalizes nothing (its normalization_mapping is IDENTITY throughout),
+        so knots have to reach its loss already comparable to metres. 1/fps makes the
+        column seconds; the curve must be unchanged by that."""
+        from dataclasses import replace
+
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        arrangement = replace(resolve_arrangement("xvla_ee6d20"), knot_scale=1 / 20)
+        matrix = np.zeros((16, 11))
+        matrix[:, 0] = np.arange(16) * 3.0
+        emitted = arrangement.emit(matrix)
+        np.testing.assert_allclose(emitted[:, 10], matrix[:, 0] / 20)
+        np.testing.assert_allclose(arrangement.recover(emitted, 10), matrix)
+
+    def test_an_unknown_arrangement_names_the_known_ones(self):
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        with pytest.raises(ValueError, match="unknown matrix arrangement"):
+            resolve_arrangement("knot_last")
+
+
+class TestXVLABSplineActionSpace:
+    def test_it_registers_and_scores_the_knot_column(self):
+        from lerobot.policies.xvla.action_hub import build_action_space
+
+        import pace_bench.methods.bspline.xvla_action  # noqa: F401
+
+        space = build_action_space("ee6d_bspline")
+        assert space.dim_action == 20
+        assert space.KNOT_IDX == (10,)
+        assert space.gripper_idx == (9,)  # single arm; upstream ee6d is (9, 19)
+
+        pred = torch.zeros(2, 16, 20)
+        target = torch.zeros(2, 16, 20)
+        target[:, :, 10] = 1.0  # a knot error and nothing else
+        losses = space.compute_loss(pred, target)
+        assert losses["knot_loss"] > 0
+        assert losses["position_loss"] == 0 and losses["rotate6D_loss"] == 0
+
+    def test_the_structured_groups_do_not_overlap_the_knot(self):
+        """The whole point: no index is scored as two different quantities."""
+        from lerobot.policies.xvla.action_hub import build_action_space
+
+        import pace_bench.methods.bspline.xvla_action  # noqa: F401
+
+        space = build_action_space("ee6d_bspline")
+        groups = [set(space.POS_IDX), set(space.ROT_IDX), set(space.gripper_idx), set(space.KNOT_IDX)]
+        for i, a in enumerate(groups):
+            for b in groups[i + 1 :]:
+                assert not (a & b)

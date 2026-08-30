@@ -86,3 +86,62 @@ def resolve_layout(name: str, raw_dim: int) -> ActionLayout:
     if layout.spline_dim == 0:  # "identity" adopts whatever the dataset is
         return ActionLayout(layout.name, raw_dim, layout.to_spline, layout.from_spline, raw_dim)
     return layout
+
+
+@dataclass(frozen=True)
+class MatrixArrangement:
+    """How a parameter matrix's columns are laid out in the tensor a policy sees.
+
+    Upstream puts the knot column first and the control points after it, which is
+    right for any policy that treats its action vector as an undifferentiated set of
+    numbers -- ACT and Diffusion both do. xVLA does not: its loss slices the action by
+    hardcoded index (``POS_IDX_1 = (0, 1, 2)``, ``ROT_IDX_1 = (3..8)``, gripper at 9
+    and 19), so a knot column at index 0 is trained as an x-coordinate. On LIBERO that
+    showed up as a position loss of 122840 against a rotation loss of 6.3.
+    """
+
+    name: str
+    #: Channels emitted, or None to mean "one knot column plus the control points".
+    channels: int | None
+    #: Multiplier on the knot column, for policies that do not normalize their
+    #: actions. xVLA's normalization_mapping is IDENTITY throughout, so raw magnitudes
+    #: reach its loss: knots in frames run to ~50 while positions in metres run to
+    #: ~1.3, and the knot term then swamps everything by scale alone (a knot loss of
+    #: 7365 beside a position loss of 2.1). Set to 1/fps, the knot column is seconds
+    #: and the two are comparable. Inverted on `recover`, so the curve is unchanged.
+    knot_scale: float = 1.0
+
+    def emit(self, matrix: np.ndarray) -> np.ndarray:
+        """`(rows, 1 + spline_dim)` -> what the policy regresses."""
+        if self.channels is None:
+            return matrix
+        out = np.zeros((matrix.shape[0], self.channels), dtype=matrix.dtype)
+        points = matrix.shape[1] - 1
+        out[:, :points] = matrix[:, 1:]
+        out[:, points] = matrix[:, 0] * self.knot_scale
+        return out
+
+    def recover(self, emitted: np.ndarray, spline_dim: int) -> np.ndarray:
+        """The inverse, for decoding what a policy predicted."""
+        if self.channels is None:
+            return emitted
+        out = np.empty((emitted.shape[0], 1 + spline_dim), dtype=emitted.dtype)
+        out[:, 0] = emitted[:, spline_dim] / self.knot_scale
+        out[:, 1:] = emitted[:, :spline_dim]
+        return out
+
+
+ARRANGEMENTS: dict[str, MatrixArrangement] = {
+    # Upstream's own: knot column first, then control points.
+    "knot_first": MatrixArrangement("knot_first", None),
+    # xVLA's ee6d vector: control point in slots 0..9 exactly where its structured
+    # loss expects xyz / rot6d / gripper, the knot in slot 10, the rest zero. Keeps
+    # the pretrained action decoder's width of 20 untouched.
+    "xvla_ee6d20": MatrixArrangement("xvla_ee6d20", 20),
+}
+
+
+def resolve_arrangement(name: str) -> MatrixArrangement:
+    if name not in ARRANGEMENTS:
+        raise ValueError(f"unknown matrix arrangement {name!r}; known: {sorted(ARRANGEMENTS)}")
+    return ARRANGEMENTS[name]

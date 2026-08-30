@@ -79,6 +79,10 @@ def attach_method_steps(method: MethodConfig):
         )
         preprocessor.steps[at:at] = steps
         postprocessor.steps.extend(method.postprocessor_steps())
+        # Last: correct the normalizers the factory built. A pretrained policy's
+        # processor is loaded from its checkpoint, so a method that changed the action
+        # space cannot reach it through the dataset metadata alone.
+        method.adjust_processors(preprocessor, postprocessor)
         return preprocessor, postprocessor
 
     lerobot_train.make_train_eval_datasets = make_datasets

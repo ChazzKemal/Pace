@@ -219,3 +219,42 @@ class TestRelativeKnots:
             decode_chunk(parameters, 20),
             atol=1e-9,
         )
+
+
+class TestPaddedChunkEndpoint:
+    """A chunk at the episode tail repeats its final knot, and the endpoint is a limit.
+
+    Deliberate divergence from upstream, whose `decode_bspline_action` evaluates the
+    padded end exactly and gets the all-zero vector -- every basis function is zero on
+    a zero-length knot span. As an action in an absolute space that is a command to
+    the world origin, and it makes the 6D rotation un-normalizable.
+    """
+
+    def test_the_endpoint_of_a_padded_chunk_is_its_last_control_point(self, path):
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        chunks = chunk_parameters(spline, CHUNK, stride=1)
+        padded = [c for c in chunks if c[-1, 0] == c[-(DEGREE + 1), 0]]
+        assert padded, "expected the tail chunks to be padded"
+        for parameters in padded[:5]:
+            decoded = decode_chunk(parameters, 8)
+            assert np.isfinite(decoded).all()
+            np.testing.assert_allclose(decoded[-1], parameters[-(DEGREE + 1) - 1, 1:], atol=1e-6)
+
+    def test_no_chunk_decodes_to_an_all_zero_action(self, path):
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        for parameters in chunk_parameters(spline, CHUNK, stride=1):
+            decoded = decode_chunk(parameters, 12)
+            assert np.isfinite(decoded).all()
+            assert np.abs(decoded).max(axis=1).min() > 0, "a slot decoded to all zeros"
+
+    def test_an_interior_chunk_is_unaffected_to_float_precision(self, path):
+        """The clamp is one ulp, so it must not move a chunk that is not padded."""
+        from scipy.interpolate import BSpline
+
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        parameters = chunk_parameters(spline, CHUNK, stride=1)[4]
+        knots = parameters[:, 0]
+        raw = BSpline(knots, parameters[: -(DEGREE + 1), 1:], DEGREE, extrapolate=False)(
+            np.linspace(knots[DEGREE], knots[-(DEGREE + 1)], 9)
+        )
+        np.testing.assert_allclose(decode_chunk(parameters, 9), raw, atol=1e-9)

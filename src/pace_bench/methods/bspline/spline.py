@@ -243,4 +243,12 @@ def decode_chunk(
         samples = np.asarray([start], dtype=np.float64)
     else:
         samples = np.linspace(start, end, int(num_actions), dtype=np.float64)
+    # Take the last sample as a limit from the left. A chunk at the episode tail is
+    # padded by repeating its final knot, so `end` sits at the bottom of a run of
+    # identical knots -- a zero-length span, where every basis function is zero and
+    # the curve evaluates to the all-zero vector. Upstream returns that zero as an
+    # action; in an absolute action space it is a command to the world origin, and
+    # after a 6D rotation is normalized it is a division by zero. One ulp inside, the
+    # value is exactly the last control point, which is what the endpoint means.
+    samples = np.minimum(samples, np.nextafter(end, start))
     return BSpline(knots, control_points, degree, extrapolate=False)(samples)
