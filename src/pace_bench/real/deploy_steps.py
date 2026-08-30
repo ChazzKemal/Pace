@@ -18,7 +18,14 @@ import numpy as np
 import torch
 
 from crisp_gym.deploy.pipeline import Chunk, GripperHold, GripperReplicate, HeuristicSpeed
-from pace_bench.methods.config import DemoSpeedupMethod, MethodConfig, NoMethod, PaceMethod
+from pace_bench.methods.config import (
+    BSplineMethod,
+    DemoSpeedupMethod,
+    MethodConfig,
+    NoMethod,
+    PaceMethod,
+)
+from pace_bench.methods.bspline.processor import BSplineDecodeStep
 from pace_bench.methods.pace.processor import PaceSpeedStep
 
 
@@ -45,6 +52,36 @@ class PaceSpeed:
             actions=kept[0].cpu().numpy(),
             speeds=speeds[0].cpu().numpy().astype(np.float64),
         )
+
+
+class BSplineDecode:
+    """Evaluate the predicted spline into executable actions -- the `decode` slot.
+
+    B-spline is the method that proves the pipeline needed a decode stage at all: the
+    policy emits a knot column beside control points, which no robot can execute, so
+    something must turn parameters into a trajectory before anything else looks at it.
+    Every other method leaves this slot as identity.
+
+    ``num_actions`` is the speed lever and is a *decode-time* choice needing no
+    retraining -- the curve covers a fixed stretch of demonstrated motion, so asking
+    for fewer samples covers that stretch in fewer executed steps.
+    """
+
+    def __init__(self, step: BSplineDecodeStep):
+        self.step = step
+
+    def __call__(self, chunk: Chunk) -> Chunk:
+        t = torch.from_numpy(np.ascontiguousarray(chunk.actions)).unsqueeze(0)
+        actions, _rates = self.step.decode_batch(t)
+        a = actions[0].cpu().numpy().astype(np.float64)
+        # Decoding changes the row count, so speeds are rebuilt at nominal rather
+        # than carried over: the speed-up lives in how far each decoded action
+        # travels, exactly as it does for demospeedup.
+        return Chunk(actions=a, speeds=np.ones(a.shape[0], dtype=np.float64))
+
+
+class GripperCompensationUndecided(NotImplementedError):
+    """Raised rather than silently running a method with no gripper compensation."""
 
 
 def deploy_steps(method: MethodConfig, *, args, n_action_steps: int | None = None,
@@ -77,6 +114,31 @@ def deploy_steps(method: MethodConfig, *, args, n_action_steps: int | None = Non
         # No speed step: the speedup is in the weights, and retiming time as well
         # would apply it twice. The gripper is paid for in rows instead.
         return [GripperReplicate(int(method.low_v))]
+
+    if isinstance(method, BSplineMethod):
+        decode = BSplineDecode(BSplineDecodeStep(
+            num_actions=int(getattr(args, "bspline_num_actions", 0)) or 16,
+            degree=method.degree,
+            relative_knots=method.relative_knots,
+        ))
+        # B-spline compresses *waypoints*, like demospeedup, so a speed pin buys the
+        # gripper nothing -- speeds are already 1.0. It must be paid in rows, and the
+        # factor is the realised bspline_rate (source frames advanced per executed
+        # action), which varies per chunk rather than being a config constant. Until
+        # that is decided, refuse rather than return a step list whose gripper entry
+        # is a silent no-op: the arm would lift with the gripper still half closed.
+        low_v = getattr(args, "bspline_gripper_low_v", None)
+        if not low_v:
+            raise GripperCompensationUndecided(
+                "B-spline decodes fewer actions across the same motion, so the "
+                "gripper gets proportionally less wall-clock to close -- but unlike "
+                "demospeedup there is no low_v recorded to size the compensation, "
+                "and the realised rate varies per chunk. Set "
+                "--gripper.bspline_low_v explicitly (start from the decoded "
+                "bspline_rate), or pass --gripper.slowdown_frames=0 to state that "
+                "no compensation is wanted."
+            )
+        return [decode, GripperReplicate(int(low_v))]
 
     raise ValueError(
         f"no deploy steps defined for method {type(method).__name__!r} "
