@@ -19,11 +19,11 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 4 | DemoSpeedup training step (tail-walk retiming) | walk parity vs the copied reference (500 sequences, runs by default) + on-the-fly == labels; recorded-dataset reconstruction | ✅ committed (`0b31a80` + follow-ups) |
 | 5 | `TimedActions` contract (`timed.py`) | baseline dt=1/fps is a byte-level no-op | ✅ committed (`432b712`) |
 | 6 | real env: crisp forks referenced, same LeRobot SHA (`real/pixi.toml`) | full pixi solve; NEP 50 in installed env | ✅ committed (`b303153`); fake-mode diff **deferred to deploy day** |
-| 7 | B-spline, real (ACT) | matches `merged_bspline_20260528` reconstruction | 🔨 **gate met**; maths ported and all 70 episodes reconstruct exactly (`methods/bspline/`). Training integration not started — see below |
+| 7 | B-spline, real (ACT) | matches `merged_bspline_20260528` reconstruction | ✅ gate met (all 70 episodes reconstruct exactly) **and integrated**: `--method.type=bspline` trains on 2 datasets × 2 policy families. Not yet trained to completion |
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ⏳ not started |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/pace_bench/`, 267 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 288 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -47,6 +47,8 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `methods/demospeedup/run_label.py` | draccus labelling runner: checkpoint's own preprocessor, per-frame chunk sampling, temporal aggregation over every chunk covering a frame, `speedup_labels/episode_<i>.npy` + the raw `entropy_<i>.npy` trace, `run_config.yaml`; `--batch_frames` (default 32) routes through `sample_frames` for families that implement it, and ACT keeps the one-frame-at-a-time path |
 | `methods/demospeedup/actuator.py` | `DemoSpeedupTrackingActuator`: constant gains+gripper ×low_v, time untouched (upstream's high-gain-XML recipe + arm gains); per-step re-application (reset-proof) |
 | `methods/bspline/spline.py` | the B-spline action representation (`B-spline-policy/bspline-policy` @ `61ed5f4`, arXiv:2607.09648). `fit_episode` (adaptive least-squares fit: `generate_knots` grows the knot count until the spline is within `max_error`), `chunk_parameters` (cut the fit into `(chunk_size + 2*degree, 1 + dim)` windows of the *episode's* knot vector — only the first carries the clamped boundary), `assign_chunks_to_frames` (one matrix per frame, knots shifted to offsets from that frame), `decode_chunk` (evaluate the curve at `num_actions` points across its span — this is the speed knob), `to/from_spline_actions` (cart7 ↔ xyz+rot6d+gripper, with Gram-Schmidt back onto SO(3)), `encode/decode_relative_knots` (the knot column as consecutive differences). Parity against `tests/upstream_reference_bspline.py` |
+| `methods/bspline/layout.py` | which columns of a dataset's action can be splined, named per run: `cart7` (UR10e, angle-axis → rot6d), `ee6d20` (LIBERO, already rot6d, 10 zero-pad columns dropped and restored), `identity` (joint space). Checked against the dataset's real action width, because naming the wrong one is otherwise silent — a transposed rotation still fits and still decodes |
+| `methods/bspline/processor.py` | `BSplineChunkStep` (`bspline_chunk`) + `EpisodeSplines`. Holds every episode's **fit**, not a label per frame (7.7 MB vs 36 MB on pickplace); a sample's matrix is its chunk with the knot column shifted to that frame. Fits once at construction — random sampling means a batch of 32 touches ~32 episodes, so lazy refitting at 1.4 s/fit would cost ~45 s per batch. `transform_features` rewrites the action feature to the matrix's channel count |
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
 | `train/run_train.py` | upstream `lerobot-train` + `--method.*`: wraps `make_train_eval_datasets` (capture dataset, halve chunk) and `make_pre_post_processors` (insert method steps pre-normalizer); calls `train.__wrapped__` (subclass fails upstream's identity check) |
 | `eval/run_libero.py` | draccus eval runner, one task per output dir: method steps attached, actuator per method (PACE per-step / DemoSpeedup constant / none), env↔checkpoint ImageNet dedupe, IDENTITY-stats guard, sim-time recording, `run_config.yaml` |
@@ -154,17 +156,19 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   say anything about the thing the benchmark is for: whether the task succeeds when
   the robot runs faster. **Do not rebuild it.** The real-arm question stays open until
   the UR10e runs both arms and success rates are counted; that is deploy-day work.
-- **B-spline is ported but not yet a benchmark arm.** The maths is in and the
-  reconstruction gate is met, but B-spline is a deeper integration than PACE or
-  DemoSpeedup, both of which only reindex actions and leave the action space alone.
-  This one *replaces* it: the policy regresses a `(chunk + 2*degree, 1 + dim)`
-  parameter matrix — a knot column in frames beside control points in action units —
-  and inference has to decode before anything can be executed. Open:
-  (a) `adjust_policy` currently only halves a chunk; here it must rewrite the action
-  feature's shape *and* width; (b) ACT rebuilds its pad mask as
-  `actions.sum(-1) == 0`, meaningless against a parameter matrix, so `pad_mode` needs
-  deciding for this arm the way it was for diffusion; (c) a decode step at inference,
-  carrying the `num_actions` choice that is the whole speed lever. The paper (§5) integrates with **both**
+- **B-spline trains; it cannot yet be deployed.** `--method.type=bspline` is wired
+  end to end and verified on 2 datasets × 2 policy families (pickplace/cart7 and
+  libero_10_ee6d/ee6d20, each with ACT and Diffusion). What made it deeper than PACE
+  or DemoSpeedup, both of which only reindex actions: it replaces the action *space*,
+  and `make_policy` overwrites `cfg.output_features` from `ds_meta.features` and
+  builds its normalization buffers from `ds_meta.stats`. So `adjust_policy` alone
+  cannot change the action width — hence the new `MethodConfig.adjust_dataset` hook,
+  called from `run_train` after the dataset is built, which rewrites the action
+  feature and replaces its statistics with ones computed from the fits. **Still
+  missing: the decode step at inference**, carrying the `num_actions` choice that is
+  the whole speed lever. Until that exists a B-spline checkpoint predicts splines
+  nobody evaluates. ACT's `actions.sum(-1) == 0` pad heuristic is moot here — a
+  B-spline chunk is fixed-size by construction and the step masks nothing. The paper (§5) integrates with **both**
   Diffusion Policy ("Diff.+BSP") and ACT ("Reg.+BSP"), so batch 7 is a reproduction;
   only the released *code* is diffusion-only. xVLA (batch 8) is ours.
   **The gripper is not special-cased**, which is upstream's own choice
@@ -199,7 +203,26 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   chunks plus a frame→chunk index rather than a matrix per frame (~12 MB for
   pickplace instead of 36 MB, and it is what upstream's `all_actions` /
   `timestep_to_chunk` pair does).
-- **Normalisation is settled: train on `relative_knots=True`** (2026-08-30).
+- **Knots are absolute offsets from the current frame** (user decision 2026-08-30),
+  matching every shipped upstream config and the recorded dataset. Two things get
+  called "relative" here and only one is a choice: the control points are absolute
+  poses always, and the knot column is relative to the sample's own frame always
+  (upstream shifts it per sample; the recorded metadata says `"knot_units": "source
+  frames, relative to the current frame"`). What `relative_knots` selects is whether
+  that time column holds those offsets (-7, 0, 4, ... 51) or their consecutive
+  differences. Offsets normalise to about [-1.6, +1.4], which is fine; the cost is
+  that one per-column statistic spans the row-to-row ramp and attenuates the
+  per-sample knot signal ~2.3x against the control points. The flag remains, off.
+- **Diffusion constrains the matrix width, and LeRobot's own check cannot catch it.**
+  The temporal U-Net halves the horizon once per `down_dims` stage, so the width must
+  be a multiple of `2**len(down_dims)` = 8. `DiffusionConfig.__post_init__` validates
+  exactly this, but it has already run by the time a method mutates the config — so
+  the first attempt died mid-forward with "Sizes of tensors must match except in
+  dimension 1", naming neither the horizon nor the method. `adjust_policy` now checks
+  it and lists the usable `chunk_size` values. The default is `chunk_size=10` (width
+  16), which is upstream's own real-robot horizon and suits every family; the recorded
+  dataset's 20 (width 26) is fine for ACT and xVLA but Diffusion rejects it.
+- **Superseded: normalisation via `relative_knots=True`** (2026-08-30).
   It looked as though the B-spline step would have to own normalisation, because
   LeRobot computes one statistic per action *dimension* while upstream computes one
   per *element* of the matrix — and the knot column badly needs the latter, its value
@@ -210,9 +233,9 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   0.44 of a unit of real signal on top. But upstream already has the fix and it is a
   flag, not an architecture: `relative_knots=True` stores the column as consecutive
   differences, which drops the ratio to 0.23 and makes the stock per-dim normaliser
-  correct. LeRobot's normaliser stays in charge. The recorded dataset used
-  `relative_knots=False`, so the reconstruction gate is unaffected — this is a
-  training-time representation layered on top of it.
+  correct. LeRobot's normaliser stays in charge. **Overtaken by the decision above**:
+  the ramp is real but its cost is a ~2.3x attenuation, not a defect, and upstream
+  ships absolute. Kept here because the measurement is the reason the flag exists.
 - **The interpolable action layout is per dataset, not per method.** `to_spline_actions`
   converts cart7 (xyz + angle-axis + gripper) to xyz + rot6d + gripper because
   angle-axis cannot be interpolated across the pi wrap. But `libero_10_ee6d` is

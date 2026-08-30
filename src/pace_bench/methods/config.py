@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import abc
 import logging
-
-import numpy as np
+import time
 from dataclasses import dataclass, field, fields
 
 import draccus
+import numpy as np
 from lerobot.processor.pipeline import ProcessorStep
+from lerobot.utils.constants import ACTION
 
 from pace_bench.methods.demospeedup.labels import describe, load_labels
 from pace_bench.methods.demospeedup.processor import DemoSpeedupRetimeStep, episode_starts_from_metadata
@@ -77,6 +78,19 @@ class MethodConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore[misc]
 
         Called for every method, so it must stay a no-op by default -- PACE and the
         baseline contribute nothing here and must be unaffected by it.
+        """
+
+    def adjust_dataset(self, dataset) -> None:
+        """Mutate the dataset's *metadata* after it is built, before the policy is.
+
+        Exists because `make_policy` derives `output_features` from `ds_meta.features`
+        and its normalization buffers from `ds_meta.stats`, overwriting whatever
+        `adjust_policy` put on the policy config. A method that changes the action
+        space -- B-spline replaces actions with spline parameters -- can therefore
+        only be seen by the policy through the metadata.
+
+        No-op by default: PACE, DemoSpeedup and the baseline all keep the dataset's
+        own action space.
         """
 
 
@@ -297,3 +311,192 @@ class DemoSpeedupMethod(MethodConfig):
             "DemoSpeedup: halved %s to %d, %s to %d (policy type %r)",
             fields.chunk, chunk // 2, fields.executed, executed // 2, policy_type,
         )
+
+
+@MethodConfig.register_subclass("bspline")
+@dataclass
+class BSplineMethod(MethodConfig):
+    """B-spline action representation (Han et al., arXiv:2607.09648).
+
+    The only method here that changes the action *space*. Instead of regressing a
+    dense sequence of actions the policy regresses one B-spline's parameters -- a
+    knot column beside control points -- and the executable actions are that curve,
+    sampled. Speed then comes from sampling the same span at fewer points rather than
+    from dropping or reweighting demonstration frames.
+
+    Needs no labelling stage: the parameters are a geometric fit of the demonstration,
+    computed in the preprocessor when training starts (3 s for LIBERO-10, 50 s for
+    pickplace).
+    """
+
+    #: Knot spans per chunk. The emitted matrix is `chunk_size + 2*degree` rows, and
+    #: that width becomes the policy's chunk -- so it is the width, not this, that has
+    #: to suit the policy. 10 gives width 16, which is upstream's own real-robot
+    #: configuration (`clean_bspline_policy_*.yaml`, horizon 16) and is a multiple of
+    #: 8, as Diffusion's temporal U-Net requires. The recorded UR10e dataset used 20
+    #: (width 26); that is fine for ACT and xVLA but Diffusion rejects it.
+    chunk_size: int = 10
+    degree: int = 3
+    #: Fit tolerance, in the dataset's own action units, applied per element -- so a
+    #: gripper edge constrains the knot search as hard as a position does.
+    max_error: float = 0.01
+    #: Which columns of this dataset's action can be splined. See `bspline.layout`.
+    layout: str = "cart7"
+    #: Store the knot column as consecutive differences instead of as offsets from
+    #: the current frame. Off by default, matching every shipped upstream config and
+    #: the recorded UR10e dataset. Note this concerns *time* only: the control points
+    #: are absolute poses either way, and the knots are relative to the sample's own
+    #: frame either way -- the choice is offsets (-7, 0, 4, 7, ... 51) against the
+    #: differences of those (4, 3, 2, ...). Offsets normalize to roughly [-1.6, +1.4],
+    #: which is fine; the cost is that a single per-column statistic spans the
+    #: row-to-row ramp, attenuating the per-sample knot signal about 2.3x relative to
+    #: the control points. Turning this on removes the ramp if that ever matters.
+    relative_knots: bool = False
+
+    def __post_init__(self):
+        if self.chunk_size < 2:
+            raise ValueError(f"chunk_size must be >= 2, got {self.chunk_size}")
+        if self.degree < 1:
+            raise ValueError(f"degree must be >= 1, got {self.degree}")
+
+    @property
+    def width(self) -> int:
+        """Rows of the parameter matrix: what the policy's chunk field becomes."""
+        return self.chunk_size + 2 * self.degree
+
+    def _build(self, dataset):
+        """Fit every episode. Cached on the instance so the two hooks share one pass."""
+        if getattr(self, "_splines", None) is not None:
+            return self._splines, self._episode_starts
+        from pace_bench.methods.bspline.layout import resolve_layout
+        from pace_bench.methods.bspline.processor import EpisodeSplines
+
+        raw_dim = int(dataset.meta.features[ACTION]["shape"][0])
+        layout = resolve_layout(self.layout, raw_dim)
+        starts = episode_starts_from_metadata(dataset.meta)
+        action_table = np.asarray(dataset.hf_dataset[ACTION], dtype=np.float64)
+        episode_actions = {
+            episode: action_table[start : start + dataset.meta.episodes[episode]["length"]]
+            for episode, start in starts.items()
+        }
+        started = time.perf_counter()
+        splines = EpisodeSplines(
+            episode_actions, layout, self.chunk_size, self.degree, self.max_error
+        )
+        logging.info(
+            "B-spline: fitted %d episodes in %.1f s, holding %.2f MB of splines "
+            "(layout %r, %d-dim action -> %d spline dims, matrix %dx%d)",
+            len(episode_actions), time.perf_counter() - started, splines.nbytes() / 1e6,
+            layout.name, raw_dim, layout.spline_dim, self.width, splines.channels,
+        )
+        self._splines, self._episode_starts, self._layout = splines, starts, layout
+        return splines, starts
+
+    def adjust_policy(self, policy_cfg) -> None:
+        """The policy predicts one parameter matrix, so its chunk is that matrix.
+
+        Its `n_action_steps` matches: a B-spline chunk is not a sequence executed
+        step by step but a single object decoded into however many actions the
+        deployment asks for, so re-planning happens once per predicted spline.
+        """
+        fields = POLICY_CHUNK_FIELDS.get(policy_cfg.type)
+        if fields is None:
+            raise ValueError(
+                f"B-spline does not know the chunk fields of policy type "
+                f"{policy_cfg.type!r}; add it to POLICY_CHUNK_FIELDS "
+                f"(known: {sorted(POLICY_CHUNK_FIELDS)})."
+            )
+        # Diffusion's temporal U-Net halves the horizon once per `down_dims` stage,
+        # so the width must be a multiple of 2**len(down_dims). LeRobot checks this in
+        # `DiffusionConfig.__post_init__`, which has already run by the time a method
+        # mutates the config -- so without this the run dies mid-forward with
+        # "Sizes of tensors must match except in dimension 1", tens of seconds after
+        # the fit, naming neither the horizon nor the method.
+        if (down_dims := getattr(policy_cfg, "down_dims", None)) is not None:
+            factor = 2 ** len(down_dims)
+            if self.width % factor:
+                usable = [c for c in range(2, 64) if (c + 2 * self.degree) % factor == 0]
+                raise ValueError(
+                    f"B-spline emits a {self.width}-row matrix (chunk_size="
+                    f"{self.chunk_size} + 2*degree={self.degree}), and policy type "
+                    f"{policy_cfg.type!r} needs that to be a multiple of {factor} "
+                    f"(2**len(down_dims), down_dims={tuple(down_dims)}). Use "
+                    f"--method.chunk_size from {usable[:6]}..."
+                )
+        setattr(policy_cfg, fields.chunk, self.width)
+        setattr(policy_cfg, fields.executed, self.width)
+        logging.info(
+            "B-spline: set %s and %s to %d (policy type %r)",
+            fields.chunk, fields.executed, self.width, policy_cfg.type,
+        )
+
+    def adjust_dataset(self, dataset) -> None:
+        """Point the metadata at the parameter matrix, so the policy is built for it.
+
+        `make_policy` reads `ds_meta.features` for the action's width and
+        `ds_meta.stats` for its normalization buffers, so both have to describe the
+        parameters rather than the raw actions. The statistics are computed from the
+        fits themselves -- the dataset's own action stats describe a different
+        quantity in different units and would mis-scale every column.
+        """
+        from pace_bench.methods.bspline.spline import encode_relative_knots
+
+        splines, _ = self._build(dataset)
+
+        # Statistics must describe exactly what the step emits, which is the chunk
+        # *shifted* so its knots read as offsets from the sample's own frame. The
+        # unshifted chunks carry absolute episode positions running to the episode
+        # length -- on pickplace that is a knot column with std 341 instead of 2.5,
+        # and a normalizer built from it would divide the knot signal away. Only
+        # column 0 is affected (a shift cancels in the differences and never touches
+        # a control point), but it is computed by replaying the step rather than by
+        # reasoning about which columns move.
+        total = np.zeros(splines.channels, dtype=np.float64)
+        total_sq = np.zeros(splines.channels, dtype=np.float64)
+        low = np.full(splines.channels, np.inf)
+        high = np.full(splines.channels, -np.inf)
+        count = 0
+        for episode, length in ((e, len(f)) for e, f in splines.frame_to_chunk.items()):
+            for frame in range(length):
+                matrix = splines.parameters(episode, frame)
+                if self.relative_knots:
+                    matrix = encode_relative_knots(matrix, self.degree)
+                total += matrix.sum(axis=0)
+                total_sq += (matrix.astype(np.float64) ** 2).sum(axis=0)
+                low = np.minimum(low, matrix.min(axis=0))
+                high = np.maximum(high, matrix.max(axis=0))
+                count += matrix.shape[0]
+        mean = total / count
+        std = np.sqrt(np.maximum(total_sq / count - mean**2, 0.0))
+
+        dataset.meta.features[ACTION] = {
+            **dataset.meta.features[ACTION],
+            "shape": (splines.channels,),
+        }
+        dataset.meta.stats[ACTION] = {
+            "mean": mean.astype(np.float32),
+            "std": np.maximum(std, 1e-8).astype(np.float32),
+            "min": low.astype(np.float32),
+            "max": high.astype(np.float32),
+            "count": np.array([count]),
+        }
+        logging.info(
+            "B-spline: action metadata now %d-dim; knot column mean %.2f std %.2f, "
+            "control points |mean| <= %.3f",
+            splines.channels, mean[0], std[0], np.abs(mean[1:]).max(),
+        )
+
+    def preprocessor_steps(self, dataset=None) -> list[ProcessorStep]:
+        from pace_bench.methods.bspline.processor import BSplineChunkStep
+
+        if dataset is None:
+            return [BSplineChunkStep(relative_knots=self.relative_knots, degree=self.degree)]
+        splines, starts = self._build(dataset)
+        return [
+            BSplineChunkStep(
+                splines=splines,
+                episode_starts=starts,
+                relative_knots=self.relative_knots,
+                degree=self.degree,
+            )
+        ]

@@ -58,6 +58,12 @@ def attach_method_steps(method: MethodConfig):
         # episode action trajectories from it -- captured here.
         datasets = original_make_datasets(cfg, *args, **kwargs)
         captured["dataset"] = datasets[0]
+        # Then let the method rewrite the dataset's metadata. `make_policy` derives
+        # the action feature's width from `ds_meta.features` and its normalization
+        # buffers from `ds_meta.stats`, overwriting anything `adjust_policy` set on
+        # the policy config -- so a method that changes the action space (B-spline
+        # regresses spline parameters, not actions) can only be seen through here.
+        method.adjust_dataset(datasets[0])
         return datasets
 
     def patched(*args, **kwargs):
