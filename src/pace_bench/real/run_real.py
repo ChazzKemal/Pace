@@ -237,8 +237,8 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
     matched before the producer. Teardown is in a ``finally`` because a live sender
     thread and scaled controller gains outlive a crash.
     """
+    import time
     from collections import deque
-    from datetime import datetime
 
     import rclpy
     from crisp_gym.deploy import session
@@ -248,10 +248,16 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
     from crisp_gym.deploy.trace import RunRecord, write_run_artifacts
 
     env = session.build_env(args)
-    src = _LeRobotChunkSource(pretrained_path=cfg.policy_path, env=env)
+    src = _LeRobotChunkSource(
+        pretrained_path=cfg.policy_path, env=env,
+        # Without this the checkpoint's own n_action_steps wins and cfg is ignored:
+        # a config asking for 32 would quietly run the policy's full 100.
+        n_action_steps=cfg.n_action_steps,
+    )
     n_obs, n_act = src.n_obs, src.n_act
 
-    scaler = sender = None
+    scaler = sender = rec = None
+    started_mono = time.monotonic()
     try:
         session.phase_home(env, args)
         session.phase_switch_controller(env, args)
@@ -271,6 +277,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
         while len(buf) < n_obs:
             buf.append(_get_obs_zerofill(env, schema, last))
 
+        started_mono = time.monotonic()
         run_producer_loop(
             env=env, chunk_source=src, q=q, args=args, rec=rec,
             dt_base=cfg.control_dt, obs_schema=schema,
@@ -279,13 +286,22 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
             obs_buf=buf, last_obs=last, lookbehind_buf=deque(maxlen=8),
             steps=steps,
         )
-        write_run_artifacts(rec, args, sender, None)
     finally:
+        # Drain the sender BEFORE reporting, so its counters are final.
         if sender is not None:
             try:
                 q.put(None); sender.join(5.0)
             except Exception:
                 logger.exception("sender shutdown")
+        # Report from the finally, not the try: a run normally ends by Ctrl-C or by
+        # an exception out of the loop, and the record is most wanted exactly then.
+        if rec is not None:
+            try:
+                rec.duration_s = time.monotonic() - started_mono
+                rec.sender_stage_samples = getattr(sender, "stage_samples", {}) or {}
+                write_run_artifacts(rec, args, sender, None)
+            except Exception:
+                logger.exception("failed to write run artifacts")
         try:
             src.shutdown()
         except Exception:
