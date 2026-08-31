@@ -1,9 +1,13 @@
 """Every dataset an arm trains on carries exactly the features its spec names.
 
-The failure this exists for is silent: LeRobot turns every `observation.*` key
-into a policy input, so a dataset that picked up bookkeeping columns somewhere in
-conversion trains a policy that reads them, the loss goes down, and nothing says
-a word. `stackcups_20260829_merged` did exactly that for 39k steps.
+What is actually at stake is narrower than "a stray column reaches the policy",
+and `specs.py` documents the measurement: the robot state is taken by exact name
+(`observation.state`), so extra *scalar* columns are inert, while `image_features`
+returns *every* VISUAL feature, so an extra camera silently adds a backbone -- and
+a substituted `observation.state` of the wrong width is read as though it were the
+right one. The spec asserts the whole set because the cheap check covers all three
+and because a dataset that quietly differs from what a run assumes is otherwise
+invisible.
 
 Two halves. The unit tests run everywhere and check the checker. The dataset
 tests run against whatever is on this machine and skip per-dataset otherwise,
@@ -51,7 +55,13 @@ class TestTheChecker:
         check(write_dataset(tmp_path, ur10e_features()), UR10E)
 
     def test_an_undeclared_input_fails_and_is_named(self, tmp_path):
-        """The real case: the three wall-clock columns and the duplicate state."""
+        """The real case: the three wall-clock columns and the duplicate state.
+
+        These four are the inert kind -- listed in `input_features`, never read,
+        because the state is taken by exact name. Flagged anyway: they are the
+        signature of a merge that copied columns instead of naming them, and the
+        next thing such a merge carries through might be a camera.
+        """
         root = write_dataset(
             tmp_path,
             ur10e_features(
@@ -127,9 +137,10 @@ def test_the_recorded_training_sets_match_their_specs(relative: str, spec_name: 
 def test_the_dataset_the_rule_came_from_still_fails():
     """`stackcups_20260829_merged` is kept, unfixed, as the archive of the recording.
 
-    Its cleaned sibling is what trains. Asserting the raw one *fails* keeps the
-    example honest: if someone ever strips it in place, this test says so, and
-    the reason the `_clean` copy exists disappears with it.
+    Its cleaned sibling is what trains -- for leanness, not for correctness: all
+    four extra columns are scalars the policy never reads. Asserting the raw one
+    *fails* keeps the example honest, and keeps the difference between the two
+    names visible.
     """
     root = DATASETS / "real" / "stackcups_20260829_merged"
     if not root.is_dir():

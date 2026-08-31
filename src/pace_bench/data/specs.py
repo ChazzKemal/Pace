@@ -1,30 +1,49 @@
 """What a policy is allowed to consume from a training set, named per dataset.
 
-LeRobot classifies **every** key beginning `observation.` as a policy input, with
-no filter and no warning::
+LeRobot lists **every** key beginning `observation.` as a policy input::
 
     elif key.startswith(OBS_STR):
         type = FeatureType.STATE          # utils/feature_utils.py:170
 
-and `make_policy` builds the policy's input projections from that same set
-(`policies/factory.py:333-335`), so whatever survived recording and conversion
-becomes something the network reads. Nothing reports it. `DatasetConfig` has no
-exclusion flag either -- `rename_map` only renames, and refuses to run without a
-pretrained checkpoint -- so the dataset is the only place to decide.
+and `make_policy` copies that whole set into `cfg.input_features`
+(`policies/factory.py:333-335`). What a policy then actually *reads* from it is
+narrower, and the difference is the point of this module -- measured, not assumed:
 
-That went wrong once, on `stackcups_20260829_merged`: it carried three absolute
-wall-clock columns and a byte-identical duplicate of `observation.state`, so an
-ACT baseline trained for 39k steps on seven inputs instead of three. The
-timestamps are monotonic across the whole session, which makes them an episode
-index and a within-episode clock during training -- a shortcut around the
-cameras -- and their std is 6.5e3 seconds, so a deployment one day later feeds
-that channel a value 13 sigma outside anything the normalizer saw.
+* **the robot state is taken by exact name.** `robot_state_feature` is
+  `ft.type is FeatureType.STATE and ft_name == OBS_STATE`
+  (`configs/policies.py:133-139`), and ACT and Diffusion both index
+  `batch[OBS_STATE]` directly (`modeling_act.py:415,467`,
+  `modeling_diffusion.py:272`). So an extra *scalar* `observation.*` column is
+  listed, gets a normalizer buffer, is fetched per batch -- and never enters the
+  network. Verified on a checkpoint trained beside four of them:
+  `encoder_robot_state_input_proj.weight` is `(512, 6)`, the width of
+  `observation.state` alone.
+* **images are taken as a set.** `image_features` returns *every* VISUAL feature
+  (`configs/policies.py:151-154`), and ACT builds a backbone per camera. An extra
+  image stream therefore does change the model, silently.
+* the first ENV feature is taken likewise, though only `observation.environment_state`
+  is ever classified that way.
 
-The fix is not a filter at load time; it is naming what a training set contains,
-so that a dataset can be *checked* rather than trusted. This module holds the
-names. It is the same construction as `bspline.layout.resolve_layout`, one level
-up: a registry entry checked against what the dataset really is, because getting
-it wrong is otherwise silent.
+So the failure this guards is narrower than "any stray column reaches the policy",
+and worth stating exactly:
+
+1. an extra **camera** would be consumed without a word;
+2. a **substituted `observation.state`** would be consumed -- the raw UR10e
+   recordings carry a 13-dim joints+cartesian+gripper bundle under that same
+   name, so only the width tells the two apart;
+3. extra scalar columns cost dataloader I/O and normalizer buffers, and nothing
+   else. Hygiene, not correctness.
+
+`stackcups_20260829_merged` is the case that prompted this: it carries three
+absolute wall-clock columns and a byte-identical duplicate of `observation.state`,
+all four of which are listed in `cups_merged_act_base`'s saved `input_features`
+and none of which that policy ever read. Knowing which of those two things is
+true required reading the weights, and this module exists so the next person does
+not have to.
+
+Same construction as `bspline.layout.resolve_layout`, one level up: a registry
+entry checked against what the dataset really is, because a dataset that quietly
+differs from what a run assumes is otherwise invisible.
 """
 
 from dataclasses import dataclass
@@ -39,10 +58,12 @@ class DatasetSpec:
     """The exact set of features a policy trained on this data may see.
 
     Images are pinned by name only: a re-record at a different resolution is
-    still the same training set. The vector features are pinned by width as
-    well, because that is where a silent substitution actually hurts -- the raw
-    UR10e recordings carry a 13-dim joints+cartesian+gripper bundle under the
-    same `observation.state` name as the 6-dim cartesian pose.
+    still the same training set, and the name is what decides whether a backbone
+    gets built for it. The vector features are pinned by width as well, because
+    that is where a silent substitution actually hurts -- the raw UR10e
+    recordings carry a 13-dim joints+cartesian+gripper bundle under the same
+    `observation.state` name as the 6-dim cartesian pose, and the policy reads
+    whichever one is there.
     """
 
     #: Every `observation.*` key the dataset may carry. Exactly these, no others.

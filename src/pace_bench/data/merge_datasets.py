@@ -14,22 +14,23 @@ so this script rebuilds ``observation.state`` as the 7-dim vector
     [x, y, z, roll, pitch, yaw, gripper]
 
 i.e. ``concat(observation.state.cartesian, observation.state.gripper)``. The
-joint angles and the per-stream timestamp features are dropped, and dropping
-them is **load-bearing, not tidiness**: LeRobot classifies every key beginning
-``observation.`` as a policy input (``utils/feature_utils.py:170``) and builds
-the policy's input projections from that set (``policies/factory.py:333-335``).
-Nothing is ignored. A column left in here is a column the network reads.
+joint angles and the per-stream timestamp features are dropped.
 
-(This docstring used to claim the opposite -- "LeRobot ignores non-standard
-``observation.*`` keys during training anyway" -- and that belief is what let
-``stackcups_20260829_merged`` be built with three absolute wall-clock columns
-still attached, which then trained an ACT baseline for 39k steps on seven inputs
-instead of three. See ``docs/PLAN.md``.)
+This docstring used to add "LeRobot ignores non-standard ``observation.*`` keys
+during training anyway", which is too strong in one direction and was then
+over-corrected in the other. What is true (``configs/policies.py:133-154``): the
+robot state is matched by **exact name** -- ``ft_name == OBS_STATE`` -- so a
+stray *scalar* ``observation.*`` column is listed in ``input_features``, given a
+normalizer buffer, loaded per batch, and never read; but ``image_features``
+returns **every** VISUAL feature, so a stray *camera* is read and gets its own
+backbone, and a wrong-width ``observation.state`` is read as though it were
+right. Dropping the timestamps here is therefore hygiene; rebuilding the state to
+exactly 7 dims is the load-bearing part.
 
-The rule that follows: a merge **allowlists**. It names the features it wants and
+The rule either way: a merge **allowlists**. It names the features it wants and
 never looks at the rest, so a column added to the recorder next year cannot leak
-into a training set. ``pace_bench.data.specs`` holds those names, and
-``tests/test_dataset_specs.py`` checks each dataset against them.
+into a training set whatever its type. ``pace_bench.data.specs`` holds those
+names, and ``tests/test_dataset_specs.py`` checks each dataset against them.
 
 ``action`` is copied through unchanged: it is already [x, y, z, roll, pitch,
 yaw, gripper] -- the desired "target pose + target gripper".

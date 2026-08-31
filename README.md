@@ -150,10 +150,12 @@ docs/PLAN.md           batch plan, current state, and decisions worth not relear
 
 ### What a policy is allowed to see
 
-LeRobot turns **every** `observation.*` key into a policy input, with no filter and
-no warning (`utils/feature_utils.py:170`), so a dataset that picked up bookkeeping
-columns somewhere in conversion trains a policy that reads them. That happened once
-— three absolute wall-clock columns reached an ACT baseline for 39k steps.
+LeRobot *lists* every `observation.*` key in `input_features`
+(`utils/feature_utils.py:170`), but a policy reads less than that, and the gap is
+worth knowing: the robot state is matched by **exact name** (`configs/policies.py:137`,
+`ft_name == OBS_STATE`), so extra scalar columns are inert — while `image_features`
+returns **every** VISUAL feature, so an extra camera silently adds a backbone, and a
+substituted `observation.state` of the wrong width is read as if it were the right one.
 
 `data/specs.py` names the inputs per robot, `TRAINING_SETS` maps each dataset an arm
 trains on to its spec, and `tests/test_dataset_specs.py` checks every one present on

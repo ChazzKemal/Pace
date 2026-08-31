@@ -426,48 +426,51 @@ Runtimes for every stage above are tabulated in the README (`## Runtimes`).
   an unbatched action chunk are both 3-D. Reshape against the policy config's
   declared feature shapes, the same way chunk fields come from
   `POLICY_CHUNK_FIELDS`.
-- **LeRobot feeds the policy every `observation.*` column there is.**
-  `elif key.startswith(OBS_STR): type = FeatureType.STATE`
-  (`utils/feature_utils.py:170`), and `make_policy` builds the input projections
-  from that same set (`policies/factory.py:333-335`). There is no filter, no
-  warning, and no exclusion flag on `DatasetConfig` — `rename_map` only renames
-  and refuses to run without a pretrained checkpoint. So whatever survived
-  recording and conversion is what the network reads.
-  Cost us 39k steps: `stackcups_20260829_merged` carried three absolute
-  wall-clock columns plus a byte-identical duplicate of `observation.state`, so
-  `cups_merged_act_base` trained on **seven** inputs instead of three. The
-  timestamps are monotonic across the whole session (18:05→23:05 on 2026-08-29),
-  which during training makes them an episode index and a within-episode clock —
-  a shortcut around the cameras — and their std is 6.5e3 s, so a deployment one
-  day later feeds that channel a value 13σ outside anything the normalizer saw.
-  Both affected runs are renamed `_ts_input` and carry a `WHY_RENAMED.md`; the
-  labels derived from one of them are `outputs/label/stack_cups_ts_input/`,
-  because a DemoSpeedup label *is* the oracle's entropy and inherits its inputs.
-  Pickplace was never affected: `merge_datasets_cart6.py` builds its output by
-  **naming** the four features it wants (`build_target_features`) and never looks
-  at the source's other columns, so nothing can leak through. The cups merge
-  copied every column across instead. That is the whole difference, and it is the
-  rule: **a merge allowlists; it does not filter.** `crop_stalls.py` keeps
-  everything by default and only drops via `--keep-features`, which was passed in
-  2 of 6 runs — so the stall remover is not where this gets decided.
-  The decision (user, 2026-08-31) is to name the inputs rather than strip per run:
-  `pace_bench.data.specs` holds one `DatasetSpec` per robot, `TRAINING_SETS` maps
-  each dataset an arm trains on to its spec, and `tests/test_dataset_specs.py`
-  checks every one that is on the machine. Same construction as
-  `bspline.layout.resolve_layout`, one level up — a registry entry checked against
-  what the dataset really is, because getting it wrong is otherwise silent.
-  Deliberately **not** done: a guard in `run_train.py`, and a load-time filter.
-  A filter would have to be applied at both dataset construction sites
-  (`train/run_train.py:59` and `demospeedup/run_label.py:184`) identically, and
-  missing the labelling one would have the oracle measure entropy in a
-  seven-input observation space while the arm it labels trains in a three-input
-  one — silently wrong labels, a worse bug than the one being fixed. Allowlisting
-  at merge time solves it once, upstream of both. A load-time filter earns its
-  place only for input *ablations* (several arms, one dataset, different input
-  subsets); the seam for it already exists in `adjust_dataset`, so deferring
-  costs nothing.
-  Note also that column edits are cheap and frame edits are not: a dataset is
-  ~98.5% video (cups: 549 MB of video against 8.0 MB of data), so dropping a
-  column rewrites parquet only and runs in seconds with the videos hardlinked,
-  while anything that removes *frames* re-encodes every stream. `crop_stalls.py`
-  and the merges are slow for that reason; stripping a column never needs to be.
+- **A policy reads far less than `input_features` lists, and the difference had to
+  be measured.** LeRobot lists every `observation.*` key as an input
+  (`utils/feature_utils.py:170`) and `make_policy` copies the lot into
+  `cfg.input_features` (`policies/factory.py:333-335`). It does *not* follow that
+  the network reads them, and on 2026-08-31 that distinction was got wrong here
+  before being checked — the entry this replaces claimed a 39k-step ACT baseline
+  had been trained on seven inputs and was void. It had not, and it is not.
+  What the code actually does, verified three ways:
+  * `robot_state_feature` is `ft.type is FeatureType.STATE and ft_name ==
+    OBS_STATE` (`configs/policies.py:133-139`) — an **exact name match**, not
+    "the first STATE feature". ACT and Diffusion then index `batch[OBS_STATE]`
+    directly (`modeling_act.py:415,467`, `modeling_diffusion.py:272`).
+  * the trained weights agree: `cups_merged_act_base`'s
+    `encoder_robot_state_input_proj.weight` is `(512, 6)` — the width of
+    `observation.state` alone, beside four other scalar `observation.*` columns
+    it was never given.
+  * the saved normalizer carries buffers for `frame_index`, `index`,
+    `episode_index`, `task_index` and `timestamp` as well, which on its own
+    disproves "has a normalizer buffer" ⇒ "is a model input". The normalizer is
+    indiscriminate; the policy is not. It also skips any key absent from the
+    observation (`normalize_processor.py:281`, `key in new_observation`), so a
+    checkpoint whose config lists columns the robot does not publish still runs.
+  So the real hazards are narrower, and only two of them bite:
+  1. **an extra camera is consumed.** `image_features` returns *every* VISUAL
+     feature (`configs/policies.py:151-154`) and ACT builds a backbone per camera.
+  2. **a substituted `observation.state` is consumed.** The raw UR10e recordings
+     carry a 13-dim joints+cartesian+gripper bundle under that same name; only
+     the width distinguishes it from the 6-dim pose.
+  3. extra *scalar* `observation.*` columns cost dataloader I/O and normalizer
+     buffers and nothing else — hygiene, not correctness.
+  `pace_bench.data.specs` names the inputs per robot, `TRAINING_SETS` maps each
+  dataset an arm trains on to its spec, and `tests/test_dataset_specs.py` checks
+  every one present. It is worth keeping for (1) and (2) and because a dataset
+  that quietly differs from what a run assumes is otherwise invisible — but not
+  on the strength of (3), which is what it was first written for.
+  Standing conventions this leaves intact: a merge **allowlists** rather than
+  filters (`merge_datasets_cart6.build_target_features` names its four features
+  and never looks at the rest, which is why pickplace was never in question);
+  `crop_stalls.py` keeps every column unless `--keep-features` is passed, which
+  happened in 2 of 6 runs; and column edits are cheap while frame edits are not
+  — a dataset is ~98.5% video (cups: 549 MB video against 8.0 MB data), so
+  dropping a column rewrites parquet only and runs in seconds with the videos
+  hardlinked, while removing *frames* re-encodes every stream.
+  **The general lesson, which is the reason this entry is long:** "the config
+  lists it" is not evidence the model uses it. Check the consuming code, or the
+  weight shapes, before calling a run void. Renaming two output directories and
+  writing three tombstones on the strength of a config listing cost more than
+  reading `configs/policies.py:133` would have.
