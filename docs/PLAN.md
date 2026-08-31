@@ -450,7 +450,19 @@ Runtimes for every stage above are tabulated in the README (`## Runtimes`).
     checkpoint whose config lists columns the robot does not publish still runs.
   So the real hazards are narrower, and only two of them bite:
   1. **an extra camera is consumed.** `image_features` returns *every* VISUAL
-     feature (`configs/policies.py:151-154`) and ACT builds a backbone per camera.
+     feature (`configs/policies.py:151-154`), and ACT feeds each one through the
+     backbone and appends its whole feature map to the encoder sequence
+     (`modeling_act.py:472-487`) — on 480x640 that is ~300 more tokens per camera.
+     Not an extra ResNet: ACT shares **one** backbone across every camera
+     (`modeling_act.py:336`, applied in a loop at `:477`), which is upstream's own
+     design — `detr_vae.py:156,209` call `self.backbones[0]` for every `cam_id`
+     under the authors' `# HARDCODED` comment, and only the CNN-MLP *baseline*
+     (`build_cnnmlp`, `:396-398`) builds one backbone per camera. Confirmed against
+     the trained weights: `pickplace_act_base` has 100 `model.backbone.*` tensors
+     and no `backbones.N` key, for two cameras. Note also that the cameras are not
+     distinguished positionally — `encoder_cam_feat_pos_embed` is derived from the
+     feature-map shape, so two 480x640 streams get *identical* position embeddings
+     and the transformer separates them by content alone. Upstream does the same.
   2. **a substituted `observation.state` is consumed.** The raw UR10e recordings
      carry a 13-dim joints+cartesian+gripper bundle under that same name; only
      the width distinguishes it from the 6-dim pose.
