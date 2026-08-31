@@ -1,27 +1,10 @@
-# A demospeedup arm. low_v is read from the checkpoint's built pipeline unless set
-# here, so it cannot drift from what the weights were trained against. No speed
-# entry: the speed-up is already in the weights, and retiming time too applies it
-# twice. The gripper is repaid in rows instead.
+# A demospeedup arm. No speed entry: the speed-up is already in the weights, and
+# retiming time as well would apply it twice. The gripper is repaid in rows instead.
+# low_v is read from the checkpoint's built pipeline unless set here, so it cannot
+# drift from what the weights were trained against.
+_include: deploy_defaults.yaml
 
 method:
   type: demospeedup
   low_v: 2
   high_v: 4
-
-policy_path: ""
-env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
-fps: 20.0
-n_action_steps: 32
-
-sender:
-  cpp: true
-  startup_delay: 4.0
-blend:
-  overlap: 4
-  mode: hermite
-loop:
-  overlap_threshold: 2
-gains:
-  scale_kp: false
-gripper:
-  slowdown_frames: 5

@@ -26,6 +26,7 @@ import draccus
 
 from pace_bench.methods.config import MethodConfig, MethodPipelineConfig, NoMethod
 from pace_bench.real.checkpoint import read_checkpoint, validate_method
+from pace_bench.real.configs import materialise
 from pace_bench.real.deploy_steps import deploy_steps
 
 logger = logging.getLogger(__name__)
@@ -311,9 +312,28 @@ def main(cfg: RealEvalConfig) -> None:
     run_on_robot(cfg, steps, deploy_args(cfg, method))
 
 
+def _resolve_config_arg(argv: list[str]) -> list[str]:
+    """Expand ``_include`` in a --config_path before draccus opens the file.
+
+    draccus reads one YAML by path and knows nothing about inheritance, so the merge
+    happens here and it is handed the resolved file. A config without an ``_include``
+    is passed through by path, so it keeps its own name in logs.
+    """
+    out = list(argv)
+    for i, a in enumerate(out):
+        if a == "--config_path" and i + 1 < len(out):
+            out[i + 1] = str(materialise(out[i + 1]))
+        elif a.startswith("--config_path="):
+            out[i] = "--config_path=" + str(materialise(a.split("=", 1)[1]))
+    return out
+
+
 if __name__ == "__main__":
     # Import the package-qualified main so draccus resolves the same class object
     # (under `python -m`, this file is __main__ and RealEvalConfig would differ).
+    import sys
+
     from pace_bench.real.run_real import main as packaged_main
 
+    sys.argv = _resolve_config_arg(sys.argv)
     packaged_main()

@@ -1,23 +1,5 @@
-# No method: bit-identical to the pre-method deploy path. Transport settings match
-# the other arms so a comparison isolates the method rather than the plumbing.
+# No method: bit-identical to the pre-method deploy path.
+_include: deploy_defaults.yaml
 
 method:
   type: none
-
-policy_path: ""
-env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
-fps: 20.0
-n_action_steps: 32
-
-sender:
-  cpp: true
-  startup_delay: 4.0
-blend:
-  overlap: 4
-  mode: hermite
-loop:
-  overlap_threshold: 2
-gains:
-  scale_kp: false
-gripper:
-  slowdown_frames: 5

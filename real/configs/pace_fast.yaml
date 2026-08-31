@@ -1,38 +1,10 @@
-# PACE at 2x. Every knob that changes what reaches the robot is stated here --
-# leaving one out means falling back to 19_deploy_policy.py's argparse default,
-# which is conservative (no blending, Python sender, no startup delay) and would
-# silently produce a different run from the one this rig has 256 sessions behind.
+# PACE at 2x. Eval-time speed modulation: applies to any checkpoint, including a
+# plain baseline, because nothing about it is baked into the weights.
+_include: deploy_defaults.yaml
 
 method:
   type: pace
-  max_speed: 2.0          # also sizes the gain scaler, when gains.scale_kp is on
+  max_speed: 2.0            # also sizes the gain scaler when gains.scale_kp is on
   min_speed: 1.0
   clamp_deg: 5.0
   n_lookahead: 2
-
-policy_path: ""           # --policy_path on the command line
-env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
-fps: 20.0
-n_action_steps: 32        # executed per query; must be < the policy's chunk_size
-
-sender:
-  cpp: true               # C++ sender: keeps cadence under GIL contention
-  startup_delay: 4.0      # NOT optional with cpp: DDS subscriber match, else
-                          # the first chunk is published into the void
-  rt_priority: 0
-
-blend:
-  overlap: 4              # hold back 4 frames, fold into the next chunk's head
-  mode: hermite           # bridge position AND velocity; linear only averages
-  skip: 0
-
-loop:
-  overlap_threshold: 2    # inference budget = 2 x dt_eff = 100 ms at 20 Hz
-
-gains:
-  scale_kp: false         # writes controller params on the robot; opt in
-
-gripper:
-  slowdown_frames: 5      # hold nominal speed across a grasp; the stroke is
-                          # fixed hardware and cannot be sped up
-  invert: false

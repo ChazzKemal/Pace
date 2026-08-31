@@ -1,0 +1,39 @@
+# Transport settings shared by every arm. An arm inherits this with
+#
+#     _include: deploy_defaults.yaml
+#
+# and states only its own `method:` block, so a comparison between arms isolates the
+# method rather than the plumbing.
+#
+# Defaults are the values this rig actually deploys with, NOT 19_deploy_policy.py's
+# argparse defaults -- those are conservative (no blending, Python sender, no startup
+# delay) and would quietly produce a different run from the one with 256 sessions
+# behind it.
+
+policy_path: ""             # supply with --policy_path
+env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
+fps: 20.0
+n_action_steps: 32          # executed per query; must be < the policy's chunk_size
+
+sender:
+  cpp: true                 # C++ sender: holds cadence under GIL contention
+  startup_delay: 4.0        # NOT optional with cpp -- DDS subscriber match, else
+                            # the first chunk is published into the void
+  rt_priority: 0
+
+blend:
+  overlap: 4                # hold back 4 frames, fold into the next chunk's head
+  mode: hermite             # bridges position AND velocity; linear only averages
+  skip: 0
+
+loop:
+  overlap_threshold: 2      # inference budget = 2 x dt_eff = 100 ms at 20 Hz
+
+gains:
+  scale_kp: false           # writes controller parameters on the robot; opt in
+
+gripper:
+  slowdown_frames: 5        # nominal speed across a grasp; the 85 mm stroke needs
+                            # ~0.57 s even at the driver maximum and cannot be
+                            # sped up. NOTE: historical runs used 0.
+  invert: false
