@@ -32,6 +32,62 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SenderConfig:
+    """How targets reach the robot.
+
+    Defaults are the values this rig actually deploys with, not
+    ``19_deploy_policy.py``'s historical argparse defaults. Those defaults are
+    conservative -- Python sender, no startup delay -- and silently produce a
+    different run from the one that has 256 sessions behind it.
+    """
+
+    #: C++ subprocess sender. Keeps cadence under GIL contention.
+    cpp: bool = True
+    #: Seconds to wait after starting the sender before the first chunk. With the
+    #: C++ sender this is not optional: DDS needs the subscriber match to complete
+    #: or the first chunk is published into the void.
+    startup_delay: float = 4.0
+    #: SCHED_FIFO priority for the C++ sender; 0 disables real-time scheduling.
+    rt_priority: int = 0
+
+
+@dataclass
+class BlendConfig:
+    """Chunk-seam smoothing.
+
+    A new chunk is predicted from a fresh observation and need not continue the old
+    one, so the join is where the arm jerks. ``hermite`` bridges position *and*
+    velocity across the seam; ``linear`` averages the two predictions.
+    """
+
+    overlap: int = 4
+    mode: str = "hermite"
+    skip: int = 0
+
+
+@dataclass
+class LoopConfig:
+    """When the producer goes back for more.
+
+    ``overlap_threshold`` is the inference budget: the next chunk is requested once
+    the queue falls to this many items, so inference must finish within
+    ``overlap_threshold x dt_eff`` or the sender drains dry.
+    """
+
+    overlap_threshold: int = 2
+    stride: int = 1
+
+
+@dataclass
+class GainsConfig:
+    """Controller stiffness scaling. Off unless asked -- it writes to the robot."""
+
+    scale_kp: bool = False
+    kp_exp: float = 2.0
+    kd_exp: float = 1.0
+
+
+@dataclass
 class GripperConfig:
     """How this run gives the gripper back the time a speedup took from it.
 
@@ -60,6 +116,10 @@ class RealEvalConfig(MethodPipelineConfig):
     n_action_steps: int | None = None
     max_chunks: int = -1
     gripper: GripperConfig = field(default_factory=GripperConfig)
+    sender: SenderConfig = field(default_factory=SenderConfig)
+    blend: BlendConfig = field(default_factory=BlendConfig)
+    loop: LoopConfig = field(default_factory=LoopConfig)
+    gains: GainsConfig = field(default_factory=GainsConfig)
     dry_run: bool = False
     #: Deploy a checkpoint whose trained method contradicts --method.type.
     force: bool = False
@@ -69,7 +129,7 @@ class RealEvalConfig(MethodPipelineConfig):
         return 1.0 / max(self.fps, 1e-9)
 
 
-def deploy_args(cfg: RealEvalConfig):
+def deploy_args(cfg: RealEvalConfig, method=None):
     """crisp_gym's deploy vocabulary, seeded from its own CLI defaults.
 
     The actuation layer speaks the argparse namespace ``19_deploy_policy.py`` builds
@@ -88,12 +148,33 @@ def deploy_args(cfg: RealEvalConfig):
     args.max_chunks = cfg.max_chunks
     args.gripper_slowdown_frames = cfg.gripper.slowdown_frames
     args.invert_gripper = cfg.gripper.invert
+    args.cpp_sender = cfg.sender.cpp
+    args.startup_delay = cfg.sender.startup_delay
+    args.rt_priority = cfg.sender.rt_priority
+    args.blend_overlap = cfg.blend.overlap
+    args.blend_mode = cfg.blend.mode
+    args.blend_skip = cfg.blend.skip
+    args.overlap_threshold = cfg.loop.overlap_threshold
+    args.stride = cfg.loop.stride
+    args.scale_kp = cfg.gains.scale_kp
+    args.kp_exp = cfg.gains.kp_exp
+    args.kd_exp = cfg.gains.kd_exp
     args.yes = True                  # the method and checkpoint were already validated
     if cfg.n_action_steps is not None:
         args.n_act = cfg.n_action_steps
-    # The method owns the speed decision, so the heuristic knobs stay neutral;
-    # method `none` then reproduces the pre-method defaults exactly.
+    # The method owns the speed decision, so the heuristic schedule stays neutral --
+    # for anything but `none` it is not even in the pipeline.
     args.max_speed = args.min_speed = 1.0
+
+    # ...but the gain scaler is NOT part of the pipeline: phase_scaler reads
+    # args.max_speed directly to size peak stiffness (kp = kp_base * s_eff**2). Leave
+    # it at 1.0 and a method that drives the arm at 2.0 gets gains for 1.0 -- the arm
+    # lags and cuts corners at exactly the speeds the method exists to reach. So the
+    # method's own peak is propagated when it has one.
+    peak = getattr(method, "max_speed", None) if method is not None else None
+    if peak is not None:
+        args.max_speed = float(peak)
+        args.min_speed = float(getattr(method, "min_speed", None) or peak / 2)
     return args
 
 
@@ -129,7 +210,7 @@ def resolve_method(cfg: RealEvalConfig) -> MethodConfig:
 def build_steps(cfg: RealEvalConfig, method: MethodConfig, dataset_stats=None) -> list:
     """The deploy pipeline this run will hand to crisp_gym's producer loop."""
     return deploy_steps(
-        method, args=deploy_args(cfg),
+        method, args=deploy_args(cfg, method),
         n_action_steps=cfg.n_action_steps,
         control_dt=cfg.control_dt,
         dataset_stats=dataset_stats,
@@ -227,7 +308,7 @@ def main(cfg: RealEvalConfig) -> None:
     logger.info("method=%s | steps=%s",
                 getattr(method, "type", "none"), [type(s).__name__ for s in steps])
     logger.info("run config -> %s", dump_run_config(cfg))
-    run_on_robot(cfg, steps, deploy_args(cfg))
+    run_on_robot(cfg, steps, deploy_args(cfg, method))
 
 
 if __name__ == "__main__":
