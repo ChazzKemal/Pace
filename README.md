@@ -21,7 +21,7 @@ loop — stays exactly as upstream LeRobot provides it.
 | baseline        | `none`          | stock policy, no steps                                     | ✅          |
 | **PACE**        | `pace`          | per-chunk speed + stride at inference, from action geometry | ✅          |
 | DemoSpeedup     | `demospeedup`   | entropy-labels demos, retimes training targets             | ✅          |
-| B-spline        | —               | spline action space                                        | not started |
+| B-spline        | `bspline`       | spline action space, decoded at eval — the speed lever      | ✅ trains; no arm run to completion |
 
 ## Install
 
@@ -138,12 +138,27 @@ src/pace_bench/
     config.py          --method.type registry; chunk geometry per policy family
     pace/              speed decision math, processor step, robosuite actuator
     demospeedup/       entropy, segmentation, chunk samplers, retiming, labelling
+    bspline/           spline fit, action layouts, decode, eval-time actuation
+  data/                recordings → training sets: crop stalls, merge, reshape columns
+    specs.py           what a policy may consume, per robot — checked in tests
   train/run_train.py   lerobot-train + --method.*
   eval/run_libero.py   LIBERO eval runner
   timed.py             TimedActions — per-action dt, the real robot's (pose, t) view
 real/                  pixi manifest + lock for the UR10e deploy environment
 docs/PLAN.md           batch plan, current state, and decisions worth not relearning
 ```
+
+### What a policy is allowed to see
+
+LeRobot turns **every** `observation.*` key into a policy input, with no filter and
+no warning (`utils/feature_utils.py:170`), so a dataset that picked up bookkeeping
+columns somewhere in conversion trains a policy that reads them. That happened once
+— three absolute wall-clock columns reached an ACT baseline for 39k steps.
+
+`data/specs.py` names the inputs per robot, `TRAINING_SETS` maps each dataset an arm
+trains on to its spec, and `tests/test_dataset_specs.py` checks every one present on
+the machine. A merge **allowlists**: it names the features it wants and never looks
+at the rest, so a column added to the recorder later cannot leak into a training set.
 
 ## Results so far
 
@@ -163,7 +178,7 @@ deployment. See `docs/PLAN.md` for what is trained, what is not, and why.
 pytest
 ```
 
-245 tests, no network, no external checkouts, nothing skipped. They include parity
+338 tests, no network, no external checkouts, nothing skipped. They include parity
 checks of the DemoSpeedup ports against that paper's own code, which is copied
 verbatim into `tests/upstream_reference.py` with its provenance.
 

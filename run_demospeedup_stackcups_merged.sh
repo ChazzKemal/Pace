@@ -41,7 +41,7 @@ PY=.venv/bin/python
 
 # The card is 24GB and the disk was at 97% when this queue was written, so both
 # get checked up front rather than 6 hours in.
-PRUNER=${PACE_PRUNER:-$(dirname "$REPO_ROOT")/prune_checkpoints.py}
+PRUNER=${PACE_PRUNER:-$REPO_ROOT/src/pace_bench/data/prune_checkpoints.py}
 KEEP=2
 [ -f "$PRUNER" ] || echo "WARNING: no pruner at $PRUNER (set PACE_PRUNER); keeping every checkpoint"
 FREE_GB=$(df -BG --output=avail . | tail -1 | tr -dcs '0-9' '\n')

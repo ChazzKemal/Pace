@@ -78,7 +78,7 @@ DATASET_ROOT=${PICKPLACE_ROOT:-$DATA_ROOT/datasets/real/pickplace_cart7_v2_angle
 # the pruner annotates with PEP 585 generics (list[tuple[...]]) that need 3.9+.
 # Invoked as `python3` it dies on import, and because it runs in the background
 # nothing surfaces that -- the first symptom is a full disk hours later.
-PRUNER=${PACE_PRUNER:-$(dirname "$REPO_ROOT")/prune_checkpoints.py}
+PRUNER=${PACE_PRUNER:-$REPO_ROOT/src/pace_bench/data/prune_checkpoints.py}
 KEEP=2
 [ -f "$PRUNER" ] || echo "WARNING: no pruner at $PRUNER (set PACE_PRUNER); keeping every checkpoint"
 
