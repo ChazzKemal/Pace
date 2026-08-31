@@ -16,8 +16,11 @@ run on the arm, because the rig was down when this was written. The phase orderi
 the one property no offline check covers.
 """
 
-from __future__ import annotations
-
+# NOTE: no `from __future__ import annotations` here. It turns annotations into
+# strings, and draccus reads main()'s annotation at runtime to find the config
+# class -- it would receive the string "RealEvalConfig" and fail with
+# "must be called with a dataclass type or instance". The `X | None` syntax used
+# below needs no future import on Python 3.10+.
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
