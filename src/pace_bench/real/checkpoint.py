@@ -164,7 +164,7 @@ def validate_method(declared: str, facts: CheckpointFacts, *, force: bool = Fals
             f"{facts.path} was trained as {trained or 'a plain baseline (no method '
             'recorded)'}. Its waypoints are not retimed, so the gripper "
             "compensation would slow the grasp for no reason and the run would not "
-            "be comparable to a real demospeedup arm."
+            "be comparable to a real demospeedup run."
         )
         if not force:
             raise MethodMismatch(msg + " Pass --force to override.")

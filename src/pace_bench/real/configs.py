@@ -1,19 +1,19 @@
 """Config includes, so transport settings live in exactly one file.
 
-Every arm of a benchmark shares its plumbing -- sender, blending, loop timing,
-gripper -- and differs only in its ``method``. Copying that plumbing into each arm's
+Every run configuration in a benchmark shares its plumbing -- sender, blending, loop timing,
+gripper -- and differs only in its ``method``. Copying that plumbing into each config's
 YAML reintroduces the drift this whole layer exists to prevent: if ``pace_fast.yaml``
 and ``baseline.yaml`` disagree on ``blend.overlap``, the comparison measures the
 plumbing rather than the method, and nothing in the output says so.
 
-So an arm names what it inherits::
+So a config names what it inherits::
 
     _include: deploy_defaults.yaml
     method:
       type: pace
       max_speed: 2.0
 
-and its file then shows only what makes it that arm.
+and its file then shows only what distinguishes it.
 
 draccus reads a single YAML by path, so includes are resolved *before* it sees the
 file: the merged result is written to a temp file and that path is handed on. The
@@ -35,10 +35,10 @@ INCLUDE_KEY = "_include"
 def deep_merge(base: dict, override: dict) -> dict:
     """``override`` wins, but nested dicts merge rather than replace.
 
-    Replacing wholesale would mean an arm setting one gripper field silently
+    Replacing wholesale would mean a config setting one gripper field silently
     discarded the others -- ``gripper: {slowdown_frames: 0}`` would drop ``invert``
     and take the dataclass default instead of the shared one. Merging keeps the parts
-    the arm did not mention.
+    it did not mention.
 
     Lists are replaced, not concatenated: a list in config is a value, and appending
     to an inherited one is almost never what the author meant.
@@ -56,7 +56,7 @@ def resolve_config(path: str | Path, _seen: tuple[Path, ...] = ()) -> dict[str, 
     """Load a YAML, resolving ``_include`` chains depth-first.
 
     An include may itself include, so a site could keep a base, a rig-specific layer
-    and an arm. Cycles raise rather than recursing forever.
+    and a run configuration. Cycles raise rather than recursing forever.
     """
     p = Path(path).resolve()
     if p in _seen:

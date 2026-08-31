@@ -1,8 +1,8 @@
-# Transport settings shared by every arm. An arm inherits this with
+# Transport settings shared by every run configuration. A config inherits this with
 #
 #     _include: deploy_defaults.yaml
 #
-# and states only its own `method:` block, so a comparison between arms isolates the
+# and states only its own `method:` block, so a comparison between configs isolates the
 # method rather than the plumbing.
 #
 # Defaults are the values this rig actually deploys with, NOT 19_deploy_policy.py's

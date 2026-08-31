@@ -1,4 +1,4 @@
-# A demospeedup arm. No speed entry: the speed-up is already in the weights, and
+# A demospeedup run. No speed entry: the speed-up is already in the weights, and
 # retiming time as well would apply it twice. The gripper is repaid in rows instead.
 # low_v is read from the checkpoint's built pipeline unless set here, so it cannot
 # drift from what the weights were trained against.
