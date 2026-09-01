@@ -28,6 +28,7 @@ import contextlib
 import csv
 import curses
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -497,6 +498,34 @@ def browse_tui() -> int:
 # 3-D viewer
 # ---------------------------------------------------------------------------
 
+def _backend(save: Path | None) -> str:
+    """A matplotlib backend that exists here, rather than one we wish existed.
+
+    Order matters. Writing a file must work headless, so that is Agg regardless of
+    what is installed. For an interactive window WebAgg is the nicest over SSH -- a
+    browser UI with no X server, which is why crisp_gym's 27_speedup_slider_viewer
+    defaults to it -- but it needs tornado, and this environment does not ship it.
+    TkAgg is present (matplotlib's own default here) and needs a display. An explicit
+    MPLBACKEND always wins; this only fills in the default.
+    """
+    if save:
+        return "Agg"
+    with contextlib.suppress(ImportError):
+        import tornado  # noqa: F401
+        return "WebAgg"
+    if os.environ.get("DISPLAY") or sys.platform == "darwin":
+        with contextlib.suppress(ImportError):
+            import tkinter  # noqa: F401
+            return "TkAgg"
+    sys.exit(
+        "no interactive matplotlib backend available.\n"
+        "  - write a file instead:  --gui -c N -o chunk.png\n"
+        "  - or over SSH, install tornado for the browser UI:\n"
+        "      pixi add --manifest-path real/pixi.toml --feature dev tornado\n"
+        "  - or forward a display (ssh -X) and matplotlib will use TkAgg."
+    )
+
+
 def gui(run: Path, start: int = 0, save: Path | None = None) -> int:
     """Commanded path in 3-D, coloured by the speed PACE chose, chunk by chunk.
 
@@ -510,9 +539,7 @@ def gui(run: Path, start: int = 0, save: Path | None = None) -> int:
     MPLBACKEND=TkAgg for a native window over ssh -X.
     """
     import os
-    # Only claim the browser backend for an interactive window. With --out we are
-    # rendering to a file, which must work headless (no DISPLAY, no WebAgg server).
-    os.environ.setdefault("MPLBACKEND", "Agg" if save else "WebAgg")
+    os.environ.setdefault("MPLBACKEND", _backend(save))
     import matplotlib.pyplot as plt
     from matplotlib.widgets import Slider
 
