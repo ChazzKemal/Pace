@@ -76,3 +76,15 @@ _log "Done."
 if [ -n "${CONDA_PREFIX:-}" ] && [ -f "$CONDA_PREFIX/lib/libjpeg.so.8" ]; then
     export LD_PRELOAD="$CONDA_PREFIX/lib/libjpeg.so.8${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
+
+# ── pace_bench on the path (pace_bench addition) ────────────────────────────
+# The repo's `src/` layout puts pace_bench outside this environment, and it is
+# deliberately NOT a pypi-dependency here: installing it editable would drag in
+# its full dependency tree — robosuite over SSH, the sim stack, a second lerobot
+# resolution — onto a robot environment whose whole point is the pinned jazzy +
+# lerobot combination. Prepending the path gives `python -m pace_bench.real.*`
+# without touching what is installed. Prepended, not assigned: pixi already put
+# the environment's own site-packages in PYTHONPATH.
+if [ -d "$PIXI_PROJECT_ROOT/../src" ]; then
+    export PYTHONPATH="$PIXI_PROJECT_ROOT/../src${PYTHONPATH:+:$PYTHONPATH}"
+fi
