@@ -36,8 +36,15 @@ POS = slice(0, 3)
 ORI = slice(3, 6)
 GRIP = 6
 
-#: A gripper command is near-binary, so anything above sensor noise is a real move.
-GRIP_EPS = 1e-3
+#: Default threshold for "the gripper command is moving". A *recorded* gripper channel
+#: is binary and 1e-3 separates it fine -- crisp_gym's GripperMotionRun uses that. A
+#: *predicted* one does not: measured on a stackcups PACE run (2026-09-01), the policy
+#: emits a continuously jittering channel spanning -0.0197 to 1.0271, whose |delta|
+#: sits at 4.9e-4 median and crosses 1e-3 on 22.6% of steps -- pure noise. Real
+#: transitions live at the p99, around 0.46. Anything in 0.01-0.05 separates them:
+#: the fire rate falls to 4.9% at 5e-3 and plateaus near 3% out to 0.1, and that
+#: plateau is the transitions themselves.
+GRIP_EPS = 0.02
 
 _DEG = 180.0 / math.pi
 # Both bending channels saturate at a right angle: a 90-degree turn gets min_speed.
@@ -71,6 +78,9 @@ class PaceConfig:
     #: same bargain as the deploy path's `gripper_slowdown_frames`, which pins speed
     #: over the same window -- keep the two equal, they answer one physical question.
     gripper_stride_exempt_frames: int = 5
+    #: |delta gripper| above which the command counts as moving. See GRIP_EPS: too
+    #: tight and policy noise exempts the whole chunk, so striding silently stops.
+    gripper_stride_eps: float = GRIP_EPS
     # Skip only where the path is straight; keep full resolution through corners.
     adaptive_stride: bool = False
 
@@ -252,7 +262,7 @@ def stride_indices(abs_actions: torch.Tensor, cfg: PaceConfig) -> list[int]:
     grip = None
     if cfg.gripper_stride_exempt:
         g = abs_actions[0, :, GRIP]
-        moving = (g[1:] - g[:-1]).abs() > GRIP_EPS
+        moving = (g[1:] - g[:-1]).abs() > cfg.gripper_stride_eps
         grip = [False] * n_steps
         hold = max(0, int(cfg.gripper_stride_exempt_frames))
         for j in range(n_steps - 1):
