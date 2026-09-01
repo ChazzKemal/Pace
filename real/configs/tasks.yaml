@@ -31,8 +31,17 @@ pickplace:
   pace:        act_cart7_v2_angleaxis_nogrip_chunk100_ft_20260528/checkpoints/030000/pretrained_model
 
 stackcups:
-  # What this rig last deployed, 2026-08-31 (real/outputs/eval_real/run_config.yaml).
-  none:        cups_act_base_ts_input/checkpoints/last/pretrained_model
-  pace:        cups_act_base_ts_input/checkpoints/last/pretrained_model
+  # The merged 175-episode set, trained 2026-09-01.
+  #
+  # Replaces cups_act_base_ts_input, which is what this rig deployed up to
+  # 2026-08-31. Runs recorded before that date name `task: stackcups` but executed
+  # the older checkpoint, so a comparison spanning the change is not like-for-like --
+  # check the `policy_path` in a run's own run_config.yaml, which records the path
+  # rather than the task name.
+  #
+  # `last` and `100000` are the same weights (234 tensors bitwise identical; the file
+  # hashes differ only in encoding), so the step named here is cosmetic.
+  none:        cups_merged_act_base/checkpoints/last/pretrained_model
+  pace:        cups_merged_act_base/checkpoints/last/pretrained_model
   bspline:     ~
   demospeedup: ~
