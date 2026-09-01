@@ -30,6 +30,15 @@ class SpeedupTrainConfig(TrainPipelineConfig):
     method: MethodConfig = field(default_factory=NoMethod)
 
 
+def _already_peft(policy) -> bool:
+    """Whether the policy arrived wrapped, in which case upstream will not wrap again."""
+    try:
+        from peft import PeftModel
+    except ImportError:  # pragma: no cover -- peft is a hard dependency of the xVLA path
+        return False
+    return isinstance(policy, PeftModel)
+
+
 def attach_method_steps(method: MethodConfig):
     """Wrap the processor factory so the method's steps join the pipeline.
 
@@ -85,8 +94,40 @@ def attach_method_steps(method: MethodConfig):
         method.adjust_processors(preprocessor, postprocessor)
         return preprocessor, postprocessor
 
+    original_make_policy = lerobot_train.make_policy
+
+    def make_policy(*args, **kwargs):
+        # The one hook that needs the policy *object*: `requires_grad`, gradient hooks
+        # and a wrapped `save_pretrained` have nothing to attach to until the model is
+        # built. Everything else a method changes is reachable through a config.
+        #
+        # It cannot simply run here, though. Upstream builds the policy and *then*
+        # wraps it: `policy = policy.wrap_with_peft(...)`, a few lines later in
+        # `train()`. PEFT freezes every parameter it did not target and returns a new
+        # object, so an unfreeze applied to the return value of `make_policy` is undone
+        # and then discarded -- silently, since the hook has already logged success.
+        # (That is not hypothetical: it cost a 20k-step run, which reported
+        # `num_learnable_params` unchanged while claiming to train pos_emb.) So when
+        # PEFT is coming, the adjustment rides the wrap instead.
+        policy = original_make_policy(*args, **kwargs)
+        wrap = getattr(policy, "wrap_with_peft", None)
+        if callable(wrap) and not _already_peft(policy):
+
+            def wrap_with_peft(*wrap_args, **wrap_kwargs):
+                wrapped = wrap(*wrap_args, **wrap_kwargs)
+                method.adjust_built_policy(wrapped)
+                return wrapped
+
+            policy.wrap_with_peft = wrap_with_peft
+        else:
+            # No PEFT to come, or a checkpoint that arrived already wrapped -- upstream
+            # skips `wrap_with_peft` in that case, so this object is the final one.
+            method.adjust_built_policy(policy)
+        return policy
+
     lerobot_train.make_train_eval_datasets = make_datasets
     lerobot_train.make_pre_post_processors = patched
+    lerobot_train.make_policy = make_policy
     return original_factory
 
 

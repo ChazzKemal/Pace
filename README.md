@@ -78,6 +78,33 @@ python -m pace_bench.eval.run_libero \
     --n_action_steps=30 --out=outputs/eval/run
 ```
 
+**Compare** two or more eval runs. LIBERO ships 50 fixed initial states per task and
+the evaluator walks them in order, so two runs sharing `(task_suite, tasks,
+n_episodes, batch_size, seed)` attempted the *same scenes in the same order*. The
+comparison is therefore paired — McNemar on the episodes the two runs disagree about,
+and sim time over the episodes both solved — rather than two independent rates:
+
+```bash
+python -m pace_bench.eval.compare_libero \
+    outputs/eval/ds_libero10_base outputs/eval/ds_libero10_speedup \
+    --labels=baseline,demospeedup --json=outputs/eval/comparison.json
+```
+
+It closes with a summary block: the difference in success rate with a bootstrap CI,
+Holm-adjusted McNemar p-values when several arms share one baseline, the paired
+speedup with a sign test over the episodes both runs solved, and one sentence per arm
+saying what the numbers do and do not support. Runs whose configuration would put
+them on different scenes are reported side by side but explicitly *not* paired, and
+get no verdict.
+
+Those 50 initial states are the benchmark's held-out axis — they are **not** the
+states the demonstrations start from. Checked against the raw LIBERO demos: 0 of 500
+demo start states coincides with an eval init state, and on the columns the scene
+randomizer varies, a demo is exactly as far from its nearest init state as init
+states are from each other. So a LIBERO run tests unseen object placements, but the
+n_episodes it uses is a *prefix* of the 50 — `--n_episodes=50` is the protocol the
+literature reports.
+
 End-to-end pipelines for the recorded experiments live in `training_scripts/`
 (`run_demospeedup_*.sh`, `eval_demospeedup_libero10.sh`, and the `slurm_*.sbatch`
 jobs that submit them); each stage skip-guards, so a killed run resumes. They hold
@@ -144,6 +171,7 @@ src/pace_bench/
     specs.py           what a policy may consume, per robot — checked in tests
   train/run_train.py   lerobot-train + --method.*
   eval/run_libero.py   LIBERO eval runner
+  eval/compare_libero.py  paired comparison across LIBERO eval runs
   timed.py             TimedActions — per-action dt, the real robot's (pose, t) view
 real/                  pixi manifest + lock for the UR10e deploy environment
 docs/PLAN.md           batch plan, current state, and decisions worth not relearning
@@ -169,8 +197,14 @@ LIBERO-10, xVLA, 20 episodes × 10 tasks:
 
 | run                | success rate | episode time | speedup |
 | ------------------ | ------------ | ------------ | ------- |
-| baseline           | 92.0 %       | 13.28 s      | 1.00×   |
-| DemoSpeedup        | 86.5 %       | 6.99 s       | 1.90×   |
+| baseline           | 92.0 %       | 13.27 s      | 1.00×   |
+| DemoSpeedup        | 85.5 %       | 6.94 s       | 1.91×   |
+
+Straight out of `pace_bench.eval.compare_libero`, which pools all 200 episodes; the same
+runs read 92.0 % / 85.5 % and 13.28 s / 6.99 s if the ten per-task figures are
+averaged unweighted instead. Paired over the 200 shared init states, DemoSpeedup
+loses 21 episodes the baseline solved and wins 8 (McNemar p = 0.024) — the drop is
+real, not sampling noise.
 
 PACE's LIBERO A/B has not been rerun on this stack. Real-robot runs are pending
 deployment. See `docs/PLAN.md` for what is trained, what is not, and why.
@@ -181,7 +215,8 @@ deployment. See `docs/PLAN.md` for what is trained, what is not, and why.
 pytest
 ```
 
-338 tests, no network, no external checkouts, nothing skipped. They include parity
+386 tests, no network and no external checkouts; the one skip is a checkpoint
+probe that runs only where a local LeRobot checkpoint exists. They include parity
 checks of the DemoSpeedup ports against that paper's own code, which is copied
 verbatim into `tests/upstream_reference.py` with its provenance.
 

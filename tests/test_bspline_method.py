@@ -363,6 +363,51 @@ class TestMatrixArrangement:
         np.testing.assert_allclose(emitted[:, 10], matrix[:, 0] / 20)
         np.testing.assert_allclose(arrangement.recover(emitted, 10), matrix)
 
+    def test_knot_first20_pads_without_rearranging(self):
+        """The knot stays where upstream puts it -- slot 0 -- and the pose follows it,
+        because a run that scores the matrix uniformly has no index-sliced loss to
+        satisfy. Only the width is xVLA's."""
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        arrangement = resolve_arrangement("knot_first20")
+        matrix = np.zeros((16, 11))
+        matrix[:, 0] = 7.0
+        matrix[:, 1:] = np.arange(10) + 1.0
+        emitted = arrangement.emit(matrix)
+        assert emitted.shape == (16, 20)
+        np.testing.assert_array_equal(emitted[:, 0], matrix[:, 0])
+        np.testing.assert_array_equal(emitted[:, 1:11], matrix[:, 1:])
+        assert not emitted[:, 11:].any(), "slots 11..19 are pad"
+        np.testing.assert_allclose(arrangement.recover(emitted, 10), matrix)
+
+    def test_both_20_wide_arrangements_describe_the_same_curve(self):
+        """The claim that makes the uniform arrangement safe: knot_first20 changes where
+        the numbers sit in the vector and nothing about the geometry. Whichever way round
+        a chunk is emitted, `recover` must hand the decoder back the same matrix."""
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        rng = np.random.default_rng(3)
+        matrix = rng.normal(size=(16, 11))
+        for name in ("xvla_ee6d20", "knot_first20"):
+            arrangement = resolve_arrangement(name)
+            np.testing.assert_allclose(
+                arrangement.recover(arrangement.emit(matrix), 10), matrix,
+                err_msg=f"{name} did not round-trip",
+            )
+
+    def test_only_the_unnormalised_arrangement_rescales_knots(self):
+        """xvla_ee6d20 carries knots in seconds because xVLA normalizes nothing.
+        knot_first20 is paired with real normalization, which handles the scale -- a
+        second rescaling there would only hide it."""
+        from pace_bench.methods.bspline.layout import resolve_arrangement
+
+        assert resolve_arrangement("xvla_ee6d20").scale_knots_by_fps is True
+        assert resolve_arrangement("knot_first20").scale_knots_by_fps is False
+        assert resolve_arrangement("knot_first").scale_knots_by_fps is False
+        method = BSplineMethod(arrangement="knot_first20", fps=20.0)
+        assert method._arrange().knot_scale == 1.0
+        assert BSplineMethod(arrangement="xvla_ee6d20", fps=20.0)._arrange().knot_scale == 1 / 20
+
     def test_an_unknown_arrangement_names_the_known_ones(self):
         from pace_bench.methods.bspline.layout import resolve_arrangement
 
@@ -470,6 +515,119 @@ class TestXVLABSplineActionSpace:
         space = self.space()
         scored = set(space.POS_IDX) | set(space.ROT_IDX) | set(space.gripper_idx) | set(space.KNOT_IDX)
         assert scored == set(range(11))
+
+
+class TestUniformBSplineActionSpace:
+    """Upstream B-spline's loss on xVLA: one uniform MSE over the parameter matrix.
+
+    The claim to protect is that there is nothing to tune here. The four reported terms
+    are channel-count contributions, so their sum has to be *exactly* the unweighted MSE
+    over the 11 real channels -- if that identity ever breaks, a weight has crept in.
+    """
+
+    @staticmethod
+    def space():
+        from lerobot.policies.xvla.action_hub import build_action_space
+
+        import pace_bench.methods.bspline.xvla_action  # noqa: F401
+
+        return build_action_space("bspline_uniform")
+
+    def test_the_terms_sum_to_an_unweighted_mse(self):
+        space = self.space()
+        rng = torch.Generator().manual_seed(1)
+        target = torch.zeros(3, 16, 20)
+        target[:, :, :11] = torch.randn(3, 16, 11, generator=rng)
+        pred = torch.randn(3, 16, 20, generator=rng)
+        total = sum(space.compute_loss(pred, target).values())
+        uniform = torch.nn.functional.mse_loss(pred[:, :, :11], target[:, :, :11])
+        torch.testing.assert_close(total, uniform)
+
+    def test_the_pad_channels_are_scored_by_nothing(self):
+        """XVLAPolicy pads 11 real channels out to dim_action=20. Slots 11..19 are that
+        pad, and must not enter the loss however they are filled."""
+        space = self.space()
+        pred, target = torch.zeros(2, 16, 20), torch.zeros(2, 16, 20)
+        target[:, :, :11] = 0.5
+        before = sum(space.compute_loss(pred, target).values())
+        target[:, :, 11:] = 99.0
+        pred[:, :, 11:] = -7.0
+        torch.testing.assert_close(sum(space.compute_loss(pred, target).values()), before)
+
+    def test_nothing_is_masked_or_squashed(self):
+        """Unlike the stock ee6d space: no channel here is a 0/1 command, so there is no
+        gripper to mask out of the flow input and no logit to sigmoid on the way out."""
+        space = self.space()
+        assert space.gripper_idx == ()
+        action = torch.randn(2, 16, 20)
+        torch.testing.assert_close(space.postprocess(action.clone()), action)
+        proprio = torch.randn(2, 20)
+        p_out, a_out = space.preprocess(proprio.clone(), action.clone())
+        torch.testing.assert_close(p_out, proprio)
+        torch.testing.assert_close(a_out, action)
+
+    def test_a_matrix_narrower_than_the_parameter_count_is_refused(self):
+        space = self.space()
+        with pytest.raises(ValueError, match="knot_first20 vector"):
+            space.compute_loss(torch.zeros(1, 16, 8), torch.zeros(1, 16, 8))
+
+
+class TestParameterNormalisation:
+    """The pairing and the guard around `--method.normalize_parameters`.
+
+    A uniform loss only balances if the channels are comparable. ACT and Diffusion get
+    that from their own normalizer; xVLA normalizes nothing, so selecting the uniform
+    space there without switching normalization on is a silent trap -- the knot column
+    is in source frames and would swamp everything.
+    """
+
+    @staticmethod
+    def policy_cfg(kind, mode=None, action_norm="IDENTITY"):
+        from lerobot.configs.types import NormalizationMode
+
+        from pace_bench.methods.config import POLICY_CHUNK_FIELDS
+
+        fields = POLICY_CHUNK_FIELDS[kind]
+        cfg = type("FakePolicyCfg", (), {})()
+        cfg.type, cfg.action_mode = kind, mode
+        cfg.normalization_mapping = {"ACTION": NormalizationMode[action_norm]}
+        setattr(cfg, fields.chunk, 30)
+        setattr(cfg, fields.executed, 30)
+        return cfg
+
+    def test_the_default_leaves_every_other_arm_alone(self):
+        """Off by default, and a no-op for a policy that already normalizes."""
+        cfg = self.policy_cfg("act", action_norm="MEAN_STD")
+        BSplineMethod().adjust_policy(cfg)
+        assert cfg.normalization_mapping["ACTION"].value == "MEAN_STD"
+
+    def test_the_uniform_space_is_refused_without_normalisation(self):
+        cfg = self.policy_cfg("xvla", "bspline_uniform")
+        with pytest.raises(ValueError, match="normalize_parameters"):
+            BSplineMethod(arrangement="knot_first20",
+                          xvla_action_space="bspline_uniform").adjust_policy(cfg)
+
+    def test_the_flag_switches_the_action_feature_to_mean_std(self):
+        cfg = self.policy_cfg("xvla", "bspline_uniform")
+        BSplineMethod(arrangement="knot_first20", xvla_action_space="bspline_uniform",
+                      normalize_parameters=True).adjust_policy(cfg)
+        assert cfg.normalization_mapping["ACTION"].value == "MEAN_STD"
+
+    def test_the_uniform_space_refuses_the_wrong_arrangement(self):
+        """The space reads the knot from slot 0; xvla_ee6d20 puts it in slot 10. Both
+        are 20 wide, so nothing downstream would notice the disagreement."""
+        cfg = self.policy_cfg("xvla", "bspline_uniform")
+        with pytest.raises(ValueError, match="knot_first20"):
+            BSplineMethod(arrangement="xvla_ee6d20", xvla_action_space="bspline_uniform",
+                          normalize_parameters=True).adjust_policy(cfg)
+
+    def test_naming_one_half_of_the_pairing_is_refused(self):
+        """The method registers the space, the policy selects it. One without the other
+        trains a loss the run did not ask for, and nothing downstream would notice."""
+        cfg = self.policy_cfg("xvla", "ee6d_bspline")
+        with pytest.raises(ValueError, match="xvla_action_space"):
+            BSplineMethod(arrangement="knot_first20", xvla_action_space="bspline_uniform",
+                          normalize_parameters=True).adjust_policy(cfg)
 
 
 class TestEvalPath:
@@ -679,3 +837,203 @@ class TestBSplineActuation:
         for _ in range(4):
             policy.select_action({})
         assert handle.unwrapped._env.env.robots[0].controller.kp_scale == 2.0
+
+
+def test_eval_config_registers_the_xvla_action_space(tmp_path):
+    """Parsing a B-spline eval config must register `ee6d_bspline` on its own.
+
+    xVLA resolves its action space while the model is being built, and an eval loads
+    the policy straight from a checkpoint whose config names `ee6d_bspline` -- so if
+    nothing registered it first, `make_policy` dies with a bare KeyError before a
+    single episode runs. It did, once. Run in a subprocess because registration is a
+    process-wide side effect: in this suite's process another test has already
+    imported the module, and the check would pass for the wrong reason.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import draccus
+        from lerobot.policies.xvla.action_hub import build_action_space
+        from pace_bench.eval.run_libero import LiberoEvalConfig
+
+        try:
+            build_action_space("ee6d_bspline")
+            raise SystemExit("registered before the config was built")
+        except KeyError:
+            pass
+
+        draccus.parse(
+            config_class=LiberoEvalConfig,
+            args=["--method.type=bspline", "--method.layout=ee6d20",
+                  "--method.arrangement=xvla_ee6d20"],
+        )
+        print(type(build_action_space("ee6d_bspline")).__name__)
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.strip() == "EE6DBSplineActionSpace"
+
+
+def test_decode_step_accepts_the_names_it_serialises():
+    """`get_config` writes layout and arrangement by name, so `__init__` must read them.
+
+    A saved pipeline carries the names, and LeRobot rebuilds the step from exactly
+    that dict -- so if the constructor only accepted objects, a checkpoint's own
+    decode step came back holding strings and died on the first chunk. It did.
+    """
+    from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+    step = BSplineDecodeStep(num_actions=8, degree=3, layout="ee6d20", arrangement="xvla_ee6d20")
+    assert step.layout.name == "ee6d20"
+    assert step.arrangement.name == "xvla_ee6d20"
+    # The round trip has to close: rebuilding from the config gives the same step.
+    rebuilt = BSplineDecodeStep(**step.get_config())
+    assert rebuilt.get_config() == step.get_config()
+    assert rebuilt.layout is step.layout
+
+
+def test_decode_step_keeps_an_already_resolved_layout():
+    """Objects still pass through untouched -- the training path passes those."""
+    from pace_bench.methods.bspline.layout import LAYOUTS
+    from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+    layout = LAYOUTS["ee6d20"]
+    assert BSplineDecodeStep(layout=layout).layout is layout
+
+
+def test_eval_drops_a_checkpoint_side_decode_step():
+    """Two decode steps is not redundancy, it is a decoded action read as a curve."""
+    from pace_bench.eval.run_libero import drop_steps
+    from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+    class Pipeline:
+        def __init__(self, steps):
+            self.steps = steps
+
+    class Unnormalizer:
+        pass
+
+    saved = BSplineDecodeStep(num_actions=16, layout="ee6d20", arrangement="xvla_ee6d20")
+    pipeline = Pipeline([Unnormalizer(), saved])
+    assert drop_steps(pipeline, "BSplineDecodeStep") == [saved]
+    assert [type(s).__name__ for s in pipeline.steps] == ["Unnormalizer"]
+    # Nothing left to drop, and a pipeline without one is untouched.
+    assert drop_steps(pipeline, "BSplineDecodeStep") == []
+
+
+class TestDecodeBatchSequential:
+    """A vector env is `n_envs` sequential streams, not one batch of strangers."""
+
+    @staticmethod
+    def _step(**kwargs):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        return BSplineDecodeStep(
+            num_actions=8, degree=3, layout="ee6d20", arrangement="xvla_ee6d20", **kwargs
+        )
+
+    @staticmethod
+    def _matrices(rows: int):
+        """`rows` plausible parameter matrices: a rising knot column, smooth points."""
+        import numpy as np
+        import torch
+
+        from pace_bench.methods.bspline.layout import LAYOUTS
+
+        layout = LAYOUTS["ee6d20"]
+        width = 10 + 2 * 3
+        out = np.zeros((rows, width, 1 + layout.spline_dim))
+        for r in range(rows):
+            out[r, :, 0] = np.arange(width) * 1.5 + r  # knots, strictly increasing
+            out[r, :, 1:] = np.linspace(0, 1, width)[:, None] * (r + 1)
+        arrangement = LAYOUTS and None
+        return torch.tensor(out)
+
+    def test_a_wide_batch_aligns_when_told_it_is_sequential(self):
+        """The bug: `align=True` was silently inert for every batched eval."""
+        step = self._step(align=True)
+        matrices = self._matrices(4)
+        step.decode_batch(matrices, sequential=True)
+        assert len(step._anchors) == 4
+        assert all(a is not None for a in step._anchors), "every row must carry its own anchor"
+
+    def test_a_wide_batch_does_not_align_by_default(self):
+        """A training batch's rows are unrelated samples; aligning them is nonsense."""
+        step = self._step(align=True)
+        step.decode_batch(self._matrices(4))
+        assert all(a is None for a in step._anchors)
+
+    def test_rows_get_independent_anchors(self):
+        """Row 0's place on its curve must not leak into row 1's."""
+        import numpy as np
+
+        step = self._step(align=True)
+        step.decode_batch(self._matrices(3), sequential=True)
+        first, second = step._anchors[0], step._anchors[1]
+        assert not np.allclose(first, second)
+
+    def test_a_batch_of_one_still_aligns_without_the_flag(self):
+        """The single-robot control loop has nowhere else to be."""
+        step = self._step(align=True)
+        step.decode_batch(self._matrices(1))
+        assert step._anchors[0] is not None
+
+    def test_reset_clears_every_row(self):
+        step = self._step(align=True)
+        step.decode_batch(self._matrices(2), sequential=True)
+        step.reset()
+        assert step._anchors == []
+
+    def test_a_changed_batch_width_reallocates_the_anchors(self):
+        step = self._step(align=True)
+        step.decode_batch(self._matrices(4), sequential=True)
+        step.decode_batch(self._matrices(2), sequential=True)
+        assert len(step._anchors) == 2
+
+
+class TestPredictBeforeEnd:
+    """The tail of a predicted curve is held back rather than executed."""
+
+    @staticmethod
+    def _step(**kwargs):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        return BSplineDecodeStep(
+            num_actions=8, degree=3, layout="ee6d20", arrangement="xvla_ee6d20", **kwargs
+        )
+
+    def test_zero_margin_executes_the_whole_curve(self):
+        step = self._step(predict_before_end=0.0)
+        actions, _ = step.decode_batch(TestDecodeBatchSequential._matrices(1))
+        assert actions.shape[1] == 8
+
+    def test_a_margin_holds_back_the_tail(self):
+        """Upstream never drives the arm into the end of a prediction."""
+        step = self._step(predict_before_end=0.5, fps=20.0)
+        actions, rates = step.decode_batch(TestDecodeBatchSequential._matrices(1))
+        per_action_s = float(rates[0]) / 20.0
+        held = int(-(-0.5 // per_action_s))  # ceil
+        assert actions.shape[1] == max(1, 8 - held)
+        assert actions.shape[1] < 8
+
+    def test_at_least_one_action_survives_any_margin(self):
+        """A margin longer than the curve must still leave something to execute."""
+        step = self._step(predict_before_end=1e6, fps=20.0)
+        actions, _ = step.decode_batch(TestDecodeBatchSequential._matrices(1))
+        assert actions.shape[1] == 1
+
+    def test_the_anchor_is_the_last_executed_action_not_the_last_decoded_one(self):
+        """Anchoring to an action never commanded would align to a place the arm
+        never reached, which is the whole failure the margin exists to avoid."""
+        import numpy as np
+
+        held = self._step(align=True, predict_before_end=0.5, fps=20.0)
+        full = self._step(align=True, predict_before_end=0.0)
+        matrices = TestDecodeBatchSequential._matrices(1)
+        held.decode_batch(matrices, sequential=True)
+        full.decode_batch(matrices, sequential=True)
+        assert not np.allclose(held._anchors[0], full._anchors[0])

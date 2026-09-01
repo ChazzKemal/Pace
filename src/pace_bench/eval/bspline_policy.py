@@ -63,7 +63,11 @@ def attach_bspline(policy, decode: BSplineDecodeStep, actuator: BSplineTrackingA
     def select_action(self, batch: dict[str, torch.Tensor], **_) -> torch.Tensor:
         if not self.bspline_queue:
             parameters = self.predict_action_chunk(batch)
-            actions, rates = self.bspline.decode_batch(parameters)
+            # Sequential: row i of this batch is env i, one chunk after another on
+            # its own curve -- so each row aligns to its own anchor. Without this the
+            # step falls back to its batch-of-one rule and a vector env decodes every
+            # chunk from the curve's beginning, jumping at each seam.
+            actions, rates = self.bspline.decode_batch(parameters, sequential=True)
             # (B, T, ...) -> T entries of (B, ...), the queue upstream's rollout expects.
             self.bspline_queue.extend(actions.transpose(0, 1))
             self.bspline_rate_log.append(float(rates[0]))

@@ -248,6 +248,8 @@ class BSplineDecodeStep(ProcessorStep):
         layout: ActionLayout | None = None,
         arrangement: MatrixArrangement | None = None,
         align: bool = False,
+        fps: float = 20.0,
+        predict_before_end: float = 0.0,
     ):
         if num_actions < 1:
             raise ValueError(f"num_actions must be >= 1, got {num_actions}")
@@ -261,6 +263,14 @@ class BSplineDecodeStep(ProcessorStep):
         #: Resume each chunk where the previous one left the arm, rather than at the
         #: curve's own beginning. Sequential control only -- see `decode_batch`.
         self.align = bool(align)
+        #: Seconds of each curve left unexecuted before the next chunk is requested.
+        #: Upstream re-plans while the current curve still has `predict_before_end`
+        #: (0.06 s) to run rather than after it is spent, so the arm is never driven
+        #: into the tail of a prediction -- the least constrained part of the fit, and
+        #: where a chunk padded at the episode edge degenerates outright. 0 executes
+        #: the whole curve, which is what a training pipeline wants.
+        self.predict_before_end = float(predict_before_end)
+        self.fps = float(fps)
         self.reset()
 
     def reset(self) -> None:
@@ -269,7 +279,9 @@ class BSplineDecodeStep(ProcessorStep):
         An anchor carried across a reset would align the first chunk of a new episode
         to wherever the last one ended, which is a different place entirely.
         """
-        self._anchor: np.ndarray | None = None
+        #: One anchor per batch row. A vector env is not one stream but `n_envs` of
+        #: them, each with its own place on its own curve.
+        self._anchors: list[np.ndarray | None] = []
 
     @property
     def compare_dim(self) -> int | None:
@@ -284,21 +296,30 @@ class BSplineDecodeStep(ProcessorStep):
         return None if self.layout is None else max(self.layout.spline_dim - 1, 1)
 
     @torch.no_grad()
-    def decode_batch(self, matrices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(B, width, channels)`` of parameters -> ``(B, num_actions, dim)`` actions.
+    def decode_batch(
+        self, matrices: torch.Tensor, sequential: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(B, width, channels)`` of parameters -> ``(B, executed, dim)`` actions.
+
+        ``sequential`` says the rows are *streams*: row i is the same robot, one chunk
+        after another, so it carries its own anchor. That is what a vector env is, and
+        it is the whole of the difference from a training batch, whose rows are
+        unrelated samples that must not be aligned to anything.
 
         The tensor-level entry point, so the eval loop can decode a predicted chunk
         without building a transition around it. Also returns the realised rate per
         sample -- source frames advanced per executed action, which varies with the
         span the policy predicted rather than being the constant the config asks for.
         """
-        # Alignment is sequential by definition -- it resumes *the* curve the arm is
-        # currently on -- so it is confined to a batch of one. A training or evaluation
-        # batch holds unrelated samples whose anchors have nothing to do with each
-        # other, and aligning them would be meaningless rather than merely slow.
-        aligning = self.align and matrices.shape[0] == 1
-        decoded, rates = [], []
-        for emitted in matrices.detach().cpu().numpy().astype(np.float64):
+        # A batch of one is sequential whether the caller says so or not: that is the
+        # single-robot control loop, which has nowhere else to be. Anything wider has
+        # to declare itself, because a training batch's rows are unrelated samples and
+        # aligning those would be meaningless rather than merely slow.
+        aligning = self.align and (sequential or matrices.shape[0] == 1)
+        if len(self._anchors) != matrices.shape[0]:
+            self._anchors = [None] * matrices.shape[0]
+        samples_per_row, rates = [], []
+        for row, emitted in enumerate(matrices.detach().cpu().numpy().astype(np.float64)):
             matrix = (
                 emitted
                 if self.arrangement is None or self.layout is None
@@ -307,19 +328,37 @@ class BSplineDecodeStep(ProcessorStep):
             samples = decode_chunk(
                 matrix, self.num_actions, degree=self.degree,
                 relative_knots=self.relative_knots,
-                align_to=self._anchor if aligning else None,
+                align_to=self._anchors[row] if aligning else None,
                 compare_dim=self.compare_dim,
             )
+            samples_per_row.append(samples)
+            span = matrix[-(self.degree + 1), 0] - matrix[self.degree, 0]
+            rates.append(span / max(self.num_actions - 1, 1))
+
+        # How many of each row's actions actually get executed. Alignment shortens a
+        # row by however far along its curve the arm already was, so rows can differ in
+        # length; they are cut to the shortest, since the caller executes them in
+        # lockstep. `predict_before_end` then holds back the tail, in seconds of
+        # demonstrated motion converted through the realised rate.
+        keep = min(len(row) for row in samples_per_row)
+        if self.predict_before_end > 0 and self.fps > 0:
+            per_action_s = max(rates) / self.fps
+            if per_action_s > 0:
+                keep = max(1, keep - int(np.ceil(self.predict_before_end / per_action_s)))
+
+        decoded = []
+        for row, samples in enumerate(samples_per_row):
+            samples = samples[:keep]
             if aligning:
                 # In the spline's own space, before `from_spline`: a distance taken
                 # after the rotation is back in axis-angle is meaningless across the
-                # pi wrap, which is the same reason the fit uses 6D at all.
-                self._anchor = samples[-1].copy()
+                # pi wrap, which is the same reason the fit uses 6D at all. The last
+                # *executed* sample, not the last decoded one -- the held-back tail is
+                # never commanded, so the arm never reaches it.
+                self._anchors[row] = samples[-1].copy()
             if self.layout is not None:
                 samples = self.layout.from_spline(samples)
             decoded.append(samples)
-            span = matrix[-(self.degree + 1), 0] - matrix[self.degree, 0]
-            rates.append(span / max(self.num_actions - 1, 1))
         actions = torch.from_numpy(np.stack(decoded)).to(
             device=matrices.device, dtype=matrices.dtype
         )

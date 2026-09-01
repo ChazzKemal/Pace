@@ -47,9 +47,10 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `methods/demospeedup/run_label.py` | draccus labelling runner: checkpoint's own preprocessor, per-frame chunk sampling, temporal aggregation over every chunk covering a frame, `speedup_labels/episode_<i>.npy` + the raw `entropy_<i>.npy` trace, `run_config.yaml`; `--batch_frames` (default 32) routes through `sample_frames` for families that implement it, and ACT keeps the one-frame-at-a-time path |
 | `methods/demospeedup/actuator.py` | `DemoSpeedupTrackingActuator`: constant gains+gripper ×low_v, time untouched (upstream's high-gain-XML recipe + arm gains); per-step re-application (reset-proof) |
 | `methods/bspline/spline.py` | the B-spline action representation (`B-spline-policy/bspline-policy` @ `61ed5f4`, arXiv:2607.09648). `fit_episode` (adaptive least-squares fit: `generate_knots` grows the knot count until the spline is within `max_error`), `chunk_parameters` (cut the fit into `(chunk_size + 2*degree, 1 + dim)` windows of the *episode's* knot vector — only the first carries the clamped boundary), `assign_chunks_to_frames` (one matrix per frame, knots shifted to offsets from that frame), `decode_chunk` (evaluate the curve at `num_actions` points across its span — this is the speed knob), `to/from_spline_actions` (cart7 ↔ xyz+rot6d+gripper, with Gram-Schmidt back onto SO(3)), `encode/decode_relative_knots` (the knot column as consecutive differences). Parity against `tests/upstream_reference_bspline.py` |
-| `methods/bspline/layout.py` | which columns of a dataset's action can be splined, named per run: `cart7` (UR10e, angle-axis → rot6d), `ee6d20` (LIBERO, already rot6d, 10 zero-pad columns dropped and restored), `identity` (joint space). Checked against the dataset's real action width, because naming the wrong one is otherwise silent — a transposed rotation still fits and still decodes |
+| `methods/bspline/layout.py` | which columns of a dataset's action can be splined, named per run: `cart7` (UR10e, angle-axis → rot6d), `ee6d20` (LIBERO, already rot6d, 10 zero-pad columns dropped and restored), `identity` (joint space). Arrangements: `knot_first` (upstream's own, 11 wide, for ACT/Diffusion), `xvla_ee6d20` (20 wide, knot last, knots in seconds — for xVLA's index-sliced loss under IDENTITY normalization), and `knot_first20` (20 wide, knot in slot 0, nothing rescaled — for `bspline_uniform`, where the loss does not slice by index and real normalization handles the scale). Both 20-wide arrangements round-trip to the same matrix, so they describe the same curve. Checked against the dataset's real action width, because naming the wrong one is otherwise silent — a transposed rotation still fits and still decodes |
 | `methods/bspline/actuator.py` | `BSplineTrackingActuator`: upstream's eval-time recipe, and the one place B-spline's actuation differs from every other method here. Arm **kp x2.0** (`rollout_x5_bspline.py:201`, against 1.0 in the non-B-spline `rollout_local_policy.py:269`, so it is a B-spline choice and not their rig default), applied as `kp[:6] *= scale` with **kd passed back untouched** and the gripper excluded (`yam_server.py:390-396`). Constant rather than speed-dependent, relative to base gains so re-application cannot compound, time nominal. PACE and DemoSpeedup both scale kd as `**(exp/2)` chasing critical damping; upstream B-spline does not, so neither does this |
-| `methods/bspline/xvla_action.py` | `ee6d_bspline`, registered in xVLA's own action registry: single-arm ee6d control point in slots 0-9 where its structured loss expects xyz/rot6d/gripper, B-spline knot in slot 10 with a fourth loss term. Needed because xVLA slices its action by hardcoded index, so upstream's knot-first matrix trains a *time* as an x-coordinate. Slot 9 is regressed with **MSE**, not scored with stock ee6d's BCE + sigmoid: it carries the gripper's *control point*, and fitting a binary 0/1 channel overshoots to [-0.366, 1.366] (8.8% of coefficients outside [-0.05, 1.05] on libero_10_ee6d), where BCE is unbounded below and a sigmoid cannot reach the value at all |
+| `methods/bspline/xvla_action.py` | `ee6d_bspline`, registered in xVLA's own action registry: single-arm ee6d control point in slots 0-9 where its structured loss expects xyz/rot6d/gripper, B-spline knot in slot 10 with a fourth loss term. Needed because xVLA slices its action by hardcoded index, so upstream's knot-first matrix trains a *time* as an x-coordinate. Slot 9 is regressed with **MSE**, not scored with stock ee6d's BCE + sigmoid: it carries the gripper's *control point*, and fitting a binary 0/1 channel overshoots to [-0.366, 1.366] (8.8% of coefficients outside [-0.05, 1.05] on libero_10_ee6d), where BCE is unbounded below and a sigmoid cannot reach the value at all. Also `bspline_knot_first`: upstream B-spline's own loss instead — one **unweighted MSE** over the 11 knot-first channels, reported as four channel-count contributions that sum to exactly it, so nothing in it is tunable. It exists because the arrangement was only ever needed to satisfy a loss we write ourselves, and the head is xavier-initialised anyway; it deletes `xvla_ee6d20`, `knot_scale` and all four per-group scales, in exchange for requiring `--method.normalize_parameters` |
+| `methods/config.py` → `_adjust_action_normalization` | `--method.normalize_parameters` switches the policy's ACTION feature to MEAN_STD against the parameter statistics the method already installs — upstream B-spline normalizes the matrix per channel and then weights nothing, which is the only way an unweighted loss balances. A no-op for ACT/Diffusion (they already normalize); the whole point for xVLA (IDENTITY throughout). Refuses `bspline_knot_first` under IDENTITY, because `knot_first` carries the knot in *frames* (~50) against positions (~1.3) and the loss would be almost entirely knot. Also checks `--method.xvla_action_space` against `--policy.action_mode`: naming one without the other silently trains a different loss |
 | `methods/bspline/processor.py` | `BSplineChunkStep` (`bspline_chunk`) + `BSplineDecodeStep` (`bspline_decode`) + `EpisodeSplines`. Holds every episode's **fit**, not a label per frame (7.7 MB vs 36 MB on pickplace); a sample's matrix is its chunk with the knot column shifted to that frame. Fits once at construction — random sampling means a batch of 32 touches ~32 episodes, so lazy refitting at 1.4 s/fit would cost ~45 s per batch. `transform_features` rewrites the action feature to the matrix's channel count. The decode step is the inverse and is what makes a checkpoint executable: it evaluates the predicted curve at `num_actions` points -- the speed lever, `a_exec(t) = a(nt)`, a decode-time choice needing no retraining -- maps back through the layout, and publishes the realised `bspline_rate` per sample, which varies with the predicted span |
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
 | `train/run_train.py` | upstream `lerobot-train` + `--method.*`: wraps `make_train_eval_datasets` (capture dataset, halve chunk) and `make_pre_post_processors` (insert method steps pre-normalizer); calls `train.__wrapped__` (subclass fails upstream's identity check) |
@@ -323,12 +324,36 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   misleading for "where am I along this path".
 - **Batch 2's 3-seed PACE gate** — parked; upstream xVLA has a known ~10pp task-1
   deficit vs the fork that would confound absolute-SR comparison.
+- **LIBERO eval scenes do not overlap the training demonstrations** (verified
+  2026-09-01, so the question does not need reopening). LIBERO has no validation
+  *set*: evaluation is online rollouts from the 50 fixed initial states per task in
+  `libero/init_files/<suite>/*.pruned_init`, and the benchmark's held-out axis is
+  those placements. They are **not** the states the demonstrations start from —
+  checked directly against the raw demos in `/home/batur/libero_raw/libero_10`,
+  whose `data/demo_i/states[0]` is the same flattened MuJoCo state vector: 0/500
+  demo starts are bit-identical to an init state, and on the columns the scene
+  randomizer varies, demo→nearest-init distance equals demo→demo and init→init
+  distance (task 0: 0.0511 / 0.0503 / 0.0519). Two independent draws from one
+  randomizer, no coincidences. Two traps worth remembering: the demos' first stored
+  state is at t = 0.25 s, so the *robot* joints have already settled and differ from
+  any init state; and comparing agentview pixels instead cannot answer this at all
+  — the `libero_10_ee6d` frames are vertically flipped relative to the env's own
+  render and sit further from it (RMSE 0.23) than two different scenes do (0.10).
+  A run therefore covers `n_episodes` of the 50 available scenes: our recorded A/B
+  used 20, and `--n_episodes=50` is the protocol the LIBERO literature reports.
 
 ## Experiments state (2026-08-30 23:30; pickplace 2x2 complete, GPU idle)
 
-- **LIBERO A/B (xVLA)**: complete. Baseline 92.0% SR / 13.28 s vs DemoSpeedup
-  86.5% / 6.99 s = 1.90× at −5.5 pp; task 2 (−30 pp) is the known speed-intolerant
-  task. `outputs/eval/ds_libero10_*`.
+- **LIBERO A/B (xVLA)**: complete. Baseline 92.0% SR / 13.27 s vs DemoSpeedup
+  **85.5%** / 6.94 s = 1.91× at −6.5 pp; task 2 (−30 pp) is the known
+  speed-intolerant task. `outputs/eval/ds_libero10_*`. Read out by
+  `pace_bench.eval.compare_libero`, which pools all 200 episodes; the ten per-task figures
+  averaged unweighted give the same rates and 13.28 s / 6.99 s. (The 86.5% this
+  entry and the README previously carried was wrong: the recorded per-task
+  `pc_success` values are 90/60/70/95/95/100/80/85/90/90, whose mean is 85.5.)
+  Paired over the 200 shared init states, DemoSpeedup loses 21 episodes the
+  baseline solved and wins 8 — McNemar p = 0.024, so the drop is not sampling
+  noise.
 - **pickplace 2x2: COMPLETE** (2026-08-30 23:27). All four arms trained to
   100k x 32 in bf16 on `pickplace_cart7_v2_angleaxis_nogrip`, each labelled by its
   own policy family, per the parity rule:

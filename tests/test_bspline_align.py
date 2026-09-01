@@ -219,7 +219,7 @@ class TestDecodeStepAnchor:
         s = self.step(align=True)
         m = batched(pose_matrix())
         s.decode_batch(m)
-        assert s._anchor is not None
+        assert s._anchors[0] is not None
         second = s.decode_batch(m)[0]
         # Same matrix twice: the anchor is the previous tail, which lies past the
         # window, so alignment declines and the row count is unchanged.
@@ -238,28 +238,36 @@ class TestDecodeStepAnchor:
     def test_reset_forgets_the_anchor(self):
         s = self.step(align=True)
         s.decode_batch(batched(pose_matrix()))
-        assert s._anchor is not None
+        assert s._anchors[0] is not None
         s.reset()
-        assert s._anchor is None
+        assert s._anchors == []
 
     def test_a_real_batch_never_aligns(self):
         # Two unrelated samples: an anchor from one says nothing about the other.
+        # A *sequential* wide batch is the opposite case -- rows that are each their
+        # own robot -- and has to be declared, which a training batch never is.
         s = self.step(align=True)
         pair = torch.from_numpy(np.stack([pose_matrix(), pose_matrix()]))
         s.decode_batch(pair)
-        assert s._anchor is None
+        assert all(anchor is None for anchor in s._anchors)
+
+    def test_a_sequential_batch_aligns_every_row(self):
+        s = self.step(align=True)
+        pair = torch.from_numpy(np.stack([pose_matrix(), pose_matrix()]))
+        s.decode_batch(pair, sequential=True)
+        assert all(anchor is not None for anchor in s._anchors)
 
     def test_align_off_never_records_an_anchor(self):
         s = self.step(align=False)
         s.decode_batch(batched(pose_matrix()))
-        assert s._anchor is None
+        assert all(anchor is None for anchor in s._anchors)
 
     def test_the_anchor_is_in_spline_space_not_cart7(self):
         # It must be comparable against the next curve, which lives in the 10-dim
         # spline space; a cart7 anchor would be 7 wide and wrongly parameterised.
         s = self.step(align=True)
         s.decode_batch(batched(pose_matrix()))
-        assert s._anchor.shape == (10,)
+        assert s._anchors[0].shape == (10,)
 
     def test_align_is_serialized(self):
         assert self.step(align=True).get_config()["align"] is True
@@ -302,7 +310,7 @@ class TestWiring:
 
         (step,) = BSplineMethod(layout="cart7", align=True).postprocessor_steps()
         step.decode_batch(batched(pose_matrix()))
-        assert step._anchor is not None
+        assert step._anchors[0] is not None
 
         class FakePolicy:
             def reset(self):
@@ -315,7 +323,7 @@ class TestWiring:
 
         policy = attach_bspline(FakePolicy(), step)
         policy.reset()
-        assert step._anchor is None
+        assert step._anchors == []
         assert isinstance(policy.reset, types.MethodType)
 
 

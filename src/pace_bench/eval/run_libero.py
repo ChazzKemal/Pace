@@ -18,6 +18,7 @@ compared against.
 
 import json
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,6 +85,12 @@ class LiberoEvalConfig(MethodPipelineConfig):
     # property of the policy rather than of any method, so it lives here.
     n_action_steps: int = 32
     device: str | None = None
+    # Steps an episode may take before it is cut off. None keeps LIBERO's own cap
+    # (520 for these tasks). It has to be settable because the cap is counted in
+    # *executed actions*, not in demonstrated motion: a method that executes the same
+    # trajectory more finely spends more steps covering it, so leaving the cap fixed
+    # would score slow execution as failure whatever the control quality.
+    episode_length: int | None = None
     actuation: ActuationConfig = field(default_factory=ActuationConfig)
 
 
@@ -125,6 +132,22 @@ def action_stats(postprocessor) -> dict | None:
     return None
 
 
+def drop_steps(pipeline, name_fragment: str) -> list:
+    """Remove every step of ``pipeline`` whose class name contains ``name_fragment``.
+
+    Twice now a checkpoint has carried a step that the eval path also supplies, and
+    running both is never merely redundant: the ImageNet step would normalize an
+    already-normalized image, and a second B-spline decode would read a decoded action
+    as though it were a curve. Keep exactly one application, and say which one went.
+
+    Returns the removed steps, so the caller can report what it dropped.
+    """
+    dropped = [step for step in pipeline.steps if name_fragment in type(step).__name__]
+    if dropped:
+        pipeline.steps = [step for step in pipeline.steps if step not in dropped]
+    return dropped
+
+
 def build_speed_step(cfg: LiberoEvalConfig, stats: dict | None) -> PaceSpeedStep:
     """The method's postprocessor step, or an inert one when no method is selected.
 
@@ -146,6 +169,10 @@ def build_speed_step(cfg: LiberoEvalConfig, stats: dict | None) -> PaceSpeedStep
 def main(cfg: LiberoEvalConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+    # `from_pretrained` reads `action_mode` straight out of the checkpoint's config,
+    # and a B-spline xVLA checkpoint names an action space only this repo defines.
+    # `BSplineMethod.__post_init__` has already registered it by the time draccus
+    # hands the config over -- see the note there.
     policy_cfg = PreTrainedConfig.from_pretrained(cfg.policy_path)
     policy_cfg.pretrained_path = cfg.policy_path
     policy_cfg.use_peft = cfg.use_peft
@@ -154,7 +181,12 @@ def main(cfg: LiberoEvalConfig) -> None:
         policy_cfg.device = cfg.device
 
     device = get_safe_torch_device(policy_cfg.device, log=True)
-    torch.backends.cudnn.benchmark = True
+    # cuDNN's autotuner probes convolution algorithms by allocating workspaces, and on
+    # a card that is already busy -- an eval running beside a training job -- that
+    # probe *segfaults* inside the conv instead of raising, taking the run with it.
+    # On by default because it is worth real throughput when the card is ours alone;
+    # set PACE_CUDNN_BENCHMARK=0 to share.
+    torch.backends.cudnn.benchmark = os.environ.get("PACE_CUDNN_BENCHMARK", "1") != "0"
     torch.backends.cuda.matmul.allow_tf32 = True
 
     policy = make_policy(cfg=policy_cfg, env_cfg=LiberoEnv(task=cfg.task_suite))
@@ -196,6 +228,19 @@ def main(cfg: LiberoEvalConfig) -> None:
         # before anything can be executed. `num_actions` is the speed lever and is
         # chosen here rather than baked into the checkpoint.
         (decode,) = cfg.method.postprocessor_steps()
+        # A B-spline checkpoint saves its own `bspline_decode` into the postprocessor,
+        # and `attach_bspline` below decodes inside `select_action` -- leaving both in
+        # place decodes twice, the second time handing a single decoded action to a
+        # step that expects a parameter matrix. The attached one wins: `num_actions` is
+        # the speed lever and belongs to this run, not to the checkpoint, which baked
+        # in whatever it trained at.
+        for step in drop_steps(postprocessor, "BSplineDecodeStep"):
+            logger.info(
+                "dropped checkpoint-side bspline_decode (num_actions=%s); this run "
+                "decodes at num_actions=%s",
+                step.num_actions, decode.num_actions,
+            )
+
         # Its actuation is upstream's: a constant arm-kp multiple, kd and gripper left
         # nominal. Not PACE's per-step law and not DemoSpeedup's low_v scaling.
         paced = attach_bspline(
@@ -231,7 +276,12 @@ def main(cfg: LiberoEvalConfig) -> None:
             continue
 
         set_seed(cfg.seed)
-        env_cfg = LiberoEnv(task=cfg.task_suite, task_ids=[task_id], control_mode="absolute")
+        env_cfg = LiberoEnv(
+            task=cfg.task_suite,
+            task_ids=[task_id],
+            control_mode="absolute",
+            **({"episode_length": cfg.episode_length} if cfg.episode_length else {}),
+        )
         envs = make_env(env_cfg, n_envs=cfg.batch_size, use_async_envs=False)
 
         # One task in, one vector env out -- so binding is unambiguous.
@@ -246,9 +296,7 @@ def main(cfg: LiberoEvalConfig) -> None:
         # lineage carries the step, and running both would normalize twice; the
         # step's own guard rejects that. Keep exactly one application: the env's.
         if any("ImageNet" in type(step).__name__ for step in env_pre.steps):
-            before = len(preprocessor.steps)
-            preprocessor.steps = [s for s in preprocessor.steps if "ImageNet" not in type(s).__name__]
-            if len(preprocessor.steps) != before:
+            if drop_steps(preprocessor, "ImageNet"):
                 logger.info("dropped checkpoint-side ImageNet step (env pipeline provides it)")
         autocast = (
             torch.autocast(device_type=device.type)
@@ -291,7 +339,11 @@ def _record_timings(info: dict, recorders, cfg: LiberoEvalConfig, task_id: int, 
     recorded success count is worth checking against upstream's before either is
     trusted.
     """
-    episodes = [ep for rec in recorders for ep in rec.episodes]
+    # Sorted by upstream's episode numbering, and truncated the way upstream truncates
+    # its own metrics: a batch runs a full n_envs episodes even when the last few are
+    # past `n_episodes`, and those extras are not part of the reported run.
+    episodes = [ep for rec in recorders for ep in rec.episodes if ep["episode_index"] < cfg.n_episodes]
+    episodes.sort(key=lambda e: e["episode_index"])
     succeeded = [e["sim_time"] for e in episodes if e["success"] and e["sim_time"] is not None]
 
     expected = round(info["overall"]["pc_success"] / 100 * cfg.n_episodes)

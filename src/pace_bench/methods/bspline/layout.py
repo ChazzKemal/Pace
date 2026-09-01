@@ -110,6 +110,18 @@ class MatrixArrangement:
     #: 7365 beside a position loss of 2.1). Set to 1/fps, the knot column is seconds
     #: and the two are comparable. Inverted on `recover`, so the curve is unchanged.
     knot_scale: float = 1.0
+    #: Where the knot column sits in the emitted vector. Knot-last is what xVLA's
+    #: structured loss needs -- it wants slots 0..9 to be the pose it slices by index.
+    #: Knot-first is upstream's own order and the one to keep when the loss does not
+    #: slice, because it leaves the matrix reading as the `(knot, control points)` pair
+    #: it actually is.
+    knot_last: bool = True
+    #: Whether `BSplineMethod` should rescale the knot column into seconds. Only a
+    #: policy that does not normalize needs it: xVLA's IDENTITY mapping lets raw
+    #: magnitudes reach the loss, and knots in frames (~50) would swamp positions
+    #: (~1.3). An arrangement paired with real normalization must leave this off --
+    #: the normalizer handles the scale, and a second one only obscures it.
+    scale_knots_by_fps: bool = False
 
     def emit(self, matrix: np.ndarray) -> np.ndarray:
         """`(rows, 1 + spline_dim)` -> what the policy regresses."""
@@ -117,17 +129,30 @@ class MatrixArrangement:
             return matrix
         out = np.zeros((matrix.shape[0], self.channels), dtype=matrix.dtype)
         points = matrix.shape[1] - 1
-        out[:, :points] = matrix[:, 1:]
-        out[:, points] = matrix[:, 0] * self.knot_scale
+        if self.knot_last:
+            out[:, :points] = matrix[:, 1:]
+            out[:, points] = matrix[:, 0] * self.knot_scale
+        else:
+            out[:, 0] = matrix[:, 0] * self.knot_scale
+            out[:, 1 : 1 + points] = matrix[:, 1:]
         return out
 
     def recover(self, emitted: np.ndarray, spline_dim: int) -> np.ndarray:
-        """The inverse, for decoding what a policy predicted."""
+        """The inverse, for decoding what a policy predicted.
+
+        Also the place a padded arrangement sheds its pad: `emitted` is as wide as the
+        policy's action, `out` is as wide as the curve actually needs, and everything
+        past `spline_dim` was never a parameter.
+        """
         if self.channels is None:
             return emitted
         out = np.empty((emitted.shape[0], 1 + spline_dim), dtype=emitted.dtype)
-        out[:, 0] = emitted[:, spline_dim] / self.knot_scale
-        out[:, 1:] = emitted[:, :spline_dim]
+        if self.knot_last:
+            out[:, 0] = emitted[:, spline_dim] / self.knot_scale
+            out[:, 1:] = emitted[:, :spline_dim]
+        else:
+            out[:, 0] = emitted[:, 0] / self.knot_scale
+            out[:, 1:] = emitted[:, 1 : 1 + spline_dim]
         return out
 
 
@@ -137,7 +162,16 @@ ARRANGEMENTS: dict[str, MatrixArrangement] = {
     # xVLA's ee6d vector: control point in slots 0..9 exactly where its structured
     # loss expects xyz / rot6d / gripper, the knot in slot 10, the rest zero. Keeps
     # the pretrained action decoder's width of 20 untouched.
-    "xvla_ee6d20": MatrixArrangement("xvla_ee6d20", 20),
+    "xvla_ee6d20": MatrixArrangement("xvla_ee6d20", 20, knot_last=True, scale_knots_by_fps=True),
+    # The same 20-wide vector, but in upstream's own order and with nothing rescaled:
+    # knot in slot 0, control points in 1..10, zero pad in 11..19. For an xVLA run that
+    # scores the matrix with one unweighted MSE (`--policy.action_mode=bspline_uniform`)
+    # instead of xVLA's index-sliced loss -- nothing then needs the pose to sit where
+    # POS_IDX/ROT_IDX expect it, so the rearrangement has no reason to exist. The width
+    # stays 20 so the pretrained domain tables load at their saved shape, and so the
+    # action is one width end to end: the statistics, the normalizer and the
+    # unnormalizer all see 20, and `recover` sheds the pad on the way to the curve.
+    "knot_first20": MatrixArrangement("knot_first20", 20, knot_last=False),
 }
 
 

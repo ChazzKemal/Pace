@@ -34,16 +34,25 @@ def _mujoco_time(env) -> float | None:
 
 
 class SimTimeRecorder(gym.Wrapper):
-    """Log ``(sim_time, success)`` for every episode this env finishes.
+    """Log ``(episode_index, sim_time, success)`` for every episode this env finishes.
 
     The clock is read on the terminating step, before the auto-reset that would zero
     it. Episodes land in :attr:`episodes` in completion order.
+
+    ``episode_index`` is upstream's own numbering -- batch-major, env-minor -- and is
+    what makes a run comparable to another run episode by episode. It cannot be
+    inferred from position in :attr:`episodes`, because a failing episode usually
+    runs to the step cap without the env ever terminating and so is never recorded;
+    the batch counter is therefore tracked explicitly.
     """
 
-    def __init__(self, env):
+    def __init__(self, env, env_index: int = 0, stride: int = 1):
         super().__init__(env)
         self.episodes: list[dict] = []
+        self.env_index = env_index
+        self.stride = stride
         self._recorded = False
+        self._batch = -1
 
     def arm(self) -> None:
         """Allow one more episode to be recorded. Called at each batch start.
@@ -53,6 +62,7 @@ class SimTimeRecorder(gym.Wrapper):
         exactly the overcount this guards against.
         """
         self._recorded = False
+        self._batch += 1
 
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -66,6 +76,7 @@ class SimTimeRecorder(gym.Wrapper):
             self._recorded = True
             self.episodes.append(
                 {
+                    "episode_index": self._batch * self.stride + self.env_index,
                     "sim_time": _mujoco_time(self),
                     # LIBERO terminates on success and truncates on timeout, so
                     # `terminated` is the success flag; reward is kept as a check.
@@ -91,7 +102,8 @@ def wrap_vector_env(vec_env) -> list[SimTimeRecorder]:
             f"{type(vec_env).__name__} exposes no `.envs`; sim-time recording needs a "
             "synchronous vector env whose members can be wrapped in place."
         )
-    recorders = [SimTimeRecorder(member) for member in vec_env.envs]
+    n = len(vec_env.envs)
+    recorders = [SimTimeRecorder(member, env_index=i, stride=n) for i, member in enumerate(vec_env.envs)]
     vec_env.envs = recorders
 
     original_reset = vec_env.reset

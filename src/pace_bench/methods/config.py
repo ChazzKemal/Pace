@@ -81,6 +81,35 @@ class MethodConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore[misc]
         baseline contribute nothing here and must be unaffected by it.
         """
 
+    def adjust_built_policy(self, policy) -> None:
+        """Mutate the policy *object* once it exists, not its config.
+
+        The other `adjust_*` hooks all run before construction. This one exists for the
+        things that can only be reached afterwards -- a parameter's `requires_grad`, a
+        gradient hook, a wrapped `save_pretrained`. Called for every method, so it must
+        stay a no-op by default.
+        """
+
+    def register_action_space(self) -> None:
+        """Make ``ee6d_bspline`` resolvable by ``--policy.action_mode``.
+
+        xVLA looks its action space up in a registry while the model is being built,
+        so this import has to happen before the policy is constructed -- at training
+        **and** at evaluation, where the checkpoint's own config names
+        ``ee6d_bspline`` and nothing else in the process would pull the module in.
+        Deliberately not done at package import, so selecting any other method never
+        imports xVLA -- and that import is not cheap: `lerobot.policies.xvla.__init__`
+        pulls in `modeling_xvla`, and with it Florence-2.
+
+        Two ways to ask for it. ``xvla_ee6d20`` implies `ee6d_bspline` and needs nothing
+        else said. A ``knot_first`` run has to name its space in `xvla_action_space`,
+        because the arrangement alone cannot tell an xVLA run from an ACT one -- both
+        use ``knot_first`` -- and registering unconditionally would import Florence-2
+        into every ACT run.
+        """
+        if self.arrangement == "xvla_ee6d20" or self.xvla_action_space is not None:
+            import pace_bench.methods.bspline.xvla_action  # noqa: F401
+
     def adjust_dataset(self, dataset) -> None:
         """Mutate the dataset's *metadata* after it is built, before the policy is.
 
@@ -380,6 +409,26 @@ class BSplineMethod(MethodConfig):
     #: row-to-row ramp, attenuating the per-sample knot signal about 2.3x relative to
     #: the control points. Turning this on removes the ramp if that ever matters.
     relative_knots: bool = False
+    #: The xVLA action space this run needs registered, when the arrangement cannot
+    #: imply it. `xvla_ee6d20` implies `ee6d_bspline`; a `knot_first` run on xVLA must
+    #: name `bspline_knot_first` here. Checked against `--policy.action_mode` in
+    #: `adjust_policy`, because naming one without the other is silently wrong.
+    xvla_action_space: str | None = None
+    #: Normalize the parameter matrix per channel, the way upstream B-spline does
+    #: (`diffusion_unet_image_policy.py:192` normalizes, then applies one unweighted
+    #: MSE). Only bites on a policy whose ACTION mapping is IDENTITY -- ACT and
+    #: Diffusion already normalize, so this changes nothing for them; xVLA normalizes
+    #: nothing, which is why its four per-group loss scales had to be set by hand.
+    #: Required by `bspline_knot_first`, whose knot column is in frames.
+    normalize_parameters: bool = False
+    #: Train the first N rows of xVLA's positional embedding -- the action segment.
+    #: 0 leaves it frozen, which is what every arm so far has done. It is the only
+    #: channel through which position reaches an action token, and it was pretrained to
+    #: mean "timestep k" where B-spline means "control point k"; see
+    #: `methods/bspline/pos_emb.py` for why this cannot be a `--peft.*` flag. Rows past
+    #: N index the visual tokens and stay pretrained. Changes the trainable set, so an
+    #: arm using it is a diagnostic run rather than a member of the comparison.
+    unfreeze_pos_emb_rows: int = 0
     #: Actions decoded from one predicted spline, at inference. The speed lever, and a
     #: decode-time choice needing no retraining: the curve covers a fixed stretch of
     #: demonstrated motion, so fewer samples cover it in fewer executed steps. The
@@ -393,6 +442,12 @@ class BSplineMethod(MethodConfig):
     #: it, seam blending is unnecessary -- which is why upstream has no such blend.
     #: Sequential control only; a training batch ignores it.
     align: bool = True
+    #: Seconds of each predicted curve left unexecuted before the next chunk is
+    #: requested. Upstream re-plans while the current curve still has this much to run
+    #: (`predict_before_end`, 0.06 s) rather than after it is spent, so the arm is
+    #: never driven into the tail of a prediction. Ours is a synchronous loop, so the
+    #: margin is realised by holding back that many actions rather than by a thread.
+    predict_before_end: float = 0.06
     #: Frame rate of the demonstrations, used to express knots in seconds for
     #: arrangements that need it. A config field rather than something read off the
     #: dataset, because evaluation has no dataset and must reconstruct the exact knot
@@ -409,6 +464,12 @@ class BSplineMethod(MethodConfig):
             raise ValueError(f"chunk_size must be >= 2, got {self.chunk_size}")
         if self.degree < 1:
             raise ValueError(f"degree must be >= 1, got {self.degree}")
+        # Registering here rather than at any one call site is deliberate: xVLA
+        # resolves its action space while the model is being built, so *every* path
+        # that ends in a policy -- training and evaluation both -- has to have
+        # registered first, and tying it to construction of this config is the only
+        # place that cannot be reached in the wrong order.
+        self.register_action_space()
 
     def _arrange(self):
         """The arrangement with its knot scale resolved, from config alone.
@@ -419,7 +480,7 @@ class BSplineMethod(MethodConfig):
         from pace_bench.methods.bspline.layout import resolve_arrangement
 
         arrangement = resolve_arrangement(self.arrangement)
-        if arrangement.channels is None:
+        if not arrangement.scale_knots_by_fps:
             return arrangement
         # Knots in seconds, not frames: an arrangement exists because the policy reads
         # its action vector structurally, and such a policy (xVLA) does not normalize
@@ -459,11 +520,6 @@ class BSplineMethod(MethodConfig):
                 f"silently rescales time; set --method.fps={dataset.meta.fps}."
             )
         arrangement = self._arrange()
-        if arrangement.name == "xvla_ee6d20":
-            # Importing registers `ee6d_bspline` in xVLA's own action registry, which
-            # `--policy.action_mode` then resolves. Done here rather than at package
-            # import so that selecting any other method never pulls in xVLA.
-            import pace_bench.methods.bspline.xvla_action  # noqa: F401
         starts = episode_starts_from_metadata(dataset.meta)
         action_table = np.asarray(dataset.hf_dataset[ACTION], dtype=np.float64)
         episode_actions = {
@@ -521,6 +577,67 @@ class BSplineMethod(MethodConfig):
             "B-spline: set %s and %s to %d (policy type %r)",
             fields.chunk, fields.executed, self.width, policy_cfg.type,
         )
+        self._adjust_action_normalization(policy_cfg)
+
+    def _adjust_action_normalization(self, policy_cfg) -> None:
+        """Check the action-space pairing, then switch normalization on if asked.
+
+        Two failures this exists to make loud. Naming `--method.xvla_action_space`
+        without the matching `--policy.action_mode` (or the reverse) trains a different
+        loss than the run believes it selected, and nothing downstream notices.
+        Selecting `bspline_knot_first` without normalization is worse than it looks:
+        under `knot_first` the knot column is in *source frames* -- the `knot_scale`
+        that carried seconds is a property of the `xvla_ee6d20` arrangement and does not
+        apply here -- so knots run to ~50 against positions of ~1.3, and a loss that
+        weights every channel alike becomes a loss on time alone.
+        """
+        mode = getattr(policy_cfg, "action_mode", None)
+        if mode == "bspline_uniform" and self.arrangement != "knot_first20":
+            raise ValueError(
+                f"--policy.action_mode=bspline_uniform reads the knot from slot 0 and the "
+                f"control point from slots 1..10, which is what --method.arrangement="
+                f"knot_first20 emits; this run says {self.arrangement!r}. The two describe "
+                "the same vector from opposite ends and disagreeing is silent."
+            )
+        if self.xvla_action_space is not None and mode != self.xvla_action_space:
+            raise ValueError(
+                f"--method.xvla_action_space={self.xvla_action_space!r} but "
+                f"--policy.action_mode={mode!r}. The method registers the space and the "
+                "policy selects it; naming one without the other silently trains a "
+                "different loss. Set both, or neither."
+            )
+
+        mapping = getattr(policy_cfg, "normalization_mapping", None)
+        if mapping is None:
+            return
+        # Keys are plain strings here; the processor reconstructs FeatureType from them.
+        current = mapping.get("ACTION")
+        identity = getattr(current, "value", current) == "IDENTITY"
+
+        if self.normalize_parameters:
+            from lerobot.configs.types import NormalizationMode
+
+            mapping["ACTION"] = NormalizationMode.MEAN_STD
+            logging.info(
+                "B-spline: action normalization %s -> MEAN_STD, against the parameter "
+                "statistics this method installs", getattr(current, "value", current),
+            )
+        elif mode == "bspline_uniform" and identity:
+            raise ValueError(
+                "--policy.action_mode=bspline_uniform scores every parameter channel "
+                "alike, but this policy normalizes actions with IDENTITY and knot_first20 "
+                "carries the knot in source frames -- knots reach ~50 where positions "
+                "reach ~1.3, so the loss would be almost entirely knot. Pass "
+                "--method.normalize_parameters=true."
+            )
+
+    def adjust_built_policy(self, policy) -> None:
+        """Unfreeze the action rows of `pos_emb`, when this run asks for it."""
+        if self.unfreeze_pos_emb_rows <= 0:
+            return
+        from pace_bench.methods.bspline.pos_emb import unfreeze
+
+        unfreeze(policy, self.unfreeze_pos_emb_rows)
 
     def adjust_dataset(self, dataset) -> None:
         """Point the metadata at the parameter matrix, so the policy is built for it.
@@ -573,11 +690,16 @@ class BSplineMethod(MethodConfig):
             "count": np.array([count]),
         }
         dataset.meta.stats[ACTION] = dict(self._action_stats)
+        # Which column the knot ended up in, rather than assuming: `xvla_ee6d20` puts it
+        # last so the pose can sit where xVLA's index-sliced loss expects, every other
+        # arrangement leaves it first. Reading slot 10 unconditionally reported the
+        # *gripper's* statistics for knot_first20 -- right shape, wrong quantity, and
+        # nothing about the number looked wrong.
+        knot_idx = (splines.channels - 1) if (arrangement.channels and arrangement.knot_last) else 0
         logging.info(
-            "B-spline: action metadata now %d-dim (%s, knot x%.4g); knot mean %.2f std %.2f",
-            channels, arrangement.name, arrangement.knot_scale,
-            mean[splines.channels - 1] if arrangement.channels else mean[0],
-            std[splines.channels - 1] if arrangement.channels else std[0],
+            "B-spline: action metadata now %d-dim (%s, knot x%.4g, slot %d); knot mean %.2f std %.2f",
+            channels, arrangement.name, arrangement.knot_scale, knot_idx,
+            mean[knot_idx], std[knot_idx],
         )
 
     def adjust_processors(self, preprocessor, postprocessor) -> None:
@@ -619,6 +741,8 @@ class BSplineMethod(MethodConfig):
                 degree=self.degree,
                 relative_knots=self.relative_knots,
                 align=self.align,
+                fps=self.fps,
+                predict_before_end=self.predict_before_end,
                 layout=self._resolved_layout(),
                 arrangement=self._arrange(),
             )
