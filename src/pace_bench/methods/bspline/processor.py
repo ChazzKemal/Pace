@@ -28,7 +28,12 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.processor.pipeline import ProcessorStep, ProcessorStepRegistry
 from lerobot.utils.constants import ACTION
 
-from pace_bench.methods.bspline.layout import ActionLayout, MatrixArrangement
+from pace_bench.methods.bspline.layout import (
+    ActionLayout,
+    MatrixArrangement,
+    coerce_arrangement,
+    coerce_layout,
+)
 from pace_bench.methods.bspline.spline import (
     DEGREE,
     MAX_ERROR,
@@ -133,7 +138,7 @@ class BSplineChunkStep(ProcessorStep):
         self.episode_starts = episode_starts or {}
         self.relative_knots = relative_knots
         self.degree = degree
-        self.arrangement = arrangement
+        self.arrangement = coerce_arrangement(arrangement)
 
     @property
     def channels(self) -> int:
@@ -249,8 +254,10 @@ class BSplineDecodeStep(ProcessorStep):
         self.num_actions = num_actions
         self.degree = degree
         self.relative_knots = relative_knots
-        self.layout = layout
-        self.arrangement = arrangement
+        # Names, not objects, arrive when the step is rebuilt from a checkpoint's
+        # policy_postprocessor.json -- get_config serialises them by name.
+        self.layout = coerce_layout(layout)
+        self.arrangement = coerce_arrangement(arrangement)
         #: Resume each chunk where the previous one left the arm, rather than at the
         #: curve's own beginning. Sequential control only -- see `decode_batch`.
         self.align = bool(align)

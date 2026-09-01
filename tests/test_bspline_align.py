@@ -448,3 +448,71 @@ class TestActionStepsGuard:
 
         assert resolve_config("real/configs/bspline_1x.yaml")["n_action_steps"] is None
         assert resolve_config("real/configs/bspline_fast.yaml")["n_action_steps"] is None
+
+
+# --------------------------------------------------------------------------
+# Rebuilding a step from a checkpoint's serialised config
+# --------------------------------------------------------------------------
+
+class TestConfigRoundTrip:
+    """`get_config` writes layout and arrangement by NAME, so reconstruction is
+    handed strings. Storing them verbatim surfaced as `'str' object has no attribute
+    'recover'` inside the inference subprocess, after the robot was up -- the step is
+    rebuilt by lerobot from policy_postprocessor.json, never by our own code.
+    """
+
+    SAVED = {
+        "num_actions": 16, "degree": 3, "relative_knots": False,
+        "layout": "cart7", "arrangement": "knot_first",
+    }
+
+    def test_names_are_resolved_to_objects(self):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        step = BSplineDecodeStep(**self.SAVED)
+        assert hasattr(step.arrangement, "recover")
+        assert hasattr(step.layout, "from_spline")
+        assert step.layout.name == "cart7"
+
+    def test_a_rebuilt_step_decodes(self):
+        import torch
+
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        step = BSplineDecodeStep(**self.SAVED)
+        m = torch.zeros(1, 16, 11, dtype=torch.float64)
+        m[0, :, 0] = torch.arange(16, dtype=torch.float64)      # monotonic knots
+        # cart7 control points are xyz(3) + rot6d(6) + gripper(1); the rot6d block
+        # must be a real rotation or the re-orthonormalisation is degenerate.
+        m[0, :, 4] = 1.0
+        m[0, :, 8] = 1.0
+        actions, rates = step.decode_batch(m)
+        assert actions.shape == (1, 16, 7)
+
+    def test_objects_are_passed_through_unchanged(self):
+        from pace_bench.methods.bspline.layout import LAYOUTS, resolve_arrangement
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        layout, arr = LAYOUTS["cart7"], resolve_arrangement("knot_first")
+        step = BSplineDecodeStep(layout=layout, arrangement=arr)
+        assert step.layout is layout
+        assert step.arrangement is arr
+
+    def test_the_chunk_step_coerces_too(self):
+        from pace_bench.methods.bspline.processor import BSplineChunkStep
+
+        step = BSplineChunkStep(arrangement="knot_first")
+        assert hasattr(step.arrangement, "recover")
+
+    def test_identity_is_refused_rather_than_silently_wrong(self):
+        # `identity` adopts the dataset's width, which a name cannot carry.
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        with pytest.raises(ValueError, match=r"adopts the dataset"):
+            BSplineDecodeStep(layout="identity")
+
+    def test_an_unknown_name_names_the_known_ones(self):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        with pytest.raises(ValueError, match=r"known:"):
+            BSplineDecodeStep(layout="nope")

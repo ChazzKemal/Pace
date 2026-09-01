@@ -145,3 +145,37 @@ def resolve_arrangement(name: str) -> MatrixArrangement:
     if name not in ARRANGEMENTS:
         raise ValueError(f"unknown matrix arrangement {name!r}; known: {sorted(ARRANGEMENTS)}")
     return ARRANGEMENTS[name]
+
+
+def coerce_layout(value: "ActionLayout | str | None") -> "ActionLayout | None":
+    """Accept a layout or its name, and return the layout.
+
+    ``get_config`` serialises these by name, so a step reconstructed from a
+    checkpoint's ``policy_postprocessor.json`` is handed the *string*. Without this
+    the name is stored verbatim and the failure surfaces deep in decoding as
+    ``'str' object has no attribute 'recover'`` -- inside the inference subprocess,
+    after the robot is up.
+
+    ``identity`` cannot be rebuilt from a name: it adopts the dataset's own width, so
+    the width is not recoverable from the config alone. That is refused explicitly
+    rather than returning a layout whose ``spline_dim`` is 0.
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    if value not in LAYOUTS:
+        raise ValueError(f"unknown action layout {value!r}; known: {sorted(LAYOUTS)}")
+    layout = LAYOUTS[value]
+    if layout.raw_dim is None:
+        raise ValueError(
+            f"action layout {value!r} adopts the dataset's action width, so it cannot "
+            "be rebuilt from a name alone. Pass the resolved ActionLayout (see "
+            "`resolve_layout`) rather than its name."
+        )
+    return layout
+
+
+def coerce_arrangement(value: "MatrixArrangement | str | None") -> "MatrixArrangement | None":
+    """Accept an arrangement or its name, and return the arrangement. See `coerce_layout`."""
+    if value is None or not isinstance(value, str):
+        return value
+    return resolve_arrangement(value)
