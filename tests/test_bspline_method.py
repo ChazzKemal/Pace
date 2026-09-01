@@ -371,6 +371,26 @@ class TestMatrixArrangement:
 
 
 class TestXVLABSplineActionSpace:
+    """xVLA's structured loss applied to slots that hold spline coefficients.
+
+    Every slot of the arranged matrix is a B-spline parameter, so every term has to
+    be a regression. Stock ee6d classifies slot 9, which is right for a 0/1 gripper
+    command and wrong for the gripper's control point.
+    """
+
+    #: The control-point extremes a binary 0/1 channel actually produces. Measured
+    #: over libero_10_ee6d at max_error=0.01; the value is the cubic B-spline's
+    #: structural overshoot for a unit step, not a property of that dataset.
+    OVERSHOOT = (-0.366, 1.366)
+
+    @staticmethod
+    def space():
+        from lerobot.policies.xvla.action_hub import build_action_space
+
+        import pace_bench.methods.bspline.xvla_action  # noqa: F401
+
+        return build_action_space("ee6d_bspline")
+
     def test_it_registers_and_scores_the_knot_column(self):
         from lerobot.policies.xvla.action_hub import build_action_space
 
@@ -399,6 +419,57 @@ class TestXVLABSplineActionSpace:
         for i, a in enumerate(groups):
             for b in groups[i + 1 :]:
                 assert not (a & b)
+
+    def test_the_gripper_term_is_a_regression(self):
+        """A control point outside [0, 1] must cost more the further off it is.
+
+        Under BCE this fails in the worst possible way: the loss is unbounded below
+        for a target outside [0, 1], so saturating the logit scores *better* than
+        predicting the coefficient. Here `far` must simply cost more than `near`.
+        """
+        space = self.space()
+        target = torch.zeros(2, 4, 20)
+        target[:, :, 9] = self.OVERSHOOT[1]
+
+        near = target.clone()
+        near[:, :, 9] = self.OVERSHOOT[1] - 0.1
+        far = target.clone()
+        far[:, :, 9] = 30.0  # a saturating "logit"
+
+        assert space.compute_loss(target.clone(), target)["gripper_loss"].item() == 0.0
+        assert (
+            space.compute_loss(far, target)["gripper_loss"].item()
+            > space.compute_loss(near, target)["gripper_loss"].item()
+            > 0.0
+        )
+
+    def test_no_loss_term_can_go_negative(self):
+        """The BCE pathology, pinned: every term is a scaled MSE, so none is
+        unbounded below no matter what the coefficients are."""
+        space = self.space()
+        rng = torch.Generator().manual_seed(0)
+        target = torch.rand(2, 4, 20, generator=rng) * 3 - 1  # spans well outside [0, 1]
+        pred = torch.randn(2, 4, 20, generator=rng) * 20
+        assert all(v.item() >= 0.0 for v in space.compute_loss(pred, target).values())
+
+    def test_postprocess_leaves_the_control_point_alone(self):
+        """Stock ee6d sigmoids slot 9. That would clamp the coefficient into (0, 1)
+        and make the overshoot -- which is what encodes the gripper edge --
+        unrepresentable, so this space must return the prediction as regressed."""
+        space = self.space()
+        action = torch.zeros(1, 3, 20)
+        action[:, :, 9] = torch.tensor(list(self.OVERSHOOT) + [0.5])
+        np.testing.assert_allclose(
+            space.postprocess(action.clone())[:, :, 9].numpy(),
+            action[:, :, 9].numpy(),
+        )
+
+    def test_every_slot_of_the_matrix_is_scored(self):
+        """Nothing may be silently unsupervised: slots 0..10 are all real parameters
+        (11..19 are the zero pad a single arm leaves behind)."""
+        space = self.space()
+        scored = set(space.POS_IDX) | set(space.ROT_IDX) | set(space.gripper_idx) | set(space.KNOT_IDX)
+        assert scored == set(range(11))
 
 
 class TestEvalPath:
