@@ -27,6 +27,13 @@ from pace_bench.methods.config import (
 )
 from pace_bench.methods.bspline.processor import BSplineDecodeStep
 from pace_bench.methods.pace.processor import PaceSpeedStep
+from pace_bench.real.deploy_flags import (  # noqa: F401
+    NO_SEAM_BLEND,
+    blend_overlap_for,
+    validate_action_steps,
+)
+#   re-exported: `blend_overlap_for` is the deploy-side companion of `deploy_steps`,
+#   but it lives in deploy_flags so it stays importable without crisp_gym.
 
 
 class PaceSpeed:
@@ -116,11 +123,16 @@ def deploy_steps(method: MethodConfig, *, args, n_action_steps: int | None = Non
         return [GripperReplicate(int(method.low_v))]
 
     if isinstance(method, BSplineMethod):
-        decode = BSplineDecode(BSplineDecodeStep(
-            num_actions=int(getattr(args, "bspline_num_actions", 0)) or 16,
-            degree=method.degree,
-            relative_knots=method.relative_knots,
-        ))
+        validate_action_steps(method, n_action_steps)
+        # Built by the method, not here. A hand-rolled BSplineDecodeStep is missing the
+        # layout, and a decode step without one never calls `layout.from_spline`: the
+        # arm is handed the 10-dim spline space (xyz + rot6d + gripper) where it expects
+        # 7-dim cart7, with a rotation matrix sitting in the rotvec's slots. It runs and
+        # produces a trajectory; it is simply the wrong one. `postprocessor_steps` is the
+        # same construction the LIBERO evaluator uses, and it resolves the layout, the
+        # arrangement and `num_actions` from config alone -- no dataset needed.
+        (decode_step,) = method.postprocessor_steps()
+        decode = BSplineDecode(decode_step)
         # B-spline compresses *waypoints*, like demospeedup, so a speed pin buys the
         # gripper nothing -- speeds are already 1.0. It must be paid in rows, and the
         # factor is the realised bspline_rate (source frames advanced per executed
@@ -128,6 +140,12 @@ def deploy_steps(method: MethodConfig, *, args, n_action_steps: int | None = Non
         # that is decided, refuse rather than return a step list whose gripper entry
         # is a silent no-op: the arm would lift with the gripper still half closed.
         low_v = getattr(args, "bspline_gripper_low_v", None)
+        if not low_v and n_grip == 0:
+            # `slowdown_frames=0` is the caller stating that no compensation is wanted,
+            # which is the correct configuration at ~1x: nothing was taken from the
+            # gripper, so there is nothing to give back. The guard below exists to catch
+            # the *unstated* case, not to forbid this one.
+            return [decode]
         if not low_v:
             raise GripperCompensationUndecided(
                 "B-spline decodes fewer actions across the same motion, so the "

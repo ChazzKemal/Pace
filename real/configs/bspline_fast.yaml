@@ -1,0 +1,16 @@
+# The same checkpoint sampled sparsely -- B-spline's actual claim. `num_actions` is a
+# decode-time choice, so this differs from bspline_1x.yaml in one number and needs no
+# retraining. 16 is the matrix width: 1.60x median, 74% of chunks above demo speed.
+#
+# This config REFUSES to run as written, deliberately. Above 1x the gripper gets
+# proportionally less wall-clock to close and the arm would lift with it half shut.
+# Set bspline_low_v from the observed bspline_rate, or slowdown_frames: 0 to state
+# that a run without compensation is what you want.
+_include: bspline_1x.yaml
+
+method:
+  num_actions: 16
+
+gripper:
+  slowdown_frames: 5
+  bspline_low_v: 0          # unset -> deploy_steps raises GripperCompensationUndecided

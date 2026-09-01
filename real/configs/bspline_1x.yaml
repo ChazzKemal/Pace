@@ -1,0 +1,72 @@
+# B-spline at demonstration speed -- the "does the policy work at all" run.
+#
+# Speed is `num_actions` and nothing else. The curve covers a fixed stretch of
+# demonstrated motion, so the realised rate is span / (num_actions - 1) source frames
+# per executed action, where the span is what the policy predicted for that chunk.
+# Measured on pickplace (chunk_size 10, degree 3, max_error 0.01): span median 24
+# frames over 1932 chunks, so num_actions 25 puts the median chunk at 1.00x. Leaving
+# it unset defaults to the matrix width (16) and runs at 1.60x -- a speedup, not a
+# baseline. See bspline_fast.yaml for that.
+#
+# layout/chunk_size/degree/fps must match the checkpoint's training flags: those are
+# NOT restored by read_checkpoint, and a mismatch decodes the wrong curve silently.
+# These are stages 7-8 of run_demospeedup_pickplace.sh.
+#
+# Task-free: the checkpoint comes from --task (see tasks.yaml).
+_include: deploy_defaults.yaml
+
+n_action_steps: null        # Unset on purpose -- do not put a number here.
+                            #
+                            # crisp_gym requires `n_act < chunk_size`, because for an
+                            # ordinary policy the chunk is a sequence and you execute a
+                            # prefix of it, replanning before it runs out. A B-spline
+                            # chunk is not a sequence: its `width` rows are one curve's
+                            # knots and control points, and a prefix of them is a
+                            # different, shorter curve. So the only correct value is the
+                            # full width -- which the guard rejects (16 is not < 16).
+                            #
+                            # `null` sidesteps it: the checkpoint already carries
+                            # n_action_steps=16, put there by `adjust_policy` at training
+                            # time, and passing None means crisp_gym uses that and skips
+                            # the check. The decode then expands 16 parameter rows into
+                            # num_actions executed rows, which the loop takes as-is
+                            # (K = len(chunk) after the method pipeline).
+
+method:
+  type: bspline
+  layout: cart7
+  fps: 20.0
+  chunk_size: 10
+  degree: 3
+  max_error: 0.01
+  num_actions: 25
+
+blend:
+  overlap: 0                # MUST be 0 for B-spline, and this is not a preference.
+                            # loop.py runs seam blending at step 2d, BEFORE the method
+                            # pipeline at step 3 -- so what it blends is not a chunk of
+                            # actions, it is the parameter matrix. Two ways that breaks:
+                            #
+                            #  * it emits chunk[:K-N], turning the 16-row matrix into a
+                            #    12-row one. That is still a valid cubic (12 = 8+3+1)
+                            #    so nothing raises, but the span drops from 14.4 to 8.0
+                            #    source frames -- 44% of every chunk's motion silently
+                            #    dropped.
+                            #  * it rewrites chunk[:N, :6], and column 0 of a parameter
+                            #    matrix is the KNOT vector. The hermite bridge treats
+                            #    time as an x-coordinate and averages it against the
+                            #    previous chunk's knots.
+                            #
+                            # Every other method blends correctly because its chunk is
+                            # already actions by then. The real fix is to blend after
+                            # `run_pipeline`, which is crisp_gym's loop, not ours.
+
+loop:
+  stride: 1                 # Same reason: step 2c decimates the chunk before decode, so
+                            # a stride >1 would sample every Nth row of the matrix.
+                            # 1 is already the default; stated so it is not raised blind.
+
+gripper:
+  slowdown_frames: 0        # Nothing was taken from the gripper at 1x, so there is
+                            # nothing to give back. A positive statement: deploy_steps
+                            # refuses a B-spline run whose compensation is merely unset.

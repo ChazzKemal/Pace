@@ -22,15 +22,27 @@ the one property no offline check covers.
 # "must be called with a dataclass type or instance". The `X | None` syntax used
 # below needs no future import on Python 3.10+.
 import logging
+import sys
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import draccus
+import rclpy
+from crisp_gym.deploy import session
+from crisp_gym.deploy.cli import build_parser
+from crisp_gym.deploy.loop import run_producer_loop
+from crisp_gym.deploy.obs import _build_obs_schema, _get_obs_zerofill
+from crisp_gym.deploy.sources import _LeRobotChunkSource
+from crisp_gym.deploy.trace import RunRecord, write_run_artifacts
 
 from pace_bench.methods.config import MethodConfig, MethodPipelineConfig, NoMethod
 from pace_bench.real.checkpoint import read_checkpoint, validate_method
-from pace_bench.real.configs import materialise
+from pace_bench.real.configs import materialise, resolve_policy_path
+from pace_bench.real.deploy_flags import blend_overlap_for
 from pace_bench.real.deploy_steps import deploy_steps
+from pace_bench.real.picker import maybe_pick_config
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +117,12 @@ class GripperConfig:
     slowdown_frames: int = 5
     #: Gripper channel is inverted in some recordings.
     invert: bool = False
+    #: Rows each gripper-motion row is repeated for (`bspline`). B-spline compresses
+    #: waypoints rather than time, so it pays the gripper in rows like demospeedup --
+    #: but it has no recorded stride to inherit, and the realised rate varies per
+    #: chunk. 0 leaves it unstated, which `deploy_steps` refuses unless
+    #: `slowdown_frames` is also 0. Start from the decoded `bspline_rate`.
+    bspline_low_v: int = 0
 
 
 @dataclass
@@ -112,6 +130,14 @@ class RealEvalConfig(MethodPipelineConfig):
     """Everything one robot evaluation needs. ``--method.type`` selects the method."""
 
     policy_path: str = ""
+    #: Which task's checkpoint to deploy. Resolved against `real/configs/tasks.yaml`
+    #: using this run's `--method.type`, and only when `policy_path` is empty -- an
+    #: explicit path always wins. Left blank, nothing is looked up, so every existing
+    #: config keeps working unchanged.
+    task: str = ""
+    #: The registry `task` is resolved against. Relative to the repo, not to whichever
+    #: directory the operator happened to launch from.
+    tasks_file: str = "real/configs/tasks.yaml"
     out: Path = Path("outputs/eval_real")
     env_config: str = "ur10e_ridgeback_dual_cam_deploy_env_rotvec"
     fps: float = 20.0
@@ -143,8 +169,6 @@ def deploy_args(cfg: RealEvalConfig, method=None):
     thought about therefore keeps the value that was proven on hardware, instead of
     silently getting a fresh one.
     """
-    from crisp_gym.deploy.cli import build_parser
-
     args = build_parser().parse_args([])
     args.env_config = cfg.env_config
     args.fps = cfg.fps
@@ -152,6 +176,7 @@ def deploy_args(cfg: RealEvalConfig, method=None):
     args.max_chunks = cfg.max_chunks
     args.gripper_slowdown_frames = cfg.gripper.slowdown_frames
     args.invert_gripper = cfg.gripper.invert
+    args.bspline_gripper_low_v = cfg.gripper.bspline_low_v
     args.cpp_sender = cfg.sender.cpp
     args.startup_delay = cfg.sender.startup_delay
     args.rt_priority = cfg.sender.rt_priority
@@ -166,6 +191,13 @@ def deploy_args(cfg: RealEvalConfig, method=None):
     args.yes = True                  # the method and checkpoint were already validated
     if cfg.n_action_steps is not None:
         args.n_act = cfg.n_action_steps
+
+    # Seam blending is vetoed for methods whose chunks do not overlap in motion, so
+    # this overrides the config's `blend.overlap` rather than reading it: the veto must
+    # not be reachable by editing YAML. See `deploy_flags.blend_overlap_for`.
+    if method is not None:
+        args.blend_overlap = blend_overlap_for(method, cfg.blend.overlap)
+
     # The method owns the speed decision, so the heuristic schedule stays neutral --
     # for anything but `none` it is not even in the pipeline.
     args.max_speed = args.min_speed = 1.0
@@ -180,6 +212,24 @@ def deploy_args(cfg: RealEvalConfig, method=None):
         args.max_speed = float(peak)
         args.min_speed = float(getattr(method, "min_speed", None) or peak / 2)
     return args
+
+
+def apply_task(cfg: RealEvalConfig) -> None:
+    """Fill in ``policy_path`` from ``--task``, in place.
+
+    Runs before :func:`resolve_method`, which reads the checkpoint to validate the
+    method against it -- so the path has to exist by then. A task that resolves to
+    nothing raises there rather than here, naming what the task does have.
+    """
+    if not cfg.task:
+        return
+    if cfg.policy_path:
+        logger.info("--task=%s ignored: --policy_path was given explicitly", cfg.task)
+        return
+    declared = getattr(cfg.method, "type", "none")
+    path = resolve_policy_path(cfg.task, declared, cfg.tasks_file)
+    logger.info("task=%s method=%s -> %s", cfg.task, declared, path)
+    cfg.policy_path = str(path)
 
 
 def resolve_method(cfg: RealEvalConfig) -> MethodConfig:
@@ -249,8 +299,6 @@ def quiesce_target_pose_timer(env) -> None:
     Cancelling before the handover closes the window; the sleep lets a callback
     already in flight finish, since the executor runs on its own thread.
     """
-    import time as _time
-
     robot = env.robot
     cb = robot._callback_publish_target_pose
     cancelled = 0
@@ -259,7 +307,7 @@ def quiesce_target_pose_timer(env) -> None:
             timer.cancel()
             cancelled += 1
     if cancelled:
-        _time.sleep(2.0 / max(robot.config.publish_frequency, 1.0))
+        time.sleep(2.0 / max(robot.config.publish_frequency, 1.0))
     logger.info("target_pose timer(s) cancelled before handover: %d", cancelled)
 
 
@@ -271,16 +319,6 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
     matched before the producer. Teardown is in a ``finally`` because a live sender
     thread and scaled controller gains outlive a crash.
     """
-    import time
-    from collections import deque
-
-    import rclpy
-    from crisp_gym.deploy import session
-    from crisp_gym.deploy.loop import run_producer_loop
-    from crisp_gym.deploy.obs import _build_obs_schema, _get_obs_zerofill
-    from crisp_gym.deploy.sources import _LeRobotChunkSource
-    from crisp_gym.deploy.trace import RunRecord, write_run_artifacts
-
     env = session.build_env(args)
     src = _LeRobotChunkSource(
         pretrained_path=cfg.policy_path, env=env,
@@ -355,6 +393,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
 def main(cfg: RealEvalConfig) -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    apply_task(cfg)
     method = resolve_method(cfg)
     steps = build_steps(cfg, method)
     logger.info("method=%s | steps=%s",
@@ -382,9 +421,14 @@ def _resolve_config_arg(argv: list[str]) -> list[str]:
 if __name__ == "__main__":
     # Import the package-qualified main so draccus resolves the same class object
     # (under `python -m`, this file is __main__ and RealEvalConfig would differ).
-    import sys
-
     from pace_bench.real.run_real import main as packaged_main
 
-    sys.argv = _resolve_config_arg(sys.argv)
+    # No --config_path and a terminal to ask in: offer the choice rather than falling
+    # through to dataclass defaults, which are not a run anybody meant to start.
+    # Returns None only when the operator cancelled, which must launch nothing.
+    chosen = maybe_pick_config(sys.argv)
+    if chosen is None:
+        sys.exit(0)
+
+    sys.argv = _resolve_config_arg(chosen)
     packaged_main()

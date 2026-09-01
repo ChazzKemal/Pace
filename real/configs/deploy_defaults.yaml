@@ -27,7 +27,7 @@ blend:
   skip: 0
 
 loop:
-  overlap_threshold: 2      # inference budget = 2 x dt_eff = 100 ms at 20 Hz
+  overlap_threshold: 4      # inference budget = 2 x dt_eff = 100 ms at 20 Hz
 
 gains:
   scale_kp: false           # writes controller parameters on the robot; opt in

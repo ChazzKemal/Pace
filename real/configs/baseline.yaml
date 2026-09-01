@@ -1,4 +1,6 @@
-# No method: bit-identical to the pre-method deploy path.
+# No method: bit-identical to the pre-method deploy path. Task-free -- pick the
+# checkpoint with --task (see tasks.yaml), which currently has a `none` arm for
+# stackcups only; pickplace's has not been trained.
 _include: deploy_defaults.yaml
 
 method:
