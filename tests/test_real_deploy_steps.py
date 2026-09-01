@@ -136,7 +136,10 @@ class TestGripperStrideExemption:
         return a
 
     def idx(self, **kw):
+        # frames=0 throughout this class: these tests are about *detecting* the
+        # transition. The window that follows it is TestExemptionWindow's subject.
         from pace_bench.methods.pace.speed import stride_indices
+        kw.setdefault("gripper_stride_exempt_frames", 0)
         return stride_indices(self.chunk(), PaceMethod(action_stride=2, **kw).to_pace_config())
 
     def test_plain_striding_drops_the_transition(self):
@@ -176,3 +179,51 @@ class TestGripperStrideExemption:
                              args=args(), n_action_steps=32, control_dt=0.05)
         (replicate,) = [s for s in steps if type(s).__name__ == "GripperReplicate"]
         assert replicate.low_v == 2
+
+
+class TestExemptionWindow:
+    """The command edge is not the grasp. The jaws keep travelling after it settles.
+
+    A command transition is 1-3 rows; the stroke is ~2.27 s at the deploy rate, some
+    45 control steps at 20 Hz. Exempting only the edge lets the arm resume striding
+    mid-close -- the arm lifting with the gripper half shut is the failure the whole
+    compensation exists to prevent.
+    """
+
+    def chunk(self, k=20, edge=5):
+        import torch
+        a = torch.zeros(1, k, 7)
+        a[0, :, 0] = torch.linspace(0.0, 0.5, k)
+        a[0, edge, GRIP_COL] = 0.5          # a two-row ramp, as a policy emits
+        a[0, edge + 1:, GRIP_COL] = 1.0
+        return a
+
+    def idx(self, frames):
+        from pace_bench.methods.pace.speed import stride_indices
+        cfg = PaceMethod(action_stride=2, gripper_stride_exempt=True,
+                         gripper_stride_exempt_frames=frames).to_pace_config()
+        return stride_indices(self.chunk(), cfg)
+
+    def test_zero_frames_covers_only_the_transition(self):
+        # The old behaviour, kept reachable: striding resumes as soon as the command
+        # settles, which is too early on hardware.
+        assert 7 not in self.idx(0)
+
+    def test_the_window_keeps_striding_off_while_the_jaws_travel(self):
+        got = self.idx(5)
+        assert all(i in got for i in (7, 9, 11)), got
+
+    def test_the_window_ends(self):
+        # Only the grasp is protected; the speedup must return afterwards.
+        got = self.idx(5)
+        assert 13 not in got and 15 not in got
+
+    def test_a_longer_window_protects_further(self):
+        assert set(self.idx(5)) < set(self.idx(10))
+
+    def test_the_default_matches_the_deploy_slowdown_window(self):
+        # gripper_slowdown_frames is 5 in deploy_defaults.yaml and pins speed over the
+        # same window. Two knobs, one physical question -- they must not drift.
+        from pace_bench.real.configs import resolve_config
+        shipped = resolve_config("real/configs/deploy_defaults.yaml")["gripper"]["slowdown_frames"]
+        assert PaceMethod().gripper_stride_exempt_frames == shipped

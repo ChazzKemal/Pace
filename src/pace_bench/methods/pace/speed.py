@@ -65,6 +65,12 @@ class PaceConfig:
     action_stride: int = 1
     #: Never stride away a step where the gripper command is moving. See stride_indices.
     gripper_stride_exempt: bool = False
+    #: Steps kept *after* the command settles, while the jaws are still travelling.
+    #: The command edge is 1-3 rows; the stroke is ~45 control steps at 20 Hz, so
+    #: exempting only the edge lets the arm resume striding mid-close. Same number and
+    #: same bargain as the deploy path's `gripper_slowdown_frames`, which pins speed
+    #: over the same window -- keep the two equal, they answer one physical question.
+    gripper_stride_exempt_frames: int = 5
     # Skip only where the path is straight; keep full resolution through corners.
     adaptive_stride: bool = False
 
@@ -227,6 +233,12 @@ def stride_indices(abs_actions: torch.Tensor, cfg: PaceConfig) -> list[int]:
     an interpolated one is an estimate of what was deleted. It also removes the need
     to get the repayment arithmetic right at all.
 
+    The exemption runs past the command edge by ``gripper_stride_exempt_frames``. The
+    command settles in 1-3 rows but the jaws do not: the stroke is ~2.27 s at the
+    deploy rate, some 45 control steps at 20 Hz. Exempting only the edge lets the arm
+    resume striding while the gripper is still closing, which is the failure the whole
+    compensation exists to prevent.
+
     Note the two are independent: a grasp on a straight approach is exactly what
     ``adaptive_stride`` alone strides through, since it only looks at bend angle.
     """
@@ -242,9 +254,12 @@ def stride_indices(abs_actions: torch.Tensor, cfg: PaceConfig) -> list[int]:
         g = abs_actions[0, :, GRIP]
         moving = (g[1:] - g[:-1]).abs() > GRIP_EPS
         grip = [False] * n_steps
+        hold = max(0, int(cfg.gripper_stride_exempt_frames))
         for j in range(n_steps - 1):
             if bool(moving[j]):
-                grip[j] = grip[j + 1] = True      # both ends of the transition
+                # Both ends of the transition, then `hold` more while the jaws travel.
+                for k in range(j, min(n_steps, j + 2 + hold)):
+                    grip[k] = True
 
     return [
         i

@@ -143,6 +143,9 @@ class PaceMethod(MethodConfig):
     #: this also switches off the row repayment in `deploy_steps` -- nothing was taken
     #: from the grasp, so giving anything back would run it slower than demonstrated.
     gripper_stride_exempt: bool = False
+    #: Steps kept after the command settles, while the jaws are still travelling.
+    #: Mirrors the deploy path's `gripper_slowdown_frames`; keep the two equal.
+    gripper_stride_exempt_frames: int = 5
 
     n_lookahead: int = 0
     lookahead_agg: str = "min"
