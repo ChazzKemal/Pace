@@ -232,6 +232,37 @@ def dump_run_config(cfg: RealEvalConfig) -> Path:
     return path
 
 
+def quiesce_target_pose_timer(env) -> None:
+    """Stop crisp_py's target-pose timer before the publisher is taken away.
+
+    ``enable_target_pose_publishing`` (crisp_gym.deploy.patches) creates the
+    publisher *and* a 20 Hz timer calling ``Robot._callback_publish_target_pose``.
+    ``phase_publish_channels`` then hands the topic to the sender by setting
+    ``robot._target_pose_publisher = None`` -- and cancels nothing. The callback
+    re-reads that attribute after its own ``is None`` guard has passed (crisp_py
+    robot.py:466 guards, :471 dereferences), so a handover landing in that window
+    raises AttributeError inside the shared executor's spin thread. That thread has
+    no try/except (crisp_gym manipulator_env.py:136-138), so it dies, and every
+    robot and gripper callback dies with it while the run keeps going on frozen
+    observations.
+
+    Cancelling before the handover closes the window; the sleep lets a callback
+    already in flight finish, since the executor runs on its own thread.
+    """
+    import time as _time
+
+    robot = env.robot
+    cb = robot._callback_publish_target_pose
+    cancelled = 0
+    for timer in list(robot.node.timers):
+        if getattr(timer, "callback", None) == cb:
+            timer.cancel()
+            cancelled += 1
+    if cancelled:
+        _time.sleep(2.0 / max(robot.config.publish_frequency, 1.0))
+    logger.info("target_pose timer(s) cancelled before handover: %d", cancelled)
+
+
 def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
     """Bring the robot up, run the method's pipeline, tear down.
 
@@ -267,6 +298,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
         scaler = session.phase_scaler(env, args)
         session.phase_pin_gripper_speed(env, args)
         session.phase_gil_hygiene(env, args)
+        quiesce_target_pose_timer(env)
         ch = session.phase_publish_channels(env, args)
         sender, q = session.phase_start_sender(env, args, scaler, ch)
         started_at, out_dir, recorders = session.phase_video_and_delay(
