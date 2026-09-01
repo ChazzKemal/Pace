@@ -75,17 +75,23 @@ def blend_overlap_for(method, requested: int) -> int:
 def validate_action_steps(method, n_action_steps) -> None:
     """Refuse an ``n_action_steps`` that would cut a B-spline parameter matrix short.
 
-    crisp_gym requires ``n_act < chunk_size``: for an ordinary policy the chunk is a
-    sequence, you execute a prefix and replan before it runs out. A B-spline chunk is
-    not a sequence -- its rows are one curve's knots and control points, and a prefix
-    of them is a different, shorter curve. The only correct value is the full width,
-    which that guard rejects, so the value must be left unset and the checkpoint's own
-    (identical) number used instead.
+    For an ordinary policy the chunk is a sequence: you execute a prefix and replan
+    before it runs out, so any ``n_act`` up to the horizon is meaningful. A B-spline
+    chunk is not a sequence -- its rows are one curve's knots and control points, and
+    a prefix of them decodes a different, shorter curve. The only correct value is the
+    full matrix width, which is also what the checkpoint carries, so leaving it unset
+    and setting it to ``width`` are the same run; anything else is not.
 
     Raising here rather than letting crisp_gym raise later is the same bargain the rest
-    of this module makes: fail on the laptop, not after the arm is powered up. The
-    message crisp_gym would give -- "steps=16 must be smaller than the horizon=16" --
-    names neither the method nor the fix.
+    of this module makes: fail on the laptop, not after the arm is powered up.
+
+    Historical note: crisp_gym additionally rejected ``n_act >= chunk_size``, which
+    made *both* correct choices fail -- the width directly, and "unset" too, because
+    ``AsyncLerobotPolicy`` falls back to the checkpoint's own value and validates that.
+    That check was strictly stricter than LeRobot (``ACTConfig`` errors only on
+    ``n_action_steps > chunk_size``) and redundant beside
+    ``n_action_steps <= horizon - n_obs_steps + 1``, so it was removed in crisp_gym
+    49aea0e. Deploying against an older pin will still fail there, whatever is set here.
     """
     if getattr(method, "type", "none") != "bspline" or n_action_steps is None:
         return
