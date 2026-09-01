@@ -224,6 +224,16 @@ def main(cfg: LiberoEvalConfig) -> None:
         )
 
     if isinstance(cfg.method, BSplineMethod):
+        # A checkpoint trained with `--method.unfreeze_pos_emb_rows` carries its learned
+        # positional embedding in a file beside the adapter, because a PEFT adapter
+        # cannot hold a bare nn.Parameter. Without this the evaluation would silently
+        # run the *pretrained* table and read as a null result for the one thing that
+        # arm changed.
+        from pace_bench.methods.bspline.pos_emb import restore as restore_pos_emb
+
+        if restore_pos_emb(policy, cfg.policy_path):
+            logger.info("restored a trained pos_emb from %s", cfg.policy_path)
+
         # B-spline predicts curve parameters, not actions, so the policy has to decode
         # before anything can be executed. `num_actions` is the speed lever and is
         # chosen here rather than baked into the checkpoint.

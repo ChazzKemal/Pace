@@ -364,6 +364,15 @@ class DemoSpeedupMethod(MethodConfig):
         )
 
 
+def _pretrained_path(policy) -> str | None:
+    """Where this policy was loaded from, through whatever wrappers PEFT added."""
+    for obj in (policy, getattr(policy, "base_model", None), getattr(policy, "model", None)):
+        path = getattr(getattr(obj, "config", None), "pretrained_path", None)
+        if path:
+            return str(path)
+    return None
+
+
 @MethodConfig.register_subclass("bspline")
 @dataclass
 class BSplineMethod(MethodConfig):
@@ -632,12 +641,23 @@ class BSplineMethod(MethodConfig):
             )
 
     def adjust_built_policy(self, policy) -> None:
-        """Unfreeze the action rows of `pos_emb`, when this run asks for it."""
+        """Unfreeze the action rows of `pos_emb`, and load one back if the run has one.
+
+        The restore is not optional bookkeeping. A resumed run rebuilds the policy from
+        its checkpoint, and a PEFT checkpoint carries adapter tensors and
+        `modules_to_save` weights only -- so without this, resuming would silently drop
+        every step of training the embedding had done and continue from the pretrained
+        table, reporting nothing wrong. It is a no-op on a first run, where
+        `pretrained_path` is a hub id with no such file beside it.
+        """
         if self.unfreeze_pos_emb_rows <= 0:
             return
-        from pace_bench.methods.bspline.pos_emb import unfreeze
+        from pace_bench.methods.bspline.pos_emb import restore, unfreeze
 
         unfreeze(policy, self.unfreeze_pos_emb_rows)
+        checkpoint = _pretrained_path(policy)
+        if checkpoint:
+            restore(policy, checkpoint)
 
     def adjust_dataset(self, dataset) -> None:
         """Point the metadata at the parameter matrix, so the policy is built for it.

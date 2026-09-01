@@ -162,3 +162,37 @@ class TestHookOrdering:
 
         _, param = find(lerobot_train.make_policy().wrap_with_peft())
         assert param.requires_grad is False
+
+
+class TestRestoreIsWired:
+    """Saving without loading is worse than not saving at all: the run looks right and
+    the weights are gone. These pin that the load half is actually reachable."""
+
+    def test_a_resumed_run_reloads_the_trained_table(self, tmp_path, monkeypatch):
+        from pace_bench.methods.config import BSplineMethod
+
+        trained = FakePolicy()
+        param = unfreeze(trained, 8)
+        with torch.no_grad():
+            param[:, :8, :] += 0.5
+        trained.save_pretrained(tmp_path)
+
+        # A resume rebuilds from the checkpoint: fresh weights, `pretrained_path` set.
+        resumed = FakePolicy()
+        resumed.config = type("C", (), {"pretrained_path": str(tmp_path)})()
+        BSplineMethod(unfreeze_pos_emb_rows=8).adjust_built_policy(resumed)
+
+        _, restored = find(resumed)
+        torch.testing.assert_close(restored, param)
+        assert restored.requires_grad, "and it must still be trainable after the reload"
+
+    def test_a_first_run_is_unaffected(self, tmp_path):
+        """`pretrained_path` is a hub id on a fresh finetune, with no file beside it."""
+        from pace_bench.methods.config import BSplineMethod
+
+        fresh = FakePolicy()
+        fresh.config = type("C", (), {"pretrained_path": "lerobot/xvla-libero"})()
+        _, before = find(fresh)
+        BSplineMethod(unfreeze_pos_emb_rows=8).adjust_built_policy(fresh)
+        _, after = find(fresh)
+        torch.testing.assert_close(after, before)
