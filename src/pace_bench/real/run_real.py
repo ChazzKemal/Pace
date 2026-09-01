@@ -155,6 +155,12 @@ class RealEvalConfig(MethodPipelineConfig):
     #: lives here rather than among the method's own fields.
     n_action_steps: int | None = None
     max_chunks: int = -1
+    #: Seconds the homing trajectory is given, overriding the robot config's own value
+    #: (crisp_py's default is 5.0; the deploy env YAML does not set one). None leaves it
+    #: alone. This is a *motion* parameter -- the arm covers the same joint distance in
+    #: less time -- so it is stated per run and recorded in run_config.yaml rather than
+    #: baked into the environment, where it would also apply to teleop and recording.
+    time_to_home: float | None = None
     gripper: GripperConfig = field(default_factory=GripperConfig)
     sender: SenderConfig = field(default_factory=SenderConfig)
     blend: BlendConfig = field(default_factory=BlendConfig)
@@ -329,7 +335,14 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     matched before the producer. Teardown is in a ``finally`` because a live sender
     thread and scaled controller gains outlive a crash.
     """
+    _t = time.monotonic()
     env = session.build_env(args)
+    logger.info("build_env took %.1f s", time.monotonic() - _t)
+
+    if cfg.time_to_home is not None:
+        was = getattr(env.robot.config, "time_to_home", None)
+        env.robot.config.time_to_home = float(cfg.time_to_home)
+        logger.info("time_to_home %.1f s -> %.1f s", was, cfg.time_to_home)
 
     # A B-spline checkpoint ships its own decode step, with the num_actions frozen at
     # training. This pipeline supplies the decode instead, built from the run
@@ -355,7 +368,9 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     scaler = sender = rec = None
     started_mono = time.monotonic()
     try:
+        _t = time.monotonic()
         session.phase_home(env, args)
+        logger.info("phase_home took %.1f s", time.monotonic() - _t)
         session.phase_switch_controller(env, args)
         scaler = session.phase_scaler(env, args)
         session.phase_pin_gripper_speed(env, args)

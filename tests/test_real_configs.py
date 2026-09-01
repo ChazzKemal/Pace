@@ -228,3 +228,30 @@ class TestRepoAnchoring:
         from pace_bench.real.configs import load_tasks
         monkeypatch.chdir(tmp_path)
         assert load_tasks("real/configs/tasks.yaml")
+
+
+class TestTimeToHome:
+    """Homing duration is a run-configuration value, not an environment constant.
+
+    crisp_py defaults to 5.0 and the deploy env YAML does not override it, so every
+    run spent 5 s homing. Setting it here rather than in crisp_gym's env config keeps
+    it out of teleop and recording, and puts it in run_config.yaml where a run records
+    the motion it actually commanded.
+    """
+
+    def test_every_run_config_inherits_a_value(self):
+        import pathlib
+        for f in sorted(pathlib.Path("real/configs").glob("*.yaml")):
+            cfg = resolve_config(f)
+            if "method" not in cfg:
+                continue
+            assert cfg.get("time_to_home") is not None, f"{f.name} has no time_to_home"
+
+    def test_the_shipped_default_is_faster_than_crisp_pys(self):
+        # 5.0 is crisp_py's default; the point of the knob is not to sit on it.
+        assert resolve_config("real/configs/deploy_defaults.yaml")["time_to_home"] < 5.0
+
+    def test_a_config_can_raise_it_back(self, tmp_path):
+        (tmp_path / "base.yaml").write_text("time_to_home: 2.0\n")
+        (tmp_path / "slow.yaml").write_text("_include: base.yaml\ntime_to_home: 6.0\n")
+        assert resolve_config(tmp_path / "slow.yaml")["time_to_home"] == 6.0

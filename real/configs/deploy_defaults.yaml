@@ -14,6 +14,12 @@ policy_path: ""             # supply with --policy_path
 env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
 fps: 20.0
 n_action_steps: 32          # executed per query; must be < the policy's chunk_size
+time_to_home: 2.0           # Homing trajectory duration. crisp_py defaults to 5.0 and
+                            # the deploy env YAML does not override it, so every run
+                            # spent 5 s here. 2.0 is the value crisp_gym's own
+                            # left/right_robot_env.yaml use. It is real motion -- the
+                            # arm covers the same joint distance in less time -- so
+                            # raise it back if the approach to home looks abrupt.
 
 sender:
   cpp: true                 # C++ sender: holds cadence under GIL contention
@@ -22,7 +28,7 @@ sender:
   rt_priority: 0
 
 blend:
-  overlap: 4                # hold back 4 frames, fold into the next chunk's head
+  overlap: 8                # hold back 4 frames, fold into the next chunk's head
   mode: hermite             # bridges position AND velocity; linear only averages
   skip: 0
 
