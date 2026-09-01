@@ -111,10 +111,30 @@ def deploy_steps(method: MethodConfig, *, args, n_action_steps: int | None = Non
         return [HeuristicSpeed(args), GripperHold(n_grip, invert=invert)]
 
     if isinstance(method, PaceMethod):
+        # PACE pays for a grasp in *time*: GripperHold pins the speed to 1.0 near the
+        # close edge. That is the right currency while PACE only modulates speed.
+        #
+        # `action_stride` changes what PACE is. Striding drops rows, so each surviving
+        # row covers `action_stride` source frames -- and a pinned speed then buys the
+        # gripper one row of nominal wall-clock where the demonstration had
+        # `action_stride` of them. GripperHold cannot repay that: it writes speeds, and
+        # the missing rows are not a speed. So the stride is handed back in rows over
+        # the gripper's motion run, which is the trade demospeedup already makes.
+        #
+        # Order is load-bearing. GripperHold writes speeds; GripperReplicate repeats
+        # rows *and* their speeds by index, so holding first gives every replica the
+        # nominal speed too. Reversed, GripperCloseWindow would count its n_frames in
+        # already-replicated rows and protect proportionally less motion.
+        #
+        # Inert at the default stride: GripperReplicate(1) returns the chunk untouched,
+        # and no shipped config strides. `adaptive_stride` does not cover this -- it
+        # restores resolution where the *path bends*, and a grasp on a straight
+        # approach is exactly what it strides through.
         return [
             PaceSpeed(method.to_pace_config(), n_action_steps=n_action_steps,
                       control_dt=control_dt, dataset_stats=dataset_stats),
             GripperHold(n_grip, invert=invert),
+            GripperReplicate(int(method.action_stride)),
         ]
 
     if isinstance(method, DemoSpeedupMethod):
