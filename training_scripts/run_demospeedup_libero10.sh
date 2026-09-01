@@ -30,7 +30,9 @@ set -euo pipefail
 # directory, and the three inputs this run does not itself produce -- the dataset,
 # the pretrained xVLA, the stage-2 labels -- live in `data/` beside the checkout,
 # under datasets/sim, checkpoints/ and labels/. All are overridable; none are in git.
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The repo is this script's PARENT directory: the queue scripts live in
+# training_scripts/ and every path below is relative to the checkout root.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${LIBERO10_ROOT:-$DATA_ROOT/datasets/sim/libero_10_ee6d}
@@ -60,26 +62,106 @@ PEFT=(--peft.method_type=LORA --peft.r=8 --peft.lora_alpha=8 --peft.target_modul
       --peft.full_training_modules='["transformer.soft_prompt_hub","transformer.action_encoder","transformer.action_decoder"]')
 # alpha/rank = 1.0 and lr 1e-5: flow matching compounds adapter error over 10
 # denoising steps, so both are held low.
+STEPS=20000
 COMMON=("--policy.path=$POLICY_PATH"
         --policy.device=cuda --policy.push_to_hub=false --policy.optimizer_lr=1e-5
-        --batch_size=8 --steps=20000 --save_freq=5000 --log_freq=100
+        --batch_size=8 --steps=$STEPS --save_freq=5000 --log_freq=100
         --num_workers=4 --seed=42
         --wandb.enable=true --wandb.project="${WANDB_PROJECT:-pace_benchmark_libero10}")
 
+# Created here rather than assumed: on a fresh cluster checkout `logs/` does not
+# exist yet, and the first `tee` into it would take the arm down before it started.
+mkdir -p logs
+
+# Existence of checkpoints/last is NOT proof the arm finished. save_freq is 5k, so a
+# run cut at step 8k leaves a `last` behind, and a bare directory check would report
+# "already trained" and hand the comparison an 8k arm sitting beside a 20k one.
+# Resolve the symlink and insist on the full budget. 10# because the dirs are
+# zero-padded and bash reads a leading 0 as octal (05000 -> 2560).
+#
+# This is what makes the queue safe to interrupt, which under SLURM is not an edge
+# case but the design: slurm_libero10.sbatch requeues itself at the wall clock, so
+# the script is expected to be cut mid-arm and re-entered from the top.
+#
+# A partial arm is RESUMED, not discarded. Upstream's resume restores step, RNG,
+# optimizer moments and the sampler offset, so the continuation is sample-exact and
+# the arm that finishes is the 20k arm this queue asked for. An arm with a
+# checkpoint but no training_state left to load cannot be continued and starts over.
+arm_state () {  # -> done | resume | fresh, on stdout
+    local last="outputs/train/$1/checkpoints/last" step
+    if [ -d "$last" ]; then
+        step=$(basename "$(readlink -f "$last")")
+        if [ "$((10#$step))" -ge "$STEPS" ]; then echo done; return; fi
+        if [ -f "$last/training_state/training_step.json" ]; then echo resume; return; fi
+    fi
+    echo fresh
+}
+
+at_step () { basename "$(readlink -f "outputs/train/$1/checkpoints/last")"; }
+
+step_of () {  # numeric step, 0 when the arm has no checkpoint yet
+    local last="outputs/train/$1/checkpoints/last"
+    if [ -d "$last" ]; then echo "$((10#$(basename "$(readlink -f "$last")")))"; else echo 0; fi
+}
+
+# `|| true` on both pipelines: this script runs under `set -e`, which would
+# otherwise turn a crashed attempt into an aborted queue -- the retry loop below
+# exists precisely to decide what a failure means, so the failure has to reach it.
+launch () {  # launch <name> <job> <state> <extra args...>
+    local name=$1 job=$2 state=$3; shift 3
+    echo "───── $name attempt at $(date '+%F %T'), state=$state ─────" >>"logs/${name}.log"
+    if [ "$state" = resume ]; then
+        # The checkpoint's train_config.json is the whole configuration on this path
+        # -- PEFT block, steps, seed, wandb run id and --method.* included -- and
+        # upstream applies CLI flags over it. Re-passing the arrays would let a later
+        # edit of this file silently change an arm mid-flight, so nothing is passed
+        # but the checkpoint and where to keep writing.
+        "$PY" -m pace_bench.train.run_train \
+            --config_path="$REPO_ROOT/outputs/train/${name}/checkpoints/last/pretrained_model/train_config.json" \
+            --resume=true --output_dir="outputs/train/${name}" \
+            2>&1 | tee -a "logs/${name}.log" || true
+    else
+        # --job_name names the wandb run: <policy>_<addon>, per the project convention
+        # (project pace_benchmark_<task>). It is kept separate from the output dir so
+        # renaming runs never orphans an existing checkpoint.
+        "$PY" -m pace_bench.train.run_train \
+            "${DATASET[@]}" "${PEFT[@]}" "${COMMON[@]}" "$@" \
+            --output_dir="outputs/train/${name}" --job_name="${job}" \
+            2>&1 | tee -a "logs/${name}.log" || true
+    fi
+}
+
+# An arm is launched until it reaches the budget, not once. The guard against
+# spinning: an attempt ending no further along than it started is not a crash worth
+# retrying but a run that cannot start. One is tolerated (a fresh arm has no
+# checkpoint until step 5k); a second in a row stops the queue.
+MAX_ATTEMPTS=${PACE_MAX_ATTEMPTS:-6}
+
 run () {  # run <dir> <wandb run name> <extra args...>
     local name=$1 job=$2; shift 2
-    if [[ -d "outputs/train/${name}/checkpoints/last" ]]; then
-        echo "=== ${name} already trained, skipping ==="
-        return 0
-    fi
-    echo "=== training ${name} ==="
-    # --job_name names the wandb run: <policy>_<addon>, per the project convention
-    # (project pace_benchmark_<task>). It is kept separate from the output dir so
-    # renaming runs never orphans an existing checkpoint.
-    "$PY" -m pace_bench.train.run_train \
-        "${DATASET[@]}" "${PEFT[@]}" "${COMMON[@]}" "$@" \
-        --output_dir="outputs/train/${name}" --job_name="${job}" \
-        2>&1 | tee "logs/${name}.log"
+    local state attempt=0 before after
+    while :; do
+        state=$(arm_state "$name")
+        if [ "$state" = done ]; then
+            [ "$attempt" -eq 0 ] && echo "=== ${name} already trained ($(at_step "$name") steps), skipping ===" \
+                                 || echo "=== ${name} reached $(at_step "$name") steps in $attempt attempt(s) ==="
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
+            echo "FAILED: ${name} stuck at $(step_of "$name")/$STEPS after $MAX_ATTEMPTS attempts"; exit 1
+        fi
+        before=$(step_of "$name")
+        case "$state" in
+            resume) echo "=== [attempt $attempt/$MAX_ATTEMPTS] ${name} at $before/$STEPS -- resuming ===" ;;
+            fresh)  echo "=== [attempt $attempt/$MAX_ATTEMPTS] training ${name} from scratch ==="; rm -rf "outputs/train/${name}" ;;
+        esac
+        launch "$name" "$job" "$state" "$@"
+        after=$(step_of "$name")
+        if [ "$after" -le "$before" ] && [ "$attempt" -gt 1 ]; then
+            echo "FAILED: ${name} made no progress on attempt $attempt (still at $after) -- not a crash to retry"; exit 1
+        fi
+    done
 }
 
 run ds_libero10_base xvla_baseline \

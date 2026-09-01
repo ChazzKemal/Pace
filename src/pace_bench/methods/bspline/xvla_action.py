@@ -12,6 +12,16 @@ point in slots 0..9 where the structured loss expects it, knot in slot 10 -- and
 action space adds the knot as a fourth loss term. The pretrained decoder's width of
 20 is unchanged; slots 11..19 stay zero, as they already are for a single arm.
 
+The gripper is the second divergence, and for the same reason. Stock ee6d scores slot
+9 with `BCEWithLogitsLoss` and inverts it with a sigmoid, which is right when the slot
+holds a 0/1 command. Under this arrangement it holds the gripper's *B-spline control
+point* -- a least-squares coefficient of the episode's fit. Fitting a binary channel
+overshoots at every edge (control points span [-0.366, +1.366] on libero_10_ee6d; 8.8%
+land outside [-0.05, 1.05]), and BCE is unbounded below on a target outside [0, 1], so
+that term is minimised by saturating the logit rather than by matching the coefficient.
+Slot 9 is therefore regressed with MSE like every other control point, and `postprocess`
+returns the prediction untouched.
+
 Registered under ``ee6d_bspline``, selected with ``--policy.action_mode=ee6d_bspline``.
 Nothing in upstream xVLA or upstream B-spline is edited: the registry is xVLA's own
 extension point, and B-spline on xVLA is this project's construction rather than a
@@ -34,6 +44,9 @@ class EE6DBSplineActionSpace(BaseActionSpace):
     ROT_IDX = (3, 4, 5, 6, 7, 8)
     KNOT_IDX = (10,)
 
+    #: An MSE weight here, not the BCE one it is upstream: slot 9 carries the
+    #: gripper's *control point*, not a 0/1 command (see `postprocess`). Untuned, the
+    #: same status as KNOT_SCALE -- the stock value is inherited from a different loss.
     GRIPPER_SCALE = 1.0
     XYZ_SCALE = 500.0
     ROT_SCALE = 10.0
@@ -47,13 +60,11 @@ class EE6DBSplineActionSpace(BaseActionSpace):
     def __init__(self):
         super().__init__()
         self.mse = nn.MSELoss()
-        self.bce = nn.BCEWithLogitsLoss()
 
     def compute_loss(self, pred, target):
         assert pred.shape == target.shape, "pred/target shapes must match"
         gripper_loss = (
-            sum(self.bce(pred[:, :, i], target[:, :, i]) for i in self.gripper_idx)
-            / len(self.gripper_idx)
+            self.mse(pred[:, :, self.gripper_idx], target[:, :, self.gripper_idx])
             * self.GRIPPER_SCALE
         )
         pos_loss = self.mse(pred[:, :, self.POS_IDX], target[:, :, self.POS_IDX]) * self.XYZ_SCALE
@@ -76,6 +87,14 @@ class EE6DBSplineActionSpace(BaseActionSpace):
         return proprio_m, action_m
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
-        if action.size(-1) > max(self.gripper_idx):
-            action[..., self.gripper_idx] = torch.sigmoid(action[..., self.gripper_idx])
+        """Returned as regressed -- no sigmoid, unlike the stock ee6d space.
+
+        There, slot 9 is the gripper command itself, so BCE makes it a logit and a
+        sigmoid inverts that. Here it is the gripper's B-spline control point, and a
+        sigmoid could not express one: fitting a binary 0/1 channel overshoots to
+        [-0.366, +1.366] at every edge (measured across libero_10_ee6d, 8.8% of
+        coefficients beyond [-0.05, 1.05]), and that overshoot is precisely what
+        encodes the edge. Clipping the gripper to [0, 1] is a *decode*-side decision,
+        made in `BSplineDecodeStep` on executable actions, not on coefficients.
+        """
         return action

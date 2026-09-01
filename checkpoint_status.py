@@ -113,6 +113,29 @@ class Run:
         return "trained"
 
 
+def _policy_from_path(path: str | None) -> str | None:
+    """Backbone for a run launched with `--policy.path` instead of `--policy.type`.
+
+    A finetune names a *checkpoint*, not a policy type: every LIBERO arm passes
+    `--policy.path=lerobot/xvla-libero` and no `--policy.type` at all. The wandb
+    fallback below would therefore read None for them and `assign` would file the
+    run as an orphan -- "None is not a libero_10 backbone" -- for an arm that was
+    running at that moment. That window is exactly the one the fallback exists to
+    cover, so it has to answer here.
+
+    The type is in the checkpoint's own config, which need not be on disk: a hub id
+    resolves at load time. So the path is matched against the backbones the grid
+    knows about instead, on the separators a repo id or a directory name uses.
+    """
+    if not path:
+        return None
+    tokens = set(re.split(r"[/\\\-_.]", path.lower()))
+    for backbone in BACKBONE_LABEL:
+        if backbone in tokens:
+            return backbone
+    return None
+
+
 def _parse_args(argv: list[str]) -> dict[str, str]:
     out = {}
     for a in argv:
@@ -192,7 +215,7 @@ def scan() -> list[Run]:
                 a = _parse_args(m.get("args", []))
                 run.repo_id = a.get("dataset.repo_id")
                 run.dataset_root = a.get("dataset.root")
-                run.policy = a.get("policy.type")
+                run.policy = a.get("policy.type") or _policy_from_path(a.get("policy.path"))
                 run.budget = int(a["steps"]) if a.get("steps", "").isdigit() else None
                 run.batch_size = int(a["batch_size"]) if a.get("batch_size", "").isdigit() else None
                 run.method = a.get("method.type")

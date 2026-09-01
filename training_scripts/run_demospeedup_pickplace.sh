@@ -69,7 +69,9 @@ set -uo pipefail
 # Resolved from this script's own location, so a renamed checkout needs no edit:
 # the repo is its directory and the datasets sit in `data/` beside it. The two
 # inputs this run does not produce are overridable, since neither is in git.
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The repo is this script's PARENT directory: the queue scripts live in
+# training_scripts/ and every path below is relative to the checkout root.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${PICKPLACE_ROOT:-$DATA_ROOT/datasets/real/pickplace_cart7_v2_angleaxis_nogrip}
@@ -109,7 +111,8 @@ WANDB=(--wandb.enable=true --wandb.project="${WANDB_PROJECT:-pace_benchmark_pick
 # It is a numerics change, which is why it is set HERE, once, for every arm: the
 # four arms are only comparable if they train in the same precision. Do not vary
 # it per-arm.
-BUDGET=(--batch_size=32 --steps=100000 --save_freq=10000 --log_freq=100
+STEPS=100000
+BUDGET=(--batch_size=32 --steps=$STEPS --save_freq=10000 --log_freq=100
         --num_workers=4 --seed=42 --policy.device=cuda --policy.push_to_hub=false
         --accelerator.mixed_precision=bf16)
 N_EPISODES=45
@@ -117,25 +120,109 @@ N_EPISODES=45
 mkdir -p logs outputs/label
 stage () { echo; echo "═══════════ $1 ═══════════"; }
 
-done_already () { [ -d "outputs/train/$1/checkpoints/last" ] && { echo "$1 already trained, skipping"; return 0; }
-    # A leftover dir from a crashed attempt has no checkpoint; upstream's validate
-    # refuses to reuse it, so clear it and train fresh.
-    rm -rf "outputs/train/$1"; return 1; }
+# Existence of checkpoints/last is NOT proof the arm finished. save_freq is 10k, so
+# a run that dies at step 40k leaves a `last` behind; a bare directory check would
+# report "already trained" and hand the comparison a 40k arm sitting next to a 100k
+# one. Resolve the symlink and insist on the full budget. 10# because the dirs are
+# zero-padded and bash reads a leading 0 as octal (010000 -> 4096).
+#
+# This matters far more under SLURM than it did on the workstation. The job script
+# (slurm_pickplace.sbatch) requeues itself when it nears the wall clock, so this
+# queue is *expected* to be cut mid-arm and re-entered from the top -- exactly the
+# case a bare directory check gets wrong, and silently.
+#
+# A partial arm is RESUMED rather than thrown away. Upstream's resume restores step,
+# RNG, optimizer moments, and the EpisodeAwareSampler offset recomputed from the
+# saved (step, batch_size, dp_world_size), so the continuation is sample-exact: the
+# arm that comes out is the 100k arm this queue asked for, not a differently-trained
+# one. Nothing here was sized against a shorter budget -- the interrupted run was
+# already configured for these same 100k steps -- and ACT carries no LR schedule to
+# restore (`get_scheduler_preset()` returns None, a constant 1e-5 AdamW) while
+# Diffusion's cosine decay is written to `scheduler_state.json` beside the optimizer
+# state and read back on load. An arm with a checkpoint but no training_state left
+# to load cannot be continued and starts over.
+arm_state () {  # -> done | resume | fresh, on stdout
+    local last="outputs/train/$1/checkpoints/last" step
+    if [ -d "$last" ]; then
+        step=$(basename "$(readlink -f "$last")")
+        if [ "$((10#$step))" -ge "$STEPS" ]; then echo done; return; fi
+        if [ -f "$last/training_state/training_step.json" ]; then echo resume; return; fi
+    fi
+    echo fresh
+}
 
-train () {  # train <output name> <wandb job name> <policy args...>
-    local name=$1 job=$2; shift 2
-    done_already "$name" && return 0
+at_step () { basename "$(readlink -f "outputs/train/$1/checkpoints/last")"; }
+
+# Numeric step, 0 when the arm has no checkpoint yet -- the retry loop's progress test.
+step_of () {
+    local last="outputs/train/$1/checkpoints/last"
+    if [ -d "$last" ]; then echo "$((10#$(basename "$(readlink -f "$last")")))"; else echo 0; fi
+}
+
+# One launch. Everything that is per-attempt lives here; `train` owns the retrying.
+launch () {  # launch <name> <job> <state> <policy args...>
+    local name=$1 job=$2 state=$3; shift 3
     local pruner_pid=
     if [ -f "$PRUNER" ]; then
         "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --interval 300 \
-            >"logs/${name}.prune.log" 2>&1 &
+            >>"logs/${name}.prune.log" 2>&1 &
         pruner_pid=$!
     fi
-    "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" "${BUDGET[@]}" "$@" \
-        --job_name="$job" --output_dir="outputs/train/$name" \
-        2>&1 | tee "logs/${name}.log"
+    echo "───── $name attempt at $(date '+%F %T'), state=$state ─────" >>"logs/${name}.log"
+    if [ "$state" = resume ]; then
+        # The checkpoint's own train_config.json is the entire configuration on this
+        # path -- steps, batch, bf16, seed, wandb run id and --method.* included --
+        # and upstream applies CLI flags *over* it. Re-passing the arg arrays would
+        # therefore let a later edit of this file silently change an arm mid-flight,
+        # so nothing is passed but the checkpoint and where to keep writing.
+        "$PY" -m pace_bench.train.run_train \
+            --config_path="$REPO_ROOT/outputs/train/$name/checkpoints/last/pretrained_model/train_config.json" \
+            --resume=true --output_dir="outputs/train/$name" \
+            2>&1 | tee -a "logs/${name}.log"
+    else
+        "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" "${BUDGET[@]}" "$@" \
+            --job_name="$job" --output_dir="outputs/train/$name" \
+            2>&1 | tee -a "logs/${name}.log"
+    fi
     [ -n "$pruner_pid" ] && { kill "$pruner_pid" 2>/dev/null; "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --once >>"logs/${name}.prune.log" 2>&1; }
-    [ -d "outputs/train/$name/checkpoints/last" ] || { echo "FAILED: $name produced no checkpoint"; exit 1; }
+    return 0
+}
+
+# An arm is launched until it reaches the budget, not once: a crash costs only the
+# steps since the last save (<=10k), and under SLURM the same loop absorbs a node
+# failure or a requeue exactly the way it absorbs a segfault.
+#
+# The guard against spinning: an attempt that ends no further along than it started
+# is not a crash worth retrying, it is a run that cannot start. One such attempt is
+# tolerated (a fresh arm has no checkpoint until step 10k, so its first crash can
+# legitimately show no progress); a second in a row stops the queue.
+MAX_ATTEMPTS=${PACE_MAX_ATTEMPTS:-6}
+
+train () {  # train <output name> <wandb job name> <policy args...>
+    local name=$1 job=$2; shift 2
+    local state attempt=0 before after
+    while :; do
+        state=$(arm_state "$name")
+        if [ "$state" = done ]; then
+            [ "$attempt" -eq 0 ] && echo "$name already trained ($(at_step "$name") steps), skipping" \
+                                 || echo "$name reached $(at_step "$name") steps in $attempt attempt(s)"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
+            echo "FAILED: $name stuck at $(step_of "$name")/$STEPS after $MAX_ATTEMPTS attempts"; exit 1
+        fi
+        before=$(step_of "$name")
+        case "$state" in
+            resume) echo "[attempt $attempt/$MAX_ATTEMPTS] $name at $before/$STEPS -- resuming from its checkpoint" ;;
+            fresh)  echo "[attempt $attempt/$MAX_ATTEMPTS] $name -- training from scratch"; rm -rf "outputs/train/$name" ;;
+        esac
+        launch "$name" "$job" "$state" "$@"
+        after=$(step_of "$name")
+        if [ "$after" -le "$before" ] && [ "$attempt" -gt 1 ]; then
+            echo "FAILED: $name made no progress on attempt $attempt (still at $after) -- not a crash to retry"; exit 1
+        fi
+    done
 }
 
 label () {  # label <label dir> <oracle run name> <log tag>

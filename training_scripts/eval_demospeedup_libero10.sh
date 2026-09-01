@@ -9,7 +9,7 @@
 set -euo pipefail
 # The repo is this script's own directory; checkpoints and logs are read and
 # written relative to it, exactly where run_demospeedup_libero10.sh left them.
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 export MUJOCO_GL=egl PYTHONUNBUFFERED=1
 
 PY=.venv/bin/python
