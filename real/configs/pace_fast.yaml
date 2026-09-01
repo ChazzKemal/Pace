@@ -8,4 +8,13 @@ method:
   min_speed: 1.0
   clamp_deg: 5.0
   n_lookahead: 2
-  action_stride: 2
+  action_stride: 2          # execute every 2nd predicted action...
+  gripper_stride_exempt: true
+                            # ...except where the gripper is moving, which is never
+                            # dropped. The alternative -- dropping those steps and
+                            # repaying them downstream -- gives the arm a hold or an
+                            # interpolated guess in place of poses the policy actually
+                            # predicted, and has to get the repayment arithmetic right
+                            # on a run 2-4 rows long. adaptive_stride does NOT cover
+                            # this: it restores steps where the path bends, and a
+                            # grasp on a straight approach has no bend.

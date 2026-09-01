@@ -137,6 +137,12 @@ class PaceMethod(MethodConfig):
 
     action_stride: int = 1
     adaptive_stride: bool = False
+    #: Never stride away a step where the gripper is moving. Preferred over paying the
+    #: grasp back downstream: the steps kept are the poses the policy predicted, where
+    #: a repaid row is either a hold (duplicate) or an estimate (interpolate). Setting
+    #: this also switches off the row repayment in `deploy_steps` -- nothing was taken
+    #: from the grasp, so giving anything back would run it slower than demonstrated.
+    gripper_stride_exempt: bool = False
 
     n_lookahead: int = 0
     lookahead_agg: str = "min"

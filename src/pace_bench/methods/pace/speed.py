@@ -34,6 +34,10 @@ import torch.nn.functional as F  # noqa: N812
 # dims 0:3 and an axis-angle rotation in dims 3:6.
 POS = slice(0, 3)
 ORI = slice(3, 6)
+GRIP = 6
+
+#: A gripper command is near-binary, so anything above sensor noise is a real move.
+GRIP_EPS = 1e-3
 
 _DEG = 180.0 / math.pi
 # Both bending channels saturate at a right angle: a 90-degree turn gets min_speed.
@@ -59,6 +63,8 @@ class PaceConfig:
 
     # Deliver every Nth action instead of every one -- the "skip" baseline.
     action_stride: int = 1
+    #: Never stride away a step where the gripper command is moving. See stride_indices.
+    gripper_stride_exempt: bool = False
     # Skip only where the path is straight; keep full resolution through corners.
     adaptive_stride: bool = False
 
@@ -213,17 +219,39 @@ def stride_indices(abs_actions: torch.Tensor, cfg: PaceConfig) -> list[int]:
     step wherever the path bends past ``quantize_angle_thr`` -- skipping through a
     corner is what turns a skip baseline into a missed grasp. The decision is made
     on the full-resolution chunk, before anything is dropped.
+
+    ``gripper_stride_exempt`` applies the same idea to the grasp itself: a step where
+    the gripper command is moving is never dropped. This is strictly better than
+    dropping those steps and paying them back downstream, because the rows kept here
+    are the poses the policy actually predicted -- a replayed duplicate is a hold, and
+    an interpolated one is an estimate of what was deleted. It also removes the need
+    to get the repayment arithmetic right at all.
+
+    Note the two are independent: a grasp on a straight approach is exactly what
+    ``adaptive_stride`` alone strides through, since it only looks at bend angle.
     """
     n_steps = abs_actions.shape[1]
     if cfg.action_stride <= 1:
         return list(range(n_steps))
-    if not cfg.adaptive_stride:
+    if not cfg.adaptive_stride and not cfg.gripper_stride_exempt:
         return list(range(0, n_steps, cfg.action_stride))
-    angles = per_step_angle(abs_actions)[0]
+
+    angles = per_step_angle(abs_actions)[0] if cfg.adaptive_stride else None
+    grip = None
+    if cfg.gripper_stride_exempt:
+        g = abs_actions[0, :, GRIP]
+        moving = (g[1:] - g[:-1]).abs() > GRIP_EPS
+        grip = [False] * n_steps
+        for j in range(n_steps - 1):
+            if bool(moving[j]):
+                grip[j] = grip[j + 1] = True      # both ends of the transition
+
     return [
         i
         for i in range(n_steps)
-        if (i % cfg.action_stride == 0) or (float(angles[i]) >= cfg.quantize_angle_thr)
+        if (i % cfg.action_stride == 0)
+        or (angles is not None and float(angles[i]) >= cfg.quantize_angle_thr)
+        or (grip is not None and grip[i])
     ]
 
 

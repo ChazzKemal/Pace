@@ -134,7 +134,11 @@ def deploy_steps(method: MethodConfig, *, args, n_action_steps: int | None = Non
             PaceSpeed(method.to_pace_config(), n_action_steps=n_action_steps,
                       control_dt=control_dt, dataset_stats=dataset_stats),
             GripperHold(n_grip, invert=invert),
-            GripperReplicate(int(method.action_stride)),
+            # ...unless the stride never touched the grasp in the first place, in
+            # which case there is no debt and repaying one would run the grasp
+            # `action_stride` times slower than demonstrated.
+            GripperReplicate(1 if method.gripper_stride_exempt
+                             else int(method.action_stride)),
         ]
 
     if isinstance(method, DemoSpeedupMethod):

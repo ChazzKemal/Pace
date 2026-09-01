@@ -115,3 +115,64 @@ class TestOtherMethodsAreUnaffected:
         names = [type(s).__name__ for s in deploy_steps(
             NoMethod(), args=args(), n_action_steps=32, control_dt=0.05)]
         assert "GripperReplicate" not in names
+
+
+class TestGripperStrideExemption:
+    """Not dropping the grasp beats dropping it and paying it back.
+
+    The rows kept are the poses the policy predicted. A repaid row is either a hold
+    (duplicate) or an estimate of what was deleted (interpolate), and the repayment
+    arithmetic has to be exactly right on runs 2-4 rows long. Exempting sidesteps all
+    of it.
+    """
+
+    def chunk(self, k=12, edge=5):
+        """A straight approach with the gripper closing at `edge` -- the case
+        adaptive_stride is blind to, because nothing about the path bends."""
+        import torch
+        a = torch.zeros(1, k, 7)
+        a[0, :, 0] = torch.linspace(0.0, 0.3, k)
+        a[0, edge:, GRIP_COL] = 1.0
+        return a
+
+    def idx(self, **kw):
+        from pace_bench.methods.pace.speed import stride_indices
+        return stride_indices(self.chunk(), PaceMethod(action_stride=2, **kw).to_pace_config())
+
+    def test_plain_striding_drops_the_transition(self):
+        # step 5 is where the gripper moves, and 5 % 2 != 0.
+        assert 5 not in self.idx()
+
+    def test_adaptive_stride_alone_does_not_save_it(self):
+        # It restores steps where the PATH bends; a grasp on a straight approach has
+        # no bend to trigger on. This is the gap the new flag closes.
+        assert self.idx(adaptive_stride=True) == self.idx()
+
+    def test_the_exemption_keeps_both_ends_of_the_transition(self):
+        got = self.idx(gripper_stride_exempt=True)
+        assert 4 in got and 5 in got
+
+    def test_it_keeps_the_stride_everywhere_else(self):
+        # Only the grasp is exempt; the speedup elsewhere must survive.
+        got = self.idx(gripper_stride_exempt=True)
+        assert got == [0, 2, 4, 5, 6, 8, 10]
+
+    def test_it_is_inert_without_a_stride(self):
+        from pace_bench.methods.pace.speed import stride_indices
+        cfg = PaceMethod(action_stride=1, gripper_stride_exempt=True).to_pace_config()
+        assert stride_indices(self.chunk(), cfg) == list(range(12))
+
+    def test_exempting_switches_off_the_row_repayment(self):
+        # Nothing was taken from the grasp, so repaying would run it action_stride
+        # times SLOWER than demonstrated -- the opposite failure.
+        steps = deploy_steps(
+            PaceMethod(max_speed=2.0, action_stride=2, gripper_stride_exempt=True),
+            args=args(), n_action_steps=32, control_dt=0.05)
+        (replicate,) = [s for s in steps if type(s).__name__ == "GripperReplicate"]
+        assert replicate.low_v == 1
+
+    def test_not_exempting_still_repays(self):
+        steps = deploy_steps(PaceMethod(max_speed=2.0, action_stride=2),
+                             args=args(), n_action_steps=32, control_dt=0.05)
+        (replicate,) = [s for s in steps if type(s).__name__ == "GripperReplicate"]
+        assert replicate.low_v == 2
