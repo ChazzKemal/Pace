@@ -16,6 +16,7 @@ means this script's model of the pipeline has drifted from the pipeline.
     python real/scripts/chunk_trace.py RUN_DIR -c 5
     python real/scripts/chunk_trace.py RUN_DIR -c 5 -o chunk5.png
     python real/scripts/chunk_trace.py --gui              # 3-D, coloured by s_eff
+    python real/scripts/chunk_trace.py --gui -c 1 -o c1.png   # ...to a file, headless
 
 Needs the run to carry trace.npz (``record_trace``), commands.csv and poses.csv.
 """
@@ -496,7 +497,7 @@ def browse_tui() -> int:
 # 3-D viewer
 # ---------------------------------------------------------------------------
 
-def gui(run: Path) -> int:
+def gui(run: Path, start: int = 0, save: Path | None = None) -> int:
     """Commanded path in 3-D, coloured by the speed PACE chose, chunk by chunk.
 
     Shaped after crisp_gym's examples/27_speedup_slider_viewer.py, which does this for
@@ -509,7 +510,9 @@ def gui(run: Path) -> int:
     MPLBACKEND=TkAgg for a native window over ssh -X.
     """
     import os
-    os.environ.setdefault("MPLBACKEND", "WebAgg")
+    # Only claim the browser backend for an interactive window. With --out we are
+    # rendering to a file, which must work headless (no DISPLAY, no WebAgg server).
+    os.environ.setdefault("MPLBACKEND", "Agg" if save else "WebAgg")
     import matplotlib.pyplot as plt
     from matplotlib.widgets import Slider
 
@@ -521,7 +524,7 @@ def gui(run: Path) -> int:
     fig.canvas.manager.set_window_title(run.name)
     ax3 = fig.add_axes([0.02, 0.28, 0.48, 0.66], projection="3d")
     axs = fig.add_axes([0.62, 0.63, 0.35, 0.29])
-    axt = fig.add_axes([0.56, 0.20, 0.43, 0.36])
+    axt = fig.add_axes([0.56, 0.13, 0.43, 0.44])
     axt.axis("off")
     ax_sl = fig.add_axes([0.10, 0.12, 0.70, 0.03])
     sl = Slider(ax_sl, "chunk", 0, max(d.n_chunks - 1, 0), valinit=0, valstep=1)
@@ -550,7 +553,8 @@ def gui(run: Path) -> int:
         ax3.set_xlabel("x (m)"); ax3.set_ylabel("y (m)"); ax3.set_zlabel("z (m)")
         ax3.set_title(f"chunk {idx} — commanded, coloured by s_eff", fontsize=10)
         if state["cb"] is None:
-            state["cb"] = fig.colorbar(sc, ax=ax3, fraction=0.022, pad=0.01, shrink=0.55)
+            # pad clears the z tick labels, which sit outside the 3-D axes box
+            state["cb"] = fig.colorbar(sc, ax=ax3, fraction=0.02, pad=0.10, shrink=0.55)
             state["cb"].set_label("s_eff")
         else:
             state["cb"].update_normal(sc)
@@ -562,12 +566,22 @@ def gui(run: Path) -> int:
         axs.grid(alpha=0.2)
 
         axt.clear(); axt.axis("off")
-        axt.text(0, 1, "\n".join(describe(d, idx)[:15]), family="monospace",
-                 fontsize=7.6, va="top", transform=axt.transAxes)
+        # Everything except the closing caveat paragraph, which is in the docs.
+        lines = [ln for ln in describe(d, idx) if not ln.startswith("  Over a whole run")]
+        cut = next((i for i, ln in enumerate(lines) if ln.startswith("  the window is")), len(lines))
+        axt.text(0, 1, "\n".join(lines[:cut]), family="monospace",
+                 fontsize=7.2, va="top", transform=axt.transAxes)
         fig.canvas.draw_idle()
 
     sl.on_changed(draw)
-    draw(0)
+    start = max(0, min(int(start), d.n_chunks - 1))
+    sl.set_val(start)          # drives draw() and keeps the slider label honest
+    if start == 0:
+        draw(0)                # set_val is a no-op at the initial value
+    if save:
+        fig.savefig(save, dpi=130)
+        print(f"wrote {save}  (chunk {start} of {d.n_chunks})")
+        return 0
     print(f"{run.name}: {d.n_chunks} chunks — drag the slider to page them")
     plt.show()
     return 0
@@ -586,7 +600,8 @@ def main() -> int:
     # No run named and nothing else asked for: browse. An explicit --chunk or --out
     # means the caller wants one answer on stdout, so honour that without a screen.
     if a.gui:
-        return gui(Path(a.run_dir) if a.run_dir else newest_run())
+        return gui(Path(a.run_dir) if a.run_dir else newest_run(),
+                   a.chunk, Path(a.out) if a.out else None)
     if not a.run_dir and a.chunk == 0 and not a.out and not a.no_tui:
         return browse_tui()
     run = Path(a.run_dir) if a.run_dir else newest_run()
