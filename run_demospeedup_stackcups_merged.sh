@@ -1,16 +1,32 @@
 #!/bin/bash
 # =============================================================================
-# ACT arms on stackcups_20260829_merged (UR10e, absolute cart7)
+# {ACT, Diffusion} arms on stackcups_20260829_merged (UR10e, absolute cart7)
 # =============================================================================
-#   1. ACT baseline      chunk 100, 100k steps  (doubles as the labelling oracle)
-#   2. entropy labelling oracle = arm 1  -> outputs/label/stack_cups_merged
-#   3. ACT DemoSpeedup   chunk 100 -> 50, pad_mode=zero
-#   4. ACT B-spline      16x11 parameter matrix, no labelling stage
+#   1. ACT baseline        chunk 100, 100k steps  (doubles as the ACT oracle)
+#   2. ACT labels          oracle = arm 1  -> outputs/label/stack_cups_merged
+#   3. ACT DemoSpeedup     chunk 100 -> 50, pad_mode=zero
+#   4. ACT B-spline        16x11 parameter matrix, no labelling stage
+#   5. Diffusion baseline  n_obs_steps=1, 100k steps  (its own oracle)
+#   6. Diffusion labels    oracle = arm 5  -> outputs/label/stack_cups_merged_dp
+#   7. Diffusion DemoSpeedup  horizon 64 -> 32, n_action_steps 32 -> 16, pad_mode=hold
+#   8. Diffusion B-spline  the same 16x11 matrix, no labelling stage
 #
-# Arm 4 makes this the same three-method comparison the pickplace queue runs
-# (baseline / DemoSpeedup / B-spline), on the second real dataset. It shares the
-# queue's 100k-step budget and needs nothing from stages 1-2, so it is last only
-# because the labelled arm is the one with a dependency to satisfy.
+# This is the same 2x3 the pickplace queue runs -- {ACT, Diffusion} x {baseline,
+# DemoSpeedup, B-spline} -- on the second real dataset, so the two tasks compare
+# arm for arm. PACE needs no arm of its own: it runs at eval time on arms 1 and 5.
+#
+# Every design point below is the pickplace queue's, and deliberately so: the two
+# datasets have identical feature shapes (action cart7, state 6, two cameras) at
+# the same 20 fps, so anything that differed between the queues would be a
+# difference between the *tasks* that is really a difference between the scripts.
+# The per-family choices carried over verbatim are n_obs_steps=1 for Diffusion,
+# pad_mode zero for ACT and hold for Diffusion, and each family labelling its own
+# DemoSpeedup arm. Their justifications live in run_demospeedup_pickplace.sh and
+# are not restated here; only what is specific to THIS dataset is.
+#
+# The ACT arms run first and the Diffusion arms after, rather than interleaved,
+# because arms 1-4 were already running when 5-8 were added and the queue is
+# resumable: a rerun walks past the finished ACT arms in seconds.
 #
 # This supersedes run_demospeedup_stackcups.sh, which trained on
 # stack_cups_20260828 -- 12 episodes / 8875 frames. The merged set is 175
@@ -50,8 +66,11 @@ PY=.venv/bin/python
 PRUNER=${PACE_PRUNER:-$REPO_ROOT/src/pace_bench/data/prune_checkpoints.py}
 KEEP=2
 [ -f "$PRUNER" ] || echo "WARNING: no pruner at $PRUNER (set PACE_PRUNER); keeping every checkpoint"
+# 12GB, up from the 8GB this queue asked for while it was ACT-only: a Diffusion
+# checkpoint is 1.1GB against ACT's 0.6GB, and KEEP=2 holds two of them per arm
+# while it trains.
 FREE_GB=$(df -BG --output=avail . | tail -1 | tr -dcs '0-9' '\n')
-[ "${FREE_GB:-0}" -ge 8 ] || { echo "only ${FREE_GB}GB free on $(pwd) -- an ACT checkpoint is 0.6GB; free space first"; exit 1; }
+[ "${FREE_GB:-0}" -ge 12 ] || { echo "only ${FREE_GB}GB free on $(pwd) -- a Diffusion checkpoint is 1.1GB and KEEP=$KEEP; free space first"; exit 1; }
 
 DATA=(--dataset.repo_id=local/stack_cups_merged
       "--dataset.root=$DATASET_ROOT"
@@ -62,6 +81,29 @@ BUDGET=(--batch_size=32 --steps=$STEPS --save_freq=10000 --log_freq=100
         --num_workers=4 --seed=42 --policy.device=cuda --policy.push_to_hub=false
         --accelerator.mixed_precision=bf16)
 ACT=(--policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100)
+# n_obs_steps=1 overrides LeRobot's default of 2. It is upstream DemoSpeedup's own
+# setting for this family, and it is what lets arm 5 double as arm 6's oracle:
+# labelling asks about one frame at a time with no history to give, so
+# DiffusionChunkSampler rejects an n_obs_steps=2 checkpoint outright. See the long
+# note in run_demospeedup_pickplace.sh; the trade (a slightly weaker policy than a
+# stock 2-frame DP) is upstream's choice, not this queue's.
+DIFFUSION=(--policy.type=diffusion --policy.n_obs_steps=1)
+# The B-spline geometry, shared by arms 4 and 8 so the two families fit identical
+# curves and differ only in the policy regressing them. A B-spline chunk indexes
+# control points rather than timesteps, so ACT[]/DIFFUSION[]'s chunk settings are
+# deliberately not spread alongside it: chunk_size 10 + 2*degree 3 gives a 16x11
+# matrix, and that width becomes the policy's chunk and n_action_steps.
+#
+# 16 is upstream's own real-robot horizon, and it is the width Diffusion can take:
+# its temporal U-Net halves the horizon once per `down_dims` stage, so the width
+# must be a multiple of 2**len(down_dims) = 8. The recorded UR10e dataset's 20
+# (width 26) trains on ACT and would be rejected here.
+#
+# The dataset is cart7 at 20 fps, identical to pickplace's, so layout and fps carry
+# over unchanged. num_actions stays unset: it is the speed lever and a decode-time
+# choice, so it belongs to evaluation rather than to training.
+BSPLINE=(--method.type=bspline --method.layout=cart7 --method.fps=20
+         --method.chunk_size=10 --method.degree=3 --method.max_error=0.01)
 N_EPISODES=175
 
 mkdir -p logs outputs/label
@@ -74,14 +116,22 @@ stage () { echo; echo "═══════════ $1 ══════�
 # dirs are zero-padded and bash reads a leading 0 as octal (010000 -> 4096).
 #
 # A partial arm is RESUMED rather than thrown away, which is sound HERE and would
-# not be everywhere. ACT carries no LR schedule (`scheduler: null`, constant 1e-5
-# AdamW), and the interrupted run was already configured for these same 100k steps
-# -- so no part of the optimisation was sized against a shorter budget. Upstream's
-# resume restores step, RNG, optimizer moments, and the EpisodeAwareSampler offset
-# recomputed from the saved (step, batch_size, dp_world_size), so the continuation
-# is sample-exact: the arm that comes out is the 100k arm this queue asked for, not
-# a differently-trained one. An arm with a checkpoint but no training_state left to
-# load cannot be continued and starts over.
+# not be everywhere. Upstream's resume restores step, RNG, optimizer moments, and
+# the EpisodeAwareSampler offset recomputed from the saved (step, batch_size,
+# dp_world_size), so the continuation is sample-exact: the arm that comes out is
+# the 100k arm this queue asked for, not a differently-trained one. An arm with a
+# checkpoint but no training_state left to load cannot be continued and starts over.
+#
+# What makes that enough is that no part of the optimisation was sized against a
+# shorter budget -- the interrupted run was already configured for these same 100k
+# steps. The two families reach that conclusion differently and both have to now.
+# ACT carries no LR schedule at all (`get_scheduler_preset()` returns None, so a
+# constant 1e-5 AdamW), leaving nothing to restore. Diffusion does have one: cosine
+# decay over the full budget after 500 warmup steps. It is restored too --
+# `save_training_state` writes `scheduler_state.json` beside the optimizer state and
+# `load_training_state` reads it back (lerobot/common/train_utils.py:329 and :492)
+# -- so a resumed Diffusion arm continues down the same curve rather than
+# re-entering warmup at an already-decayed learning rate.
 arm_state () {  # -> done | resume | fresh, on stdout
     local last="outputs/train/$1/checkpoints/last" step
     if [ -d "$last" ]; then
@@ -174,31 +224,33 @@ train () {  # train <output name> <wandb job name> <policy args...>
     done
 }
 
-stage "1/4: ACT baseline (also the labelling oracle)"
-train cups_merged_act_base act_baseline_merged "${ACT[@]}" --method.type=none
+# Labelling, once per policy family: each labels its own DemoSpeedup arm with its
+# own baseline as the oracle, which is upstream DemoSpeedup's arrangement and the
+# reason there are two label dirs here rather than one shared set.
+label () {  # label <label dir> <oracle run name> <log tag>
+    local out=$1 oracle=$2 tag=$3
+    if [ "$(ls "outputs/label/$out"/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq "$N_EPISODES" ]; then
+        echo "labels in outputs/label/$out already present, skipping"
+    else
+        "$PY" -m pace_bench.methods.demospeedup.run_label \
+            --policy_path="$REPO_ROOT/outputs/train/$oracle/checkpoints/last/pretrained_model" \
+            --dataset_repo_id=local/stack_cups_merged \
+            --dataset_root="$DATASET_ROOT" \
+            --num_action_samples=10 --temporal_aggregation=true --kde_bandwidth=1.0 \
+            --min_cluster_size=5 --max_cluster_size=25 --rule=mean \
+            --out="outputs/label/$out" \
+            2>&1 | tee "logs/${tag}.log"
+    fi
+    local n
+    n=$(ls "outputs/label/$out"/speedup_labels/episode_*.npy 2>/dev/null | wc -l)
+    [ "$n" -eq "$N_EPISODES" ] || { echo "LABEL STAGE FAILED ($out): $n/$N_EPISODES label files"; exit 1; }
 
-stage "2/4: entropy labelling (ACT CVAE oracle = arm 1)"
-if [ "$(ls outputs/label/stack_cups_merged/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq "$N_EPISODES" ]; then
-    echo "labels already present, skipping"
-else
-    "$PY" -m pace_bench.methods.demospeedup.run_label \
-        --policy_path="$REPO_ROOT/outputs/train/cups_merged_act_base/checkpoints/last/pretrained_model" \
-        --dataset_repo_id=local/stack_cups_merged \
-        --dataset_root="$DATASET_ROOT" \
-        --num_action_samples=10 --temporal_aggregation=true --kde_bandwidth=1.0 \
-        --min_cluster_size=5 --max_cluster_size=25 --rule=mean \
-        --out=outputs/label/stack_cups_merged \
-        2>&1 | tee logs/cups_merged_label.log
-fi
-N=$(ls outputs/label/stack_cups_merged/speedup_labels/episode_*.npy 2>/dev/null | wc -l)
-[ "$N" -eq "$N_EPISODES" ] || { echo "LABEL STAGE FAILED: $N/$N_EPISODES label files"; exit 1; }
-
-# Is the label field structured, or noise with the right marginal? Precision
-# frames should come in runs; if the mean run is no longer than a coin flip with
-# the same rate would give, the retiming is not tracking the demonstration.
-# The heredoc binds to $PY, not to the pipeline's last command -- written after
-# `tee` it would feed the source to tee and leave python reading /dev/null.
-"$PY" - outputs/label/stack_cups_merged/speedup_labels <<'PYEOF' 2>&1 | tee logs/cups_merged_label_signal.log
+    # Is the label field structured, or noise with the right marginal? Precision
+    # frames should come in runs; if the mean run is no longer than a coin flip with
+    # the same rate would give, the retiming is not tracking the demonstration.
+    # The heredoc binds to $PY, not to the pipeline's last command -- written after
+    # `tee` it would feed the source to tee and leave python reading /dev/null.
+    "$PY" - "outputs/label/$out/speedup_labels" <<'PYEOF' 2>&1 | tee "logs/${tag}_signal.log"
 import glob
 import sys
 
@@ -223,31 +275,64 @@ print(f"episodes {len(labs)}  frames {len(allc)}  non-precision {frac:.1%}")
 print(f"mean fast-run length {mean_run:.2f} vs {expected_random:.2f} expected if random")
 print("SIGNAL:", "OK" if mean_run > 3 * expected_random else "SUSPICIOUS - review plots before trusting")
 PYEOF
+}
 
-stage "3/4: ACT DemoSpeedup (chunk 100 -> 50, masked zero-pad)"
+stage "1/8: ACT baseline (also the ACT arm's labelling oracle)"
+train cups_merged_act_base act_baseline_merged "${ACT[@]}" --method.type=none
+
+stage "2/8: ACT entropy labelling (CVAE oracle = arm 1)"
+label stack_cups_merged cups_merged_act_base cups_merged_label
+
+stage "3/8: ACT DemoSpeedup (chunk 100 -> 50, masked zero-pad)"
 train cups_merged_act_speedup act_demospeedup_merged "${ACT[@]}" \
     --method.type=demospeedup \
     --method.labels_path="$REPO_ROOT/outputs/label/stack_cups_merged/speedup_labels" \
     --method.pad_mode=zero
 
-# The B-spline arm's chunk geometry is not the ACT[] array's, and cannot be: a
-# B-spline chunk indexes control points, not timesteps. chunk_size 10 + 2*degree 3
-# gives a 16x11 parameter matrix, and that width -- not chunk_size -- becomes the
-# policy's chunk and n_action_steps, so ACT[] is deliberately not spread here.
-# 16 is upstream's own real-robot horizon. Parity across the queue is the budget,
-# which this arm holds to exactly like the other three.
-#
-# The dataset is cart7 at 20 fps, identical to pickplace's, so the layout and fps
-# carry over unchanged. num_actions stays unset: it is the speed lever and a
-# decode-time choice, so it belongs to evaluation, not to training.
-stage "4/4: ACT B-spline (16x11 parameter matrix, no labelling stage)"
+# ACT[] is deliberately not spread here: the geometry comes from BSPLINE[], which
+# sets the chunk to the matrix width. See its definition above for why 16.
+stage "4/8: ACT B-spline (16x11 parameter matrix, no labelling stage)"
 train cups_merged_act_bspline act_bspline_merged \
-    --policy.type=act \
-    --method.type=bspline --method.layout=cart7 --method.fps=20 \
-    --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
+    --policy.type=act "${BSPLINE[@]}"
+
+# ---------------------------------------------------------------------------
+# Diffusion. The same three methods on the other family, so the 2x3 here matches
+# the pickplace queue's and the two tasks compare arm for arm.
+#
+# The Diffusion arms cost more than the ACT ones on this dataset, and stage 6 is
+# where it shows: labelling queries the policy once per frame and a Diffusion
+# query is 100 sequential DDPM steps, which no batch width makes cheaper. On
+# pickplace's 31178 frames that stage took 1.4h at --batch_frames=32; this dataset
+# is 61631 frames, so budget roughly 2.8h for it and hours, not minutes, for the
+# ACT pass's equivalent. The three training arms are ~6h each at this budget.
+# ---------------------------------------------------------------------------
+stage "5/8: Diffusion baseline (n_obs_steps=1, so it is also its own oracle)"
+train cups_merged_dp_base diffusion_baseline_merged "${DIFFUSION[@]}" --method.type=none
+
+stage "6/8: Diffusion entropy labelling (oracle = arm 5; 100 DDPM steps/chunk, slow)"
+label stack_cups_merged_dp cups_merged_dp_base cups_merged_dp_label
+
+# pad_mode=hold, against ACT's zero. Diffusion's loss carries no padding mask
+# under its own defaults (do_mask_loss_for_padding=False), and these actions are
+# absolute cart7, so a trained zero is a command to the world origin rather than a
+# harmless mid-range value. adjust_policy() raises rather than let the pairing go
+# wrong silently. The full argument is in run_demospeedup_pickplace.sh.
+stage "7/8: Diffusion DemoSpeedup (horizon 64 -> 32, n_action_steps 32 -> 16, hold-pad)"
+train cups_merged_dp_speedup diffusion_demospeedup_merged "${DIFFUSION[@]}" \
+    --method.type=demospeedup \
+    --method.labels_path="$REPO_ROOT/outputs/label/stack_cups_merged_dp/speedup_labels" \
+    --method.pad_mode=hold
+
+# DIFFUSION[] keeps n_obs_steps=1 here even though the oracle argument for it does
+# not apply (B-spline has no labelling stage to be an oracle for). The reason that
+# remains is the one the comparison needs: the three Diffusion arms must differ in
+# their method and in nothing else.
+stage "8/8: Diffusion B-spline (the same 16x11 matrix, no labelling stage)"
+train cups_merged_dp_bspline diffusion_bspline_merged "${DIFFUSION[@]}" "${BSPLINE[@]}"
 
 echo
 echo "═══════════ STACK CUPS MERGED QUEUE DONE ═══════════"
-for d in cups_merged_act_base cups_merged_act_speedup cups_merged_act_bspline; do
+for d in cups_merged_act_base cups_merged_act_speedup cups_merged_act_bspline \
+         cups_merged_dp_base cups_merged_dp_speedup cups_merged_dp_bspline; do
     printf '  %-32s %s\n' "$d" "$([ -d "outputs/train/$d/checkpoints/last" ] && echo "trained ($(basename "$(readlink -f "outputs/train/$d/checkpoints/last")"))" || echo MISSING)"
 done

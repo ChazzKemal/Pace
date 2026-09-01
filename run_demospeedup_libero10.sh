@@ -2,19 +2,25 @@
 # =============================================================================
 # DemoSpeedup end-to-end on LIBERO-10, xVLA / absolute EE6D
 # =============================================================================
-# Two LoRA finetunes of the same pretrained xVLA on the same 400 demos, run back
-# to back so the only difference between them is the retiming step:
+# Three LoRA finetunes of the same pretrained xVLA on the same 400 demos, run back
+# to back so the only difference between them is the method:
 #
 #   A  method=none         chunk 30                 demos at their recorded pace
 #   B  method=demospeedup  window 60 -> chunk 15    targets retimed 2x/4x by label
+#   C  method=bspline      chunk 30 -> a 16x11      spline parameters, no labels
+#                          parameter matrix
 #
-# Both PASS chunk 30. For B the trainer widens the dataset's raw action window to
-# 60 = 15 * high_v BEFORE the dataset is built and sets the trained chunk to 15
-# after -- upstream's walk-the-tail-then-truncate semantics on a fixed-window
+# PACE needs no arm: it runs at eval time on arm A's weights.
+#
+# A and B both PASS chunk 30. For B the trainer widens the dataset's raw action
+# window to 60 = 15 * high_v BEFORE the dataset is built and sets the trained chunk
+# to 15 after -- upstream's walk-the-tail-then-truncate semantics on a fixed-window
 # loader: every executed slot is a real waypoint except at episode ends. (The
 # fork's 2x window under-supplied the walk; ~7% of its executed steps were
-# trained dwells.) Both arms are evaluated with PACE off, so any difference in
-# time-to-success comes from what the policy learned.
+# trained dwells.) C passes no chunk at all: a B-spline chunk indexes control
+# points rather than timesteps, so the method sets it to the matrix width.
+# Every arm is evaluated with PACE off, so any difference in time-to-success comes
+# from what the policy learned.
 #
 # Labels come from the fork's stage-2 run (entropy of the pretrained xVLA's own
 # action samples); stage 2 is not ported yet, so they are consumed as given.
@@ -86,4 +92,59 @@ run ds_libero10_speedup xvla_demospeedup \
     --method.labels_path="$LABELS_PATH" \
     --method.pad_mode=hold
 
-echo "=== both trainings done ==="
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE TRUSTING ARM C. Two things about it are unsettled, and neither
+# is settled by running it; both are recorded in docs/PLAN.md.
+#
+# 1. COMPARABILITY IS AN OPEN DECISION (raised by the user 2026-08-30, still
+#    pending). Every LIBERO arm starts from a checkpoint pretrained on *dense
+#    action chunks*, and the three methods ask different amounts of that
+#    checkpoint. PACE does not touch the targets; DemoSpeedup keeps the action
+#    space exactly, so slot k still means "ee6d pose at step k"; B-spline
+#    reinterprets the tokens -- the chunk axis stops indexing timesteps and starts
+#    indexing control points, and one channel becomes a time. The domain-0 finding
+#    weakens this a lot (every arm trains its action head from random init, so no
+#    arm inherits an aligned decoder and the asymmetry is confined to the LoRA'd
+#    trunk) but does not remove it. The plan's ranked options are: (1) make the
+#    real-robot comparison the headline and report LIBERO B-spline separately if at
+#    all; (2) reinitialise action_encoder/action_decoder for every LIBERO arm to
+#    equalise the handicap, costing the baseline absolute SR; (3) drop B-spline
+#    from the LIBERO axis. This arm exists so option 1 has something to report --
+#    it is NOT an answer to the question, and choosing (3) means deleting it.
+#
+# 2. KNOT_SCALE = 10.0 IS UNTUNED. xVLA does not normalize (its normalization
+#    mapping is IDENTITY throughout), so raw magnitudes reach the loss and the
+#    per-group weights decide what the policy attends to. XYZ_SCALE=500 and
+#    ROT_SCALE=10 come from upstream xVLA; the knot term has no reference to
+#    inherit from, since upstream xVLA has no knot and upstream B-spline has no
+#    xVLA. It is set to the rotation scale by argument, not by measurement, and it
+#    is the first thing to sweep if this arm tracks poorly in time. A 300-step
+#    probe left knot_loss/KNOT_SCALE at ~1.34 MSE against a target variance of
+#    ~0.94 -- no better than predicting the mean knot -- but that was 0.6% of an
+#    epoch and still inside LR warmup, so it measures nothing yet.
+#
+# The two flags that are NOT optional here. xVLA slices its action vector by
+# hardcoded index (POS_IDX=(0,1,2), ROT_IDX=(3..8), gripper at 9), so upstream's
+# knot-first matrix trains a *time* as an x-coordinate -- which showed up as a
+# position loss of 122840 beside a rotation loss of 6.3. --method.arrangement puts
+# the control point in slots 0-9 and the knot in slot 10, and
+# --policy.action_mode=ee6d_bspline scores that knot as a fourth loss term.
+# Selecting one without the other is wrong in a way nothing checks.
+#
+# `ee6d_bspline` reaches xVLA's action registry as a side effect: the method
+# imports the module that registers it while fitting the episodes, which happens
+# in adjust_dataset -- inside make_train_eval_datasets, and so before make_policy
+# resolves action_mode (upstream train(): datasets, then policy). Verified, but it
+# is an ordering this arm alone depends on, so a future reordering of those two
+# calls breaks this arm and nothing else.
+#
+# chunk_size is not passed: adjust_policy sets it to the matrix width (16) and
+# n_action_steps with it. layout=ee6d20 drops LIBERO's 10 zero-pad action columns
+# for the fit and restores them on decode. num_actions stays unset -- the decode
+# rate is an evaluation choice.
+run ds_libero10_bspline xvla_bspline \
+    --policy.action_mode=ee6d_bspline \
+    --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
+    --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
+
+echo "=== all three trainings done ==="
