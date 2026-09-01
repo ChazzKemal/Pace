@@ -2018,6 +2018,7 @@ source = { editable = "." }
 dependencies = [
     { name = "hdbscan" },
     { name = "lerobot", extra = ["diffusion", "evaluation", "libero", "peft", "training", "xvla"] },
+    { name = "pyyaml" },
     { name = "robosuite" },
     { name = "scikit-learn" },
 ]
@@ -2031,6 +2032,7 @@ dev = [
 requires-dist = [
     { name = "hdbscan", specifier = ">=0.8.44" },
     { name = "lerobot", extras = ["xvla", "libero", "training", "evaluation", "peft", "diffusion"], git = "https://github.com/huggingface/lerobot?rev=bf31dd794ffb4f87380aba3912f64421e8352d3c" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "robosuite", git = "ssh://git@github.com/ChazzKemal/robosuite?rev=71ee4f30c3032fbb0afa716f20be656ee48bfa16" },
     { name = "scikit-learn", specifier = ">=1.9.0" },
 ]

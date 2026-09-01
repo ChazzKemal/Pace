@@ -46,6 +46,16 @@ dependencies = [
   # training or evaluation path pays for them.
   "hdbscan>=0.8.44",
   "scikit-learn>=1.9.0",
+
+  # Reads the real-robot run configurations (`pace_bench.real.configs`), which are
+  # YAML with an `includes:` key so the transport settings live in one file.
+  #
+  # Declared rather than leaned on: LeRobot pulls PyYAML in transitively, so the
+  # import resolves today by accident. `tests/` is one testpaths root for sim and
+  # robot alike, so test_real_configs.py imports yaml on machines with no robot
+  # stack -- and would fail there, far from anything that looks like the cause,
+  # the first time LeRobot stopped needing it.
+  "pyyaml>=6",
 ]
 
 [dependency-groups]
