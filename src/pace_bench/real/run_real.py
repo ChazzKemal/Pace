@@ -37,8 +37,18 @@ from crisp_gym.deploy.obs import _build_obs_schema, _get_obs_zerofill
 from crisp_gym.deploy.sources import _LeRobotChunkSource
 from crisp_gym.deploy.trace import RunRecord, write_run_artifacts
 
-from pace_bench.methods.config import MethodConfig, MethodPipelineConfig, NoMethod
-from pace_bench.real.checkpoint import read_checkpoint, validate_method
+from pace_bench.methods.config import (
+    BSplineMethod,
+    MethodConfig,
+    MethodPipelineConfig,
+    NoMethod,
+)
+from pace_bench.real.checkpoint import (
+    BSPLINE_DECODE_STEP,
+    read_checkpoint,
+    validate_method,
+    without_postprocessor_steps,
+)
 from pace_bench.real.configs import materialise, resolve_policy_path
 from pace_bench.real.deploy_flags import blend_overlap_for
 from pace_bench.real.deploy_steps import deploy_steps
@@ -311,7 +321,7 @@ def quiesce_target_pose_timer(env) -> None:
     logger.info("target_pose timer(s) cancelled before handover: %d", cancelled)
 
 
-def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
+def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     """Bring the robot up, run the method's pipeline, tear down.
 
     The phases run in the order the hardware requires -- controller switched before
@@ -320,8 +330,22 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args) -> None:
     thread and scaled controller gains outlive a crash.
     """
     env = session.build_env(args)
+
+    # A B-spline checkpoint ships its own decode step, with the num_actions frozen at
+    # training. This pipeline supplies the decode instead, built from the run
+    # configuration -- which is the point, since num_actions is a decode-time choice
+    # and the whole claim of the method. Left in place the checkpoint's step runs
+    # first inside the inference subprocess: our decode then gets actions where it
+    # expects parameters, and the configured value is discarded without a word.
+    # Inert for every other method, and for a B-spline checkpoint saved without one.
+    pretrained = cfg.policy_path
+    if isinstance(method, BSplineMethod):
+        pretrained = str(without_postprocessor_steps(pretrained, (BSPLINE_DECODE_STEP,)))
+        if pretrained != cfg.policy_path:
+            logger.info("deploying a decode-free view of the checkpoint: %s", pretrained)
+
     src = _LeRobotChunkSource(
-        pretrained_path=cfg.policy_path, env=env,
+        pretrained_path=pretrained, env=env,
         # Without this the checkpoint's own n_action_steps wins and cfg is ignored:
         # a config asking for 32 would quietly run the policy's full 100.
         n_action_steps=cfg.n_action_steps,
@@ -399,7 +423,7 @@ def main(cfg: RealEvalConfig) -> None:
     logger.info("method=%s | steps=%s",
                 getattr(method, "type", "none"), [type(s).__name__ for s in steps])
     logger.info("run config -> %s", dump_run_config(cfg))
-    run_on_robot(cfg, steps, deploy_args(cfg, method))
+    run_on_robot(cfg, steps, deploy_args(cfg, method), method)
 
 
 def _resolve_config_arg(argv: list[str]) -> list[str]:

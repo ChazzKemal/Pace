@@ -25,6 +25,7 @@ halving did not happen.
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,10 @@ from typing import Any
 TRAIN_CONFIG = "train_config.json"
 POLICY_CONFIG = "config.json"
 PREPROCESSOR = "policy_preprocessor.json"
+POSTPROCESSOR = "policy_postprocessor.json"
+
+#: Registered name of B-spline's decode step, as serialized by LeRobot.
+BSPLINE_DECODE_STEP = "bspline_decode"
 
 #: Registered name of demospeedup's training-time step, as serialized by LeRobot.
 DEMOSPEEDUP_STEP = "demospeedup_retime"
@@ -187,3 +192,45 @@ def validate_method(declared: str, facts: CheckpointFacts, *, force: bool = Fals
         if not force:
             raise MethodMismatch(msg + " Pass --force to override.")
     return
+
+
+def without_postprocessor_steps(path: str | Path, names: tuple[str, ...]) -> Path:
+    """A view of the checkpoint with the named postprocessor steps removed.
+
+    Returns the original path untouched when nothing matches, so this is inert for
+    every checkpoint that does not carry one of ``names``.
+
+    Why a directory rather than an object: ``inference_worker`` runs in a *spawned
+    subprocess* and rebuilds the pipeline from the checkpoint path itself, so a
+    pipeline filtered in this process would never be seen. The path is the only
+    channel that crosses the process boundary, which is the same reason
+    ``configs.materialise`` hands draccus a resolved file rather than a dict.
+
+    The point is ``bspline_decode``. A B-spline checkpoint ships one, with the
+    ``num_actions`` frozen at training -- but ``num_actions`` is a *decode-time*
+    choice, the entire claim of the method, and the run configuration owns it. Left
+    in place it decodes first, so the deploy pipeline's own decode step receives
+    actions where it expects parameters, and the configured value is silently
+    discarded: ``bspline_1x`` asks for 25 and would execute the checkpoint's 16, a
+    1.6x run reported as 1.0x.
+
+    Everything is symlinked rather than copied -- ``model.safetensors`` is large, and
+    the only file that differs is a few hundred bytes of JSON. The temp directory
+    outlives this call deliberately: the subprocess reads it after we return, and it
+    is small enough to leave to the OS.
+    """
+    src = Path(path)
+    manifest = src / POSTPROCESSOR
+    if not manifest.exists():
+        return src
+    data = json.loads(manifest.read_text())
+    kept = [s for s in data.get("steps", []) if s.get("registry_name") not in names]
+    if len(kept) == len(data.get("steps", [])):
+        return src
+
+    out = Path(tempfile.mkdtemp(prefix="pace_ckpt_"))
+    for entry in src.iterdir():
+        if entry.name != POSTPROCESSOR:
+            (out / entry.name).symlink_to(entry.resolve())
+    (out / POSTPROCESSOR).write_text(json.dumps({**data, "steps": kept}, indent=2))
+    return out

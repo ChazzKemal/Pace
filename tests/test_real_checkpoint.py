@@ -13,10 +13,12 @@ from pathlib import Path
 import pytest
 
 from pace_bench.real.checkpoint import (
+    BSPLINE_DECODE_STEP,
     CheckpointFacts,
     MethodMismatch,
     read_checkpoint,
     validate_method,
+    without_postprocessor_steps,
 )
 
 REAL = Path("/home/ali/Coding/Robot_Control/Yunfei/crisp_gym/outputs/train/smolvla/pretrained_model")
@@ -163,3 +165,57 @@ def test_pace_stays_exempt():
     """PACE is eval-time: no checkpoint forbids it, including a demospeedup one's peers."""
     validate_method("pace", facts(None))
     validate_method("pace", facts("none"))
+
+
+class TestWithoutPostprocessorSteps:
+    """The deploy pipeline owns decoding, so the checkpoint's own decode must go.
+
+    A B-spline checkpoint ships a `bspline_decode` with `num_actions` frozen at
+    training. `inference_worker` rebuilds the pipeline from the path in a spawned
+    subprocess, so filtering it here -- by handing over a different path -- is the
+    only filter that reaches it.
+    """
+
+    def manifest(self, tmp_path, steps):
+        (tmp_path / "policy_postprocessor.json").write_text(
+            json.dumps({"name": "policy_postprocessor", "steps": steps}))
+        (tmp_path / "model.safetensors").write_text("weights")
+        (tmp_path / "config.json").write_text("{}")
+        return tmp_path
+
+    def test_the_named_step_is_removed(self, tmp_path):
+        src = self.manifest(tmp_path, [
+            {"registry_name": "unnormalizer_processor"},
+            {"registry_name": "bspline_decode", "config": {"num_actions": 16}},
+        ])
+        out = without_postprocessor_steps(src, (BSPLINE_DECODE_STEP,))
+        kept = json.loads((out / "policy_postprocessor.json").read_text())["steps"]
+        assert [s["registry_name"] for s in kept] == ["unnormalizer_processor"]
+
+    def test_a_checkpoint_without_it_is_returned_untouched(self, tmp_path):
+        # Inert for every other method: no temp directory, no copy, same path.
+        src = self.manifest(tmp_path, [{"registry_name": "unnormalizer_processor"}])
+        assert without_postprocessor_steps(src, (BSPLINE_DECODE_STEP,)) == src
+
+    def test_a_checkpoint_with_no_manifest_is_returned_untouched(self, tmp_path):
+        assert without_postprocessor_steps(tmp_path, (BSPLINE_DECODE_STEP,)) == tmp_path
+
+    def test_every_other_file_is_reachable(self, tmp_path):
+        # The subprocess loads weights and config from the view, so it must be whole.
+        src = self.manifest(tmp_path, [{"registry_name": "bspline_decode"}])
+        out = without_postprocessor_steps(src, (BSPLINE_DECODE_STEP,))
+        assert (out / "model.safetensors").read_text() == "weights"
+        assert (out / "config.json").exists()
+
+    def test_the_weights_are_not_copied(self, tmp_path):
+        # model.safetensors is gigabytes; only the JSON differs.
+        src = self.manifest(tmp_path, [{"registry_name": "bspline_decode"}])
+        out = without_postprocessor_steps(src, (BSPLINE_DECODE_STEP,))
+        assert (out / "model.safetensors").is_symlink()
+        assert not (out / "policy_postprocessor.json").is_symlink()
+
+    def test_the_original_checkpoint_is_not_modified(self, tmp_path):
+        src = self.manifest(tmp_path, [{"registry_name": "bspline_decode"}])
+        before = (src / "policy_postprocessor.json").read_text()
+        without_postprocessor_steps(src, (BSPLINE_DECODE_STEP,))
+        assert (src / "policy_postprocessor.json").read_text() == before
