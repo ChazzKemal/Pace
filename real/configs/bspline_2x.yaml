@@ -1,0 +1,37 @@
+# B-spline at 2x, chosen so the gripper compensation is exact rather than rounded.
+#
+# The realised rate is span / (num_actions - 1) source frames per executed action.
+# Measured on pickplace (chunk_size 10, degree 3, max_error 0.01): span median 24
+# frames over 1932 chunks. So:
+#
+#     num_actions 25 -> 24/24 = 1.00x    bspline_1x.yaml, the baseline
+#     num_actions 16 -> 24/15 = 1.60x    bspline_fast.yaml, the matrix width
+#     num_actions 13 -> 24/12 = 2.00x    here
+#
+# 13 is picked for the arithmetic, not for the curve: `GripperReplicate` takes an
+# integer row-replication factor, so at 1.60x the only compensating integer is 2 and
+# it over-shoots by 25%. At 2.00x that same 2 is exact -- the gripper gets back
+# precisely the wall-clock the speedup took from it.
+#
+# Exact at the *median*, not per chunk. The span varies chunk to chunk (that is why
+# deploy_steps refuses a merely-unset low_v), so half the chunks are still compensated
+# slightly wrong; 13 makes the typical one right. The 24 is a pickplace number:
+# re-measure before reusing this on another task.
+#
+# Gains are nominal, deliberately. BSplineMethod carries `stiffness_kp_scale` (2.0)
+# and the LIBERO actuator applies it, but the real runner sizes its gain scaler from
+# `method.max_speed`, which only PaceMethod defines -- so a B-spline deploy runs the
+# arm at stock stiffness. That is a choice for now, not an oversight: it means the arm
+# tracks 2x waypoints with 1x gains and will cut corners, and any tracking number from
+# this config has to be read as "untracked motion" rather than as the method's ceiling.
+_include: bspline_1x.yaml
+
+method:
+  num_actions: 13
+
+gripper:
+  slowdown_frames: 5        # A 2x run does take wall-clock from the gripper, so unlike
+                            # bspline_1x there IS something to give back.
+  bspline_low_v: 2          # Exactly the speedup factor above. Rows carrying gripper
+                            # motion are emitted twice, restoring demonstration timing
+                            # across the grasp while transport keeps the 2x.
