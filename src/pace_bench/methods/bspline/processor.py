@@ -242,6 +242,7 @@ class BSplineDecodeStep(ProcessorStep):
         relative_knots: bool = False,
         layout: ActionLayout | None = None,
         arrangement: MatrixArrangement | None = None,
+        align: bool = False,
     ):
         if num_actions < 1:
             raise ValueError(f"num_actions must be >= 1, got {num_actions}")
@@ -250,6 +251,30 @@ class BSplineDecodeStep(ProcessorStep):
         self.relative_knots = relative_knots
         self.layout = layout
         self.arrangement = arrangement
+        #: Resume each chunk where the previous one left the arm, rather than at the
+        #: curve's own beginning. Sequential control only -- see `decode_batch`.
+        self.align = bool(align)
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget the previous chunk. Must be called at every episode boundary.
+
+        An anchor carried across a reset would align the first chunk of a new episode
+        to wherever the last one ended, which is a different place entirely.
+        """
+        self._anchor: np.ndarray | None = None
+
+    @property
+    def compare_dim(self) -> int | None:
+        """Columns the alignment distance uses: everything but the gripper.
+
+        The gripper is the last spline dimension in every layout here. It is
+        near-binary, so it barely constrains *where along the path* the arm is while
+        its single step would dominate the distance -- upstream excludes it too
+        (`consider_gripper_during_align`, default off). None means "all columns", for
+        a layout with no gripper to drop.
+        """
+        return None if self.layout is None else max(self.layout.spline_dim - 1, 1)
 
     @torch.no_grad()
     def decode_batch(self, matrices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -260,6 +285,11 @@ class BSplineDecodeStep(ProcessorStep):
         sample -- source frames advanced per executed action, which varies with the
         span the policy predicted rather than being the constant the config asks for.
         """
+        # Alignment is sequential by definition -- it resumes *the* curve the arm is
+        # currently on -- so it is confined to a batch of one. A training or evaluation
+        # batch holds unrelated samples whose anchors have nothing to do with each
+        # other, and aligning them would be meaningless rather than merely slow.
+        aligning = self.align and matrices.shape[0] == 1
         decoded, rates = [], []
         for emitted in matrices.detach().cpu().numpy().astype(np.float64):
             matrix = (
@@ -270,7 +300,14 @@ class BSplineDecodeStep(ProcessorStep):
             samples = decode_chunk(
                 matrix, self.num_actions, degree=self.degree,
                 relative_knots=self.relative_knots,
+                align_to=self._anchor if aligning else None,
+                compare_dim=self.compare_dim,
             )
+            if aligning:
+                # In the spline's own space, before `from_spline`: a distance taken
+                # after the rotation is back in axis-angle is meaningless across the
+                # pi wrap, which is the same reason the fit uses 6D at all.
+                self._anchor = samples[-1].copy()
             if self.layout is not None:
                 samples = self.layout.from_spline(samples)
             decoded.append(samples)
@@ -305,6 +342,7 @@ class BSplineDecodeStep(ProcessorStep):
             "num_actions": self.num_actions,
             "degree": self.degree,
             "relative_knots": self.relative_knots,
+            "align": self.align,
             "layout": None if self.layout is None else self.layout.name,
             "arrangement": None if self.arrangement is None else self.arrangement.name,
         }

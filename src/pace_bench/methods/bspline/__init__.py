@@ -1,6 +1,9 @@
 """B-spline action representation (Han et al., arXiv:2607.09648)."""
 
 from pace_bench.methods.bspline.spline import (
+    ALIGN_ERROR_THRESHOLD,
+    ALIGN_WINDOW,
+    align_start,
     DEGREE,
     MAX_ERROR,
     RAW_DIM,
@@ -18,6 +21,9 @@ from pace_bench.methods.bspline.spline import (
 )
 
 __all__ = [
+    "ALIGN_ERROR_THRESHOLD",
+    "ALIGN_WINDOW",
+    "align_start",
     "DEGREE",
     "MAX_ERROR",
     "RAW_DIM",

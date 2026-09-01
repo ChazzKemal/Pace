@@ -30,6 +30,7 @@ stays close to SO(3) and :func:`from_spline_actions` projects back exactly.
 
 import numpy as np
 from scipy.interpolate import BSpline, generate_knots, make_lsq_spline
+from scipy.optimize import minimize_scalar
 from scipy.spatial.transform import Rotation
 
 #: Cubic. Upstream's every config and the recorded UR10e dataset agree on it.
@@ -238,11 +239,103 @@ def monotonic_knots(knots: np.ndarray, epsilon: float = 1e-6) -> np.ndarray:
     return knots
 
 
+#: Fraction of a chunk's span the alignment search may consume. Upstream's
+#: `time_align_larger_t`, same default. It stops alignment from skipping most of a
+#: plan to chase a spurious match late in the curve: a chunk describes one stretch of
+#: motion, and re-entering it 80% of the way along is never what "resume here" meant.
+ALIGN_WINDOW = 0.2
+#: Largest per-component mismatch that still counts as found. Upstream's
+#: `time_align_error_threshold`. Above it the search is rejected and the chunk starts
+#: at its own beginning, which is upstream's `restart_on_time_align_error`.
+ALIGN_ERROR_THRESHOLD = 0.1
+#: Points scanned to bracket the minimum before local refinement. Upstream instead
+#: widens its bounds by `lam *= 1.5` until the error passes, which is a globalisation
+#: bolted onto a local method; a coarse scan brackets the true minimum directly and
+#: costs microseconds.
+ALIGN_GRID = 64
+
+
+def align_start(
+    curve: BSpline,
+    anchor: np.ndarray,
+    start: float,
+    end: float,
+    compare_dim: int | None = None,
+    window: float = ALIGN_WINDOW,
+    error_threshold: float = ALIGN_ERROR_THRESHOLD,
+    grid: int = ALIGN_GRID,
+) -> tuple[float, float]:
+    """Where on this curve the arm already is: ``(t, error)``.
+
+    Upstream's `_align_new_plan`. When a fresh spline arrives mid-motion, executing it
+    from `knots[degree]` commands the arm back to the start of a stretch it is already
+    partway through -- a jump at every chunk boundary. So the curve is searched for the
+    point closest to where the arm actually is, and execution resumes *there*.
+
+    This is why upstream never blends chunk seams and neither should we: blending
+    averages two disagreeing predictions, while alignment removes the disagreement by
+    asking the one question a parameterised curve can actually answer.
+
+    Args:
+        anchor: the last action commanded from the *previous* curve, in this curve's
+            own space -- not the dataset's. The comparison must happen before any
+            rotation is converted back to axis-angle, where the pi wrap would make a
+            distance meaningless exactly where it matters.
+        compare_dim: leading columns to compare, or None for all of them. The gripper
+            is excluded by passing `spline_dim - 1`: it is near-binary, so it says
+            almost nothing about *where along the path* the arm is, and its one big
+            step would dominate the distance. Upstream's
+            `consider_gripper_during_align`, whose default is likewise off.
+
+    Returns:
+        ``(t, error)`` where `error` is the largest per-component mismatch. On failure
+        `t` is `start` -- alignment declines rather than guesses.
+    """
+    anchor = np.asarray(anchor, dtype=np.float64).reshape(-1)
+    dim = len(anchor) if compare_dim is None else int(compare_dim)
+    limit = start + float(window) * (end - start)
+    if not limit > start:
+        return float(start), float("inf")
+
+    def mismatch(t: float) -> float:
+        return float(np.abs(np.atleast_1d(curve(t)).reshape(-1)[:dim] - anchor[:dim]).sum())
+
+    # Three candidates, keep the best. The distance along a curve that revisits similar
+    # poses is not unimodal, so a bounded Brent started blind lands in whichever basin
+    # it happens to face -- upstream compensates by widening its bounds and retrying
+    # (`lam *= 1.5`). A coarse scan brackets the right basin directly, but a grid can
+    # also step over a sharp minimum that Brent would have found. Running both and
+    # taking the lower costs one extra Brent and makes "no worse than upstream" a
+    # property of the code rather than a hope.
+    scan = np.linspace(start, limit, max(int(grid), 3))
+    values = [mismatch(t) for t in scan]
+    best = int(np.argmin(values))
+    candidates = [(values[best], float(scan[best]))]
+
+    lo, hi = scan[max(best - 1, 0)], scan[min(best + 1, len(scan) - 1)]
+    if hi > lo:                                   # refine inside the bracketed basin
+        refined = minimize_scalar(mismatch, bounds=(lo, hi), method="bounded")
+        if refined.success:
+            candidates.append((mismatch(refined.x), float(refined.x)))
+    blind = minimize_scalar(mismatch, bounds=(start, limit), method="bounded")
+    if blind.success:                             # exactly upstream's own search
+        candidates.append((mismatch(blind.x), float(blind.x)))
+
+    t = min(candidates)[1]
+
+    error = float(np.abs(np.atleast_1d(curve(t)).reshape(-1)[:dim] - anchor[:dim]).max())
+    if error > error_threshold:
+        return float(start), error
+    return float(t), error
+
+
 def decode_chunk(
     parameters: np.ndarray,
     num_actions: int,
     degree: int = DEGREE,
     relative_knots: bool = False,
+    align_to: np.ndarray | None = None,
+    compare_dim: int | None = None,
 ) -> np.ndarray:
     """Evaluate one parameter matrix into ``(num_actions, dim)`` actions.
 
@@ -250,6 +343,17 @@ def decode_chunk(
     ``knots[degree]`` to ``knots[-(degree + 1)]``. ``num_actions`` is the whole
     speed knob and is free at inference: the span is a fixed stretch of demonstrated
     motion, so asking for fewer samples covers it in fewer executed steps.
+
+    ``align_to`` is the last action commanded from the *previous* chunk. Given one, the
+    curve is not sampled from its own beginning but from the point matching where the
+    arm already is (:func:`align_start`), which is how upstream avoids a jump at every
+    chunk boundary without blending anything.
+
+    Alignment shortens the span, and the row count follows rather than the spacing:
+    ``num_actions`` is a *speed*, so holding it fixed over a shorter span would make the
+    realised rate a function of tracking error and let a 1x run drift chunk to chunk.
+    Emitting fewer rows instead costs nothing -- the deploy loop takes the chunk's
+    length from the pipeline's output.
     """
     parameters = np.asarray(parameters, dtype=np.float64)
     if relative_knots:
@@ -265,10 +369,16 @@ def decode_chunk(
     start, end = knots[degree], knots[-(degree + 1)]
     if not end > start:
         raise ValueError(f"chunk spans no time: knots run [{start}, {end}]")
-    if num_actions <= 1:
+    curve = BSpline(knots, control_points, degree, extrapolate=False)
+    count = int(num_actions)
+    if align_to is not None and count > 1:
+        rate = (end - start) / (count - 1)
+        start, _error = align_start(curve, align_to, start, end, compare_dim=compare_dim)
+        count = max(2, int(round((end - start) / rate)) + 1)
+    if count <= 1:
         samples = np.asarray([start], dtype=np.float64)
     else:
-        samples = np.linspace(start, end, int(num_actions), dtype=np.float64)
+        samples = np.linspace(start, end, count, dtype=np.float64)
     # Take the last sample as a limit from the left. A chunk at the episode tail is
     # padded by repeating its final knot, so `end` sits at the bottom of a run of
     # identical knots -- a zero-length span, where every basis function is zero and
@@ -277,4 +387,4 @@ def decode_chunk(
     # after a 6D rotation is normalized it is a division by zero. One ulp inside, the
     # value is exactly the last control point, which is what the endpoint means.
     samples = np.minimum(samples, np.nextafter(end, start))
-    return BSpline(knots, control_points, degree, extrapolate=False)(samples)
+    return curve(samples)

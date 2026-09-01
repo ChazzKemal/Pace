@@ -8,12 +8,19 @@ at commit ``61ed5f4``:
   * ``decode_bspline_action``      bspline_policy/common/bspline_action.py
   * ``encode_relative_knots``      bspline_policy/common/knots.py
   * ``decode_relative_knots``      bspline_policy/common/knots.py
+  * ``find_closest_t_to_target``   scripts/policy_local_bspline.py
 
 Copied rather than depended on, for the same reason as
 :mod:`tests.upstream_reference`: the repo is a research distribution built on a
 vendored fork of ``diffusion_policy``, and ``bspline_action.py`` alone imports
 ``diffusion_policy.common.replay_buffer`` and ``filelock``. The four functions and
 one class here are the entire surface this project checks itself against.
+
+``find_closest_t_to_target`` is the one *adapted* definition: upstream it is a method
+(`BSplinePolicyLocal._find_closest_t_to_target`) and a method cannot stand alone, so
+`self.action_format` and `self.consider_gripper_during_align` became the parameter
+`compare_dim` -- which is exactly the value upstream's own branch computes from them.
+The body below the signature is unchanged.
 
 **Do not tidy this code.** Its value is being unchanged, so that "matches upstream"
 keeps meaning something. The port lives in ``pace_bench.methods.bspline``; the one
@@ -34,6 +41,7 @@ from typing import Optional
 import numpy as np
 import torch
 from scipy.interpolate import BSpline, generate_knots, make_lsq_spline
+from scipy.optimize import minimize_scalar
 
 def encode_relative_knots(action_data, degree: int = 3):
     """Encode knot values as first valid knot plus adjacent differences."""
@@ -191,3 +199,16 @@ def decode_bspline_action(
     return BSpline(knots, control_points, degree, extrapolate=False)(t_eval).astype(
         np.float32
     )
+
+
+def find_closest_t_to_target(predictor, target, min_t, max_t, compare_dim):
+    """Upstream's `_find_closest_t_to_target`, with `self` lifted to `compare_dim`."""
+    target = np.asarray(target).reshape(-1)
+
+    def dist(t):
+        current = predictor(t).squeeze()
+        return np.sqrt((current[:compare_dim] - target[:compare_dim]) ** 2).sum()
+
+    res = minimize_scalar(dist, bounds=(min_t, max_t), method="bounded")
+    error = np.abs(predictor(res.x).squeeze()[:compare_dim] - target[:compare_dim])
+    return res.x, float(error.max())

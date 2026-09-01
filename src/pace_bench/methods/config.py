@@ -377,6 +377,13 @@ class BSplineMethod(MethodConfig):
     #: realised factor varies per chunk with the predicted span and is published as
     #: `bspline_rate`. Defaults to the matrix width, i.e. roughly demonstration speed.
     num_actions: int | None = None
+    #: Resume each chunk at the point on its curve matching where the arm already is,
+    #: instead of at the curve's own start. Upstream's time-alignment, and on by
+    #: default there too (`disable_time_align=False`). Without it every chunk boundary
+    #: commands the arm back to the beginning of a stretch it is partway through; with
+    #: it, seam blending is unnecessary -- which is why upstream has no such blend.
+    #: Sequential control only; a training batch ignores it.
+    align: bool = True
     #: Frame rate of the demonstrations, used to express knots in seconds for
     #: arrangements that need it. A config field rather than something read off the
     #: dataset, because evaluation has no dataset and must reconstruct the exact knot
@@ -602,6 +609,7 @@ class BSplineMethod(MethodConfig):
                 num_actions=self.num_actions or self.width,
                 degree=self.degree,
                 relative_knots=self.relative_knots,
+                align=self.align,
                 layout=self._resolved_layout(),
                 arrangement=self._arrange(),
             )

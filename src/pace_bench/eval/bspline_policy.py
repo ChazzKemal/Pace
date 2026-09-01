@@ -81,6 +81,10 @@ def attach_bspline(policy, decode: BSplineDecodeStep, actuator: BSplineTrackingA
 
     def reset(self) -> None:
         self.bspline_queue.clear()
+        # The decode step remembers where the last chunk left the arm, to resume the
+        # next curve there. Across an episode boundary that anchor points at the
+        # previous episode's final pose, so it has to go with the queue.
+        self.bspline.reset()
         original_reset()
 
     policy.bind_env = types.MethodType(bind_env, policy)
