@@ -24,7 +24,9 @@ set -uo pipefail
 # Everything is resolved from this script's own location: the repo is its
 # directory, and the datasets sit in `data/` beside the checkout. Point
 # PACE_DATA_ROOT (or STACK_CUPS_ROOT) elsewhere to run against another copy.
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The repo is this script's PARENT directory: the queue scripts live in
+# training_scripts/ and every path below is relative to the checkout root.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${STACK_CUPS_ROOT:-$DATA_ROOT/datasets/real/stack_cups_20260828}

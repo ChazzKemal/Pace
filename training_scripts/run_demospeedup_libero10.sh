@@ -30,7 +30,9 @@ set -euo pipefail
 # directory, and the three inputs this run does not itself produce -- the dataset,
 # the pretrained xVLA, the stage-2 labels -- live in `data/` beside the checkout,
 # under datasets/sim, checkpoints/ and labels/. All are overridable; none are in git.
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The repo is this script's PARENT directory: the queue scripts live in
+# training_scripts/ and every path below is relative to the checkout root.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${LIBERO10_ROOT:-$DATA_ROOT/datasets/sim/libero_10_ee6d}

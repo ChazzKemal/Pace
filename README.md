@@ -78,10 +78,11 @@ python -m pace_bench.eval.run_libero \
     --n_action_steps=30 --out=outputs/eval/run
 ```
 
-End-to-end pipelines for the recorded experiments are in `run_demospeedup_*.sh` and
-`eval_demospeedup_libero10.sh`; each stage skip-guards, so a killed run resumes. They
-hold no absolute paths: each resolves the repo from its own location and reads
-everything it does not produce from `data/` beside the checkout —
+End-to-end pipelines for the recorded experiments live in `training_scripts/`
+(`run_demospeedup_*.sh`, `eval_demospeedup_libero10.sh`, and the `slurm_*.sbatch`
+jobs that submit them); each stage skip-guards, so a killed run resumes. They hold
+no absolute paths: each resolves the repo from its own location and reads everything
+it does not produce from `data/` beside the checkout —
 
 ```
 data/                      (not in git; PACE_DATA_ROOT points elsewhere)

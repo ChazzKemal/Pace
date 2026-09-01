@@ -125,7 +125,7 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **LIBERO's labels are the one stage still taken on trust from the fork.**
   `data/labels/xvla_libero10_ee6d/speedup_labels` holds all 400 episodes
   (`episode_<i>.npy` + `entropy_<i>.npy`), produced by the fork's stage-2 run;
-  `run_demospeedup_libero10.sh:32` consumes them via `--method.labels_path` behind a
+  `training_scripts/run_demospeedup_libero10.sh:44` consumes them via `--method.labels_path` behind a
   `require` guard, and the completed LIBERO A/B rests on them. So nothing is blocked
   operationally — every other LIBERO stage runs in this repo, and this one has its
   input on disk. What is missing is the check that pace_bench's own `run_label`
@@ -360,7 +360,7 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   attempt died with a CUDA OOM (`logs/cups_act_speedup.log`) — 23.5 GB card, another
   process holding 14.2 GB, so it is a scheduling collision, not a config fault.
   `outputs/train/cups_act_speedup/` exists with no checkpoint, so the script's
-  skip-guard will correctly retry it. Resume: `./run_demospeedup_stackcups.sh`, but
+  skip-guard will correctly retry it. Resume: `./training_scripts/run_demospeedup_stackcups.sh`, but
   not while pickplace has the card.
 
 Runtimes for every stage above are tabulated in the README (`## Runtimes`).

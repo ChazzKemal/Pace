@@ -53,7 +53,9 @@
 # once here and never varied per-arm. The 0.211 s/step this schedule is costed
 # against was measured on the pickplace ACT baseline, which ran bf16.
 set -uo pipefail
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The repo is this script's PARENT directory: the queue scripts live in
+# training_scripts/ and every path below is relative to the checkout root.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${STACK_CUPS_MERGED_ROOT:-$DATA_ROOT/datasets/real/stackcups_20260829_merged}

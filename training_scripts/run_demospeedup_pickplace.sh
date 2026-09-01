@@ -69,7 +69,9 @@ set -uo pipefail
 # Resolved from this script's own location, so a renamed checkout needs no edit:
 # the repo is its directory and the datasets sit in `data/` beside it. The two
 # inputs this run does not produce are overridable, since neither is in git.
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# The repo is this script's PARENT directory: the queue scripts live in
+# training_scripts/ and every path below is relative to the checkout root.
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$REPO_ROOT"
 DATA_ROOT=${PACE_DATA_ROOT:-$(dirname "$REPO_ROOT")/data}
 DATASET_ROOT=${PICKPLACE_ROOT:-$DATA_ROOT/datasets/real/pickplace_cart7_v2_angleaxis_nogrip}
