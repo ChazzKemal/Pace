@@ -120,6 +120,24 @@ N_EPISODES=45
 mkdir -p logs outputs/label
 stage () { echo; echo "═══════════ $1 ═══════════"; }
 
+# Optional stage selection, mirroring training_scripts/eval_libero10_all.sh:
+#
+#   ./run_demospeedup_pickplace.sh                              # the whole queue, as before
+#   ./run_demospeedup_pickplace.sh pickplace_diffusion_bspline                 # only this arm
+#
+# Keyed on the artifact a stage produces -- `outputs/train/<name>` for an arm,
+# `outputs/label/<name>` for a labelling stage -- so an argument names the thing it
+# builds rather than a position that renumbering would silently move. Selection is
+# checked inside `train` and `label`, so no call site has to know about it, and the
+# skip guards still apply on top: naming an arm that is already trained is a no-op.
+SELECTED=("$@")
+selected () {
+    [ ${#SELECTED[@]} -eq 0 ] && return 0
+    local want
+    for want in "${SELECTED[@]}"; do [ "$want" = "$1" ] && return 0; done
+    return 1
+}
+
 # Existence of checkpoints/last is NOT proof the arm finished. save_freq is 10k, so
 # a run that dies at step 40k leaves a `last` behind; a bare directory check would
 # report "already trained" and hand the comparison a 40k arm sitting next to a 100k
@@ -200,6 +218,7 @@ MAX_ATTEMPTS=${PACE_MAX_ATTEMPTS:-6}
 
 train () {  # train <output name> <wandb job name> <policy args...>
     local name=$1 job=$2; shift 2
+    selected "$name" || { echo "$name -- not selected on this invocation, skipping"; return 0; }
     local state attempt=0 before after
     while :; do
         state=$(arm_state "$name")
@@ -227,6 +246,7 @@ train () {  # train <output name> <wandb job name> <policy args...>
 
 label () {  # label <label dir> <oracle run name> <log tag>
     local out=$1 oracle=$2 tag=$3
+    selected "$out" || { echo "labels $out -- not selected on this invocation, skipping"; return 0; }
     if [ "$(ls "outputs/label/$out"/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq "$N_EPISODES" ]; then
         echo "labels in outputs/label/$out already present, skipping"
     else
