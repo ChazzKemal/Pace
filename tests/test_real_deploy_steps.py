@@ -30,11 +30,18 @@ def args(slowdown=5, invert=False):
 
 
 def grasp_chunk(k=12, edge=4, ramp=2):
-    """A chunk whose gripper closes over `ramp` rows starting at `edge`."""
+    """A chunk whose gripper CLOSES over `ramp` rows starting at `edge`.
+
+    Closing is 1 -> 0, not 0 -> 1: `GripperCloseWindow` reads `closed = g < 0.5`, and
+    the rig's own env config has `min_value: 0.8, max_value: 0.0`. A fixture ramping
+    0 -> 1 is an *open*, which fires no close edge -- and would leave these tests
+    passing on the spurious edge a chunk starting at 0 produces instead.
+    """
     a = np.zeros((k, 7), dtype=np.float64)
     a[:, 0] = np.linspace(0.0, 0.3, k)          # the arm keeps moving through it
-    a[edge:edge + ramp, GRIP_COL] = np.linspace(0.3, 1.0, ramp)
-    a[edge + ramp:, GRIP_COL] = 1.0
+    a[:edge, GRIP_COL] = 1.0                    # open on approach
+    a[edge:edge + ramp, GRIP_COL] = np.linspace(0.7, 0.0, ramp)
+    a[edge + ramp:, GRIP_COL] = 0.0             # closed, and stays closed
     return Chunk(actions=a, speeds=np.full(k, 2.0))
 
 
@@ -132,7 +139,7 @@ class TestGripperStrideExemption:
         import torch
         a = torch.zeros(1, k, 7)
         a[0, :, 0] = torch.linspace(0.0, 0.3, k)
-        a[0, edge:, GRIP_COL] = 1.0
+        a[0, :edge, GRIP_COL] = 1.0             # open -> closed; see grasp_chunk
         return a
 
     def idx(self, **kw):
@@ -194,9 +201,9 @@ class TestExemptionWindow:
         import torch
         a = torch.zeros(1, k, 7)
         a[0, :, 0] = torch.linspace(0.0, 0.5, k)
+        a[0, :edge, GRIP_COL] = 1.0         # open on approach
         a[0, edge, GRIP_COL] = 0.5          # a two-row ramp, as a policy emits
-        a[0, edge + 1:, GRIP_COL] = 1.0
-        return a
+        return a                            # 0.0 from edge+1 on: closed
 
     def idx(self, frames):
         from pace_bench.methods.pace.speed import stride_indices
