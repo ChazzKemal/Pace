@@ -94,20 +94,22 @@ arm_state () {  # -> done | resume | fresh, on stdout
 
 at_step () { basename "$(readlink -f "outputs/train/$1/checkpoints/last")"; }
 
-train () {  # train <output name> <wandb job name> <policy args...>
-    local name=$1 job=$2; shift 2
-    local state; state=$(arm_state "$name")
-    case "$state" in
-        done)   echo "$name already trained ($(at_step "$name") steps), skipping"; return 0 ;;
-        resume) echo "$name stopped at $(at_step "$name")/$STEPS steps -- resuming from its checkpoint" ;;
-        fresh)  rm -rf "outputs/train/$name" ;;
-    esac
+# Numeric step, 0 when the arm has no checkpoint yet -- the retry loop's progress test.
+step_of () {
+    local last="outputs/train/$1/checkpoints/last"
+    if [ -d "$last" ]; then echo "$((10#$(basename "$(readlink -f "$last")")))"; else echo 0; fi
+}
+
+# One launch. Everything that is per-attempt lives here; `train` owns the retrying.
+launch () {  # launch <name> <job> <state> <policy args...>
+    local name=$1 job=$2 state=$3; shift 3
     local pruner_pid=
     if [ -f "$PRUNER" ]; then
         "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --interval 300 \
-            >"logs/${name}.prune.log" 2>&1 &
+            >>"logs/${name}.prune.log" 2>&1 &
         pruner_pid=$!
     fi
+    echo "───── $name attempt at $(date '+%F %T'), state=$state ─────" >>"logs/${name}.log"
     if [ "$state" = resume ]; then
         # The checkpoint's own train_config.json is the entire configuration on this
         # path -- steps, batch, bf16, seed, wandb run id and --method.* included --
@@ -121,10 +123,55 @@ train () {  # train <output name> <wandb job name> <policy args...>
     else
         "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" "${BUDGET[@]}" "$@" \
             --job_name="$job" --output_dir="outputs/train/$name" \
-            2>&1 | tee "logs/${name}.log"
+            2>&1 | tee -a "logs/${name}.log"
     fi
     [ -n "$pruner_pid" ] && { kill "$pruner_pid" 2>/dev/null; "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --once >>"logs/${name}.prune.log" 2>&1; }
-    [ "$(arm_state "$name")" = done ] || { echo "FAILED: $name did not reach $STEPS steps"; exit 1; }
+    return 0
+}
+
+# An arm is launched until it reaches the budget, not once.
+#
+# The 2026-09-01 attempt died at step 66,409 with a general protection fault inside
+# libtorch_python.so (dmesg 13:55:36) -- no OOM, no CUDA Xid, no Python traceback,
+# 41GB of RAM free, and the pickplace queue's four 100k arms never hit it. One
+# native fault in the main process is not something this script can diagnose. What
+# it can do is stop letting it cost the whole queue: that crash aborted stages 2-4
+# as well, so ~6h of GPU time bought nothing but a 60k checkpoint. Relaunching from
+# the last checkpoint caps the damage at the steps since the last save (<=10k,
+# ~35min), and resume is sample-exact here, so the arm that finally reaches 100k is
+# still the 100k arm the queue asked for.
+#
+# The guard against spinning: an attempt that ends no further along than it started
+# is not a crash worth retrying, it is a run that cannot start. One such attempt is
+# tolerated (a fresh arm has no checkpoint until step 10k, so its first crash can
+# legitimately show no progress); a second in a row stops the queue.
+MAX_ATTEMPTS=${PACE_MAX_ATTEMPTS:-6}
+
+train () {  # train <output name> <wandb job name> <policy args...>
+    local name=$1 job=$2; shift 2
+    local state attempt=0 before after
+    while :; do
+        state=$(arm_state "$name")
+        if [ "$state" = done ]; then
+            [ "$attempt" -eq 0 ] && echo "$name already trained ($(at_step "$name") steps), skipping" \
+                                 || echo "$name reached $(at_step "$name") steps in $attempt attempt(s)"
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
+            echo "FAILED: $name stuck at $(step_of "$name")/$STEPS after $MAX_ATTEMPTS attempts"; exit 1
+        fi
+        before=$(step_of "$name")
+        case "$state" in
+            resume) echo "[attempt $attempt/$MAX_ATTEMPTS] $name at $before/$STEPS -- resuming from its checkpoint" ;;
+            fresh)  echo "[attempt $attempt/$MAX_ATTEMPTS] $name -- training from scratch"; rm -rf "outputs/train/$name" ;;
+        esac
+        launch "$name" "$job" "$state" "$@"
+        after=$(step_of "$name")
+        if [ "$after" -le "$before" ] && [ "$attempt" -gt 1 ]; then
+            echo "FAILED: $name made no progress on attempt $attempt (still at $after) -- not a crash to retry"; exit 1
+        fi
+    done
 }
 
 stage "1/4: ACT baseline (also the labelling oracle)"
