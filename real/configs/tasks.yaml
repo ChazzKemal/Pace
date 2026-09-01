@@ -1,0 +1,38 @@
+# Which checkpoint each (task, method) pair was trained as.
+#
+# A method config states how to deploy; this states what to deploy it on. Selected
+# with --task, and only consulted when --policy_path is left empty, so an explicit
+# path always wins.
+#
+# Paths are relative to `root` and must end at the directory holding config.json --
+# LeRobot's `pretrained_model`, not the checkpoint step above it. A pair that is
+# absent, or present but null, raises and names what IS trained; nothing here ever
+# falls back to a checkpoint from another arm.
+
+root: /home/ali/Coding/Robot_Control/Yunfei/crisp_gym/outputs/train
+
+pickplace:
+  # Stages 6-8 of run_demospeedup_pickplace.sh, all on
+  # pickplace_cart7_v2_angleaxis_nogrip.
+  bspline:     pickplace_act_bspline/checkpoints/last/pretrained_model
+  demospeedup: pickplace_act_speedup/checkpoints/last/pretrained_model
+  # The rig's standing baseline: 256 of the 628 recorded deploy runs used exactly
+  # this path, more than every other checkpoint combined, most recently 2026-08-27.
+  # Step 030000 rather than `last` because that is what those runs name; the two are
+  # byte-identical (same model.safetensors md5).
+  #
+  # CAVEAT: it fine-tuned on merged_act_finetune_20260528, NOT the
+  # pickplace_cart7_v2_angleaxis_nogrip that the bspline and demospeedup arms above
+  # trained on. So it is the right thing to *operate* -- and PACE is checkpoint-
+  # agnostic by construction, so `pace` runs on it correctly -- but it is not a
+  # matched control for those two. Stage 1 of run_demospeedup_pickplace.sh
+  # (pickplace_act_base) is still the checkpoint an A/B claim needs.
+  none:        act_cart7_v2_angleaxis_nogrip_chunk100_ft_20260528/checkpoints/030000/pretrained_model
+  pace:        act_cart7_v2_angleaxis_nogrip_chunk100_ft_20260528/checkpoints/030000/pretrained_model
+
+stackcups:
+  # What this rig last deployed, 2026-08-31 (real/outputs/eval_real/run_config.yaml).
+  none:        cups_act_base_ts_input/checkpoints/last/pretrained_model
+  pace:        cups_act_base_ts_input/checkpoints/last/pretrained_model
+  bspline:     ~
+  demospeedup: ~
