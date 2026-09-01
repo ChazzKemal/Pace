@@ -15,6 +15,7 @@ means this script's model of the pipeline has drifted from the pipeline.
     python real/scripts/chunk_trace.py                 # browse runs, then chunks
     python real/scripts/chunk_trace.py RUN_DIR -c 5
     python real/scripts/chunk_trace.py RUN_DIR -c 5 -o chunk5.png
+    python real/scripts/chunk_trace.py --gui              # 3-D, coloured by s_eff
 
 Needs the run to carry trace.npz (``record_trace``), commands.csv and poses.csv.
 """
@@ -489,16 +490,103 @@ def browse_tui() -> int:
     return 0
 
 
+
+
+# ---------------------------------------------------------------------------
+# 3-D viewer
+# ---------------------------------------------------------------------------
+
+def gui(run: Path) -> int:
+    """Commanded path in 3-D, coloured by the speed PACE chose, chunk by chunk.
+
+    Shaped after crisp_gym's examples/27_speedup_slider_viewer.py, which does this for
+    a *dataset* episode while tuning the schedule. This does it for a *recorded deploy*,
+    so the colours are the speeds that actually ran and the achieved path is drawn
+    beside them -- the question is no longer "what would this schedule do" but "what
+    did the arm do when it ran".
+
+    WebAgg by default so an SSH'd session gets a browser UI with no X server; export
+    MPLBACKEND=TkAgg for a native window over ssh -X.
+    """
+    import os
+    os.environ.setdefault("MPLBACKEND", "WebAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Slider
+
+    d = RunData(run)
+    if d.missing:
+        sys.exit(f"{run.name}: {d.missing}")
+
+    fig = plt.figure(figsize=(13, 8))
+    fig.canvas.manager.set_window_title(run.name)
+    ax3 = fig.add_axes([0.02, 0.28, 0.48, 0.66], projection="3d")
+    axs = fig.add_axes([0.62, 0.63, 0.35, 0.29])
+    axt = fig.add_axes([0.56, 0.20, 0.43, 0.36])
+    axt.axis("off")
+    ax_sl = fig.add_axes([0.10, 0.12, 0.70, 0.03])
+    sl = Slider(ax_sl, "chunk", 0, max(d.n_chunks - 1, 0), valinit=0, valstep=1)
+
+    state = {"cb": None}
+
+    def draw(idx: int) -> None:
+        idx = int(idx)
+        lo, hi = d.bounds[idx]
+        cx = d.cmd["cmd_x"][lo:hi]; cy = d.cmd["cmd_y"][lo:hi]; cz = d.cmd["cmd_z"][lo:hi]
+        se = d.cmd["s_eff"][lo:hi]
+        dwell = d.cmd["cycles"][lo:hi] * d.control_dt
+        t = np.concatenate([[0.0], np.cumsum(dwell)[:-1]])
+
+        ax3.clear()
+        ax3.plot(cx, cy, cz, color="0.6", lw=0.7, alpha=0.7)
+        sc = ax3.scatter(cx, cy, cz, c=se, cmap="viridis", s=26,
+                         vmin=1.0, vmax=max(float(se.max()), 1.01))
+        if d.poses is not None:
+            t0 = d.cmd["t_wall"][lo] + d.lag_s
+            w = (d.poses["t_wall"] >= t0) & (d.poses["t_wall"] <= t0 + t[-1] + dwell[-1])
+            if w.any():
+                ax3.plot(d.poses["ach_x"][w], d.poses["ach_y"][w], d.poses["ach_z"][w],
+                         color="#eb6834", lw=1.6, alpha=0.9, label="achieved")
+                ax3.legend(loc="upper left", fontsize=8)
+        ax3.set_xlabel("x (m)"); ax3.set_ylabel("y (m)"); ax3.set_zlabel("z (m)")
+        ax3.set_title(f"chunk {idx} — commanded, coloured by s_eff", fontsize=10)
+        if state["cb"] is None:
+            state["cb"] = fig.colorbar(sc, ax=ax3, fraction=0.022, pad=0.01, shrink=0.55)
+            state["cb"].set_label("s_eff")
+        else:
+            state["cb"].update_normal(sc)
+
+        axs.clear()
+        axs.step(t, se, where="post", color="#eb6834", lw=1.7)
+        axs.set_xlabel("seconds into the chunk"); axs.set_ylabel("s_eff")
+        axs.set_title("speed schedule", fontsize=10)
+        axs.grid(alpha=0.2)
+
+        axt.clear(); axt.axis("off")
+        axt.text(0, 1, "\n".join(describe(d, idx)[:15]), family="monospace",
+                 fontsize=7.6, va="top", transform=axt.transAxes)
+        fig.canvas.draw_idle()
+
+    sl.on_changed(draw)
+    draw(0)
+    print(f"{run.name}: {d.n_chunks} chunks — drag the slider to page them")
+    plt.show()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("run_dir", nargs="?", help="deploy_runs/<ts>; default: newest")
     ap.add_argument("-c", "--chunk", type=int, default=0)
     ap.add_argument("-o", "--out", default=None, help="write a PNG as well")
+    ap.add_argument("--gui", action="store_true",
+                    help="3-D viewer: commanded path coloured by s_eff, chunk slider")
     ap.add_argument("--no-tui", action="store_true",
                     help="never open the browser; use the newest run")
     a = ap.parse_args()
     # No run named and nothing else asked for: browse. An explicit --chunk or --out
     # means the caller wants one answer on stdout, so honour that without a screen.
+    if a.gui:
+        return gui(Path(a.run_dir) if a.run_dir else newest_run())
     if not a.run_dir and a.chunk == 0 and not a.out and not a.no_tui:
         return browse_tui()
     run = Path(a.run_dir) if a.run_dir else newest_run()
