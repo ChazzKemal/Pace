@@ -1,10 +1,16 @@
 #!/bin/bash
 # =============================================================================
-# DemoSpeedup ACT arms on stackcups_20260829_merged (UR10e, absolute cart7)
+# ACT arms on stackcups_20260829_merged (UR10e, absolute cart7)
 # =============================================================================
 #   1. ACT baseline      chunk 100, 100k steps  (doubles as the labelling oracle)
 #   2. entropy labelling oracle = arm 1  -> outputs/label/stack_cups_merged
 #   3. ACT DemoSpeedup   chunk 100 -> 50, pad_mode=zero
+#   4. ACT B-spline      16x11 parameter matrix, no labelling stage
+#
+# Arm 4 makes this the same three-method comparison the pickplace queue runs
+# (baseline / DemoSpeedup / B-spline), on the second real dataset. It shares the
+# queue's 100k-step budget and needs nothing from stages 1-2, so it is last only
+# because the labelled arm is the one with a dependency to satisfy.
 #
 # This supersedes run_demospeedup_stackcups.sh, which trained on
 # stack_cups_20260828 -- 12 episodes / 8875 frames. The merged set is 175
@@ -15,19 +21,19 @@
 # why this one is meant to run with the GPU to itself.
 #
 # Output dirs and the label dir are deliberately NEW names. Reusing cups_act_base
-# would hand done_already a checkpoint trained on the 12-episode set and it would
-# skip straight past stage 1, labelling the merged data with an oracle that never
-# saw it.
+# would hand arm_state a checkpoint trained on the 12-episode set and it would skip
+# straight past stage 1, labelling the merged data with an oracle that never saw
+# it.
 #
 # BUDGET: 100k steps at batch 32 = 3.2M samples = 51.9 epochs on 61631 frames.
 # The repo's other queues are epoch-matched at ~100 epochs (pickplace 102, the old
-# cups run 108); on a 6.9x dataset that would be ~193k steps and ~24h for the two
-# arms. 100k is the deliberate trade (user decision 2026-08-30): half the wall
-# clock, and it matches the pickplace ACT arms step-for-step so the two tasks'
-# ACT arms are comparable in optimizer steps. What parity actually requires is
-# that the two arms HERE get the same budget, and they do.
+# cups run 108); on a 6.9x dataset that would be ~193k steps and ~24h per arm.
+# 100k is the deliberate trade (user decision 2026-08-30): half the wall clock,
+# and it matches the pickplace ACT arms step-for-step so the two tasks' ACT arms
+# are comparable in optimizer steps. What parity actually requires is that the
+# three arms HERE get the same budget, and they do.
 #
-# bf16 for both arms, as in the pickplace queue: a numerics change, so it is set
+# bf16 for every arm, as in the pickplace queue: a numerics change, so it is set
 # once here and never varied per-arm. The 0.211 s/step this schedule is costed
 # against was measured on the pickplace ACT baseline, which ran bf16.
 set -uo pipefail
@@ -62,42 +68,69 @@ mkdir -p logs outputs/label
 stage () { echo; echo "═══════════ $1 ═══════════"; }
 
 # Existence of checkpoints/last is NOT proof the arm finished. save_freq is 10k,
-# so a run that dies at step 40k leaves a `last` behind; the old check would then
-# report "already trained" and hand the comparison a 40k arm sitting next to a
-# 100k one. Resolve the symlink and insist on the full budget. 10# because the
+# so a run that dies at step 40k leaves a `last` behind; a bare directory check
+# would report "already trained" and hand the comparison a 40k arm sitting next to
+# a 100k one. Resolve the symlink and insist on the full budget. 10# because the
 # dirs are zero-padded and bash reads a leading 0 as octal (010000 -> 4096).
-done_already () {
+#
+# A partial arm is RESUMED rather than thrown away, which is sound HERE and would
+# not be everywhere. ACT carries no LR schedule (`scheduler: null`, constant 1e-5
+# AdamW), and the interrupted run was already configured for these same 100k steps
+# -- so no part of the optimisation was sized against a shorter budget. Upstream's
+# resume restores step, RNG, optimizer moments, and the EpisodeAwareSampler offset
+# recomputed from the saved (step, batch_size, dp_world_size), so the continuation
+# is sample-exact: the arm that comes out is the 100k arm this queue asked for, not
+# a differently-trained one. An arm with a checkpoint but no training_state left to
+# load cannot be continued and starts over.
+arm_state () {  # -> done | resume | fresh, on stdout
     local last="outputs/train/$1/checkpoints/last" step
     if [ -d "$last" ]; then
         step=$(basename "$(readlink -f "$last")")
-        if [ "$((10#$step))" -ge "$STEPS" ]; then
-            echo "$1 already trained ($((10#$step)) steps), skipping"; return 0
-        fi
-        echo "$1 stopped at $((10#$step))/$STEPS steps -- crashed attempt, retraining fresh"
+        if [ "$((10#$step))" -ge "$STEPS" ]; then echo done; return; fi
+        if [ -f "$last/training_state/training_step.json" ]; then echo resume; return; fi
     fi
-    rm -rf "outputs/train/$1"; return 1
+    echo fresh
 }
+
+at_step () { basename "$(readlink -f "outputs/train/$1/checkpoints/last")"; }
 
 train () {  # train <output name> <wandb job name> <policy args...>
     local name=$1 job=$2; shift 2
-    done_already "$name" && return 0
+    local state; state=$(arm_state "$name")
+    case "$state" in
+        done)   echo "$name already trained ($(at_step "$name") steps), skipping"; return 0 ;;
+        resume) echo "$name stopped at $(at_step "$name")/$STEPS steps -- resuming from its checkpoint" ;;
+        fresh)  rm -rf "outputs/train/$name" ;;
+    esac
     local pruner_pid=
     if [ -f "$PRUNER" ]; then
         "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --interval 300 \
             >"logs/${name}.prune.log" 2>&1 &
         pruner_pid=$!
     fi
-    "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" "${BUDGET[@]}" "$@" \
-        --job_name="$job" --output_dir="outputs/train/$name" \
-        2>&1 | tee "logs/${name}.log"
+    if [ "$state" = resume ]; then
+        # The checkpoint's own train_config.json is the entire configuration on this
+        # path -- steps, batch, bf16, seed, wandb run id and --method.* included --
+        # and upstream applies CLI flags *over* it. Re-passing the arg arrays would
+        # therefore let a later edit of this file silently change an arm mid-flight,
+        # so nothing is passed but the checkpoint and where to keep writing.
+        "$PY" -m pace_bench.train.run_train \
+            --config_path="$REPO_ROOT/outputs/train/$name/checkpoints/last/pretrained_model/train_config.json" \
+            --resume=true --output_dir="outputs/train/$name" \
+            2>&1 | tee -a "logs/${name}.log"
+    else
+        "$PY" -m pace_bench.train.run_train "${DATA[@]}" "${WANDB[@]}" "${BUDGET[@]}" "$@" \
+            --job_name="$job" --output_dir="outputs/train/$name" \
+            2>&1 | tee "logs/${name}.log"
+    fi
     [ -n "$pruner_pid" ] && { kill "$pruner_pid" 2>/dev/null; "$PY" "$PRUNER" "outputs/train/$name" --keep "$KEEP" --once >>"logs/${name}.prune.log" 2>&1; }
-    done_already "$name" >/dev/null || { echo "FAILED: $name did not reach $STEPS steps"; exit 1; }
+    [ "$(arm_state "$name")" = done ] || { echo "FAILED: $name did not reach $STEPS steps"; exit 1; }
 }
 
-stage "1/3: ACT baseline (also the labelling oracle)"
+stage "1/4: ACT baseline (also the labelling oracle)"
 train cups_merged_act_base act_baseline_merged "${ACT[@]}" --method.type=none
 
-stage "2/3: entropy labelling (ACT CVAE oracle = arm 1)"
+stage "2/4: entropy labelling (ACT CVAE oracle = arm 1)"
 if [ "$(ls outputs/label/stack_cups_merged/speedup_labels/episode_*.npy 2>/dev/null | wc -l)" -eq "$N_EPISODES" ]; then
     echo "labels already present, skipping"
 else
@@ -144,14 +177,30 @@ print(f"mean fast-run length {mean_run:.2f} vs {expected_random:.2f} expected if
 print("SIGNAL:", "OK" if mean_run > 3 * expected_random else "SUSPICIOUS - review plots before trusting")
 PYEOF
 
-stage "3/3: ACT DemoSpeedup (chunk 100 -> 50, masked zero-pad)"
+stage "3/4: ACT DemoSpeedup (chunk 100 -> 50, masked zero-pad)"
 train cups_merged_act_speedup act_demospeedup_merged "${ACT[@]}" \
     --method.type=demospeedup \
     --method.labels_path="$REPO_ROOT/outputs/label/stack_cups_merged/speedup_labels" \
     --method.pad_mode=zero
 
+# The B-spline arm's chunk geometry is not the ACT[] array's, and cannot be: a
+# B-spline chunk indexes control points, not timesteps. chunk_size 10 + 2*degree 3
+# gives a 16x11 parameter matrix, and that width -- not chunk_size -- becomes the
+# policy's chunk and n_action_steps, so ACT[] is deliberately not spread here.
+# 16 is upstream's own real-robot horizon. Parity across the queue is the budget,
+# which this arm holds to exactly like the other three.
+#
+# The dataset is cart7 at 20 fps, identical to pickplace's, so the layout and fps
+# carry over unchanged. num_actions stays unset: it is the speed lever and a
+# decode-time choice, so it belongs to evaluation, not to training.
+stage "4/4: ACT B-spline (16x11 parameter matrix, no labelling stage)"
+train cups_merged_act_bspline act_bspline_merged \
+    --policy.type=act \
+    --method.type=bspline --method.layout=cart7 --method.fps=20 \
+    --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
+
 echo
 echo "═══════════ STACK CUPS MERGED QUEUE DONE ═══════════"
-for d in cups_merged_act_base cups_merged_act_speedup; do
+for d in cups_merged_act_base cups_merged_act_speedup cups_merged_act_bspline; do
     printf '  %-32s %s\n' "$d" "$([ -d "outputs/train/$d/checkpoints/last" ] && echo "trained ($(basename "$(readlink -f "outputs/train/$d/checkpoints/last")"))" || echo MISSING)"
 done
