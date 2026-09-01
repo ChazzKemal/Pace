@@ -23,7 +23,7 @@ gate that fails loudly. One batch = one reviewable commit set; the user commits.
 | 8 | B-spline on xVLA (`bspline_ee6d`) | trains and reconstructs | ✅ trains (`--method.arrangement=xvla_ee6d20 --policy.action_mode=ee6d_bspline`); `KNOT_SCALE` untuned. Not trained to completion |
 | 9 | DemoSpeedup stage 2 in-repo (`methods/demospeedup/run_label.py`) | bit-exact vs upstream's `hdbscan_with_custom_merge`, 6 golden traces; 1-episode run on the real cups checkpoint; ACT + xVLA + Diffusion oracles | ✅ committed |
 
-## Implementation state (`src/pace_bench/`, 317 passed, 0 skipped)
+## Implementation state (`src/pace_bench/`, 325 passed, 0 skipped)
 
 The suite no longer skips anything and needs no network or external checkout. The
 DemoSpeedup repo is not a dependency in any form (user decision 2026-08-29): the
@@ -48,6 +48,7 @@ random label sequences) in `test_demospeedup_processor.py`. Neither skips.
 | `methods/demospeedup/actuator.py` | `DemoSpeedupTrackingActuator`: constant gains+gripper ×low_v, time untouched (upstream's high-gain-XML recipe + arm gains); per-step re-application (reset-proof) |
 | `methods/bspline/spline.py` | the B-spline action representation (`B-spline-policy/bspline-policy` @ `61ed5f4`, arXiv:2607.09648). `fit_episode` (adaptive least-squares fit: `generate_knots` grows the knot count until the spline is within `max_error`), `chunk_parameters` (cut the fit into `(chunk_size + 2*degree, 1 + dim)` windows of the *episode's* knot vector — only the first carries the clamped boundary), `assign_chunks_to_frames` (one matrix per frame, knots shifted to offsets from that frame), `decode_chunk` (evaluate the curve at `num_actions` points across its span — this is the speed knob), `to/from_spline_actions` (cart7 ↔ xyz+rot6d+gripper, with Gram-Schmidt back onto SO(3)), `encode/decode_relative_knots` (the knot column as consecutive differences). Parity against `tests/upstream_reference_bspline.py` |
 | `methods/bspline/layout.py` | which columns of a dataset's action can be splined, named per run: `cart7` (UR10e, angle-axis → rot6d), `ee6d20` (LIBERO, already rot6d, 10 zero-pad columns dropped and restored), `identity` (joint space). Checked against the dataset's real action width, because naming the wrong one is otherwise silent — a transposed rotation still fits and still decodes |
+| `methods/bspline/actuator.py` | `BSplineTrackingActuator`: upstream's eval-time recipe, and the one place B-spline's actuation differs from every other method here. Arm **kp x2.0** (`rollout_x5_bspline.py:201`, against 1.0 in the non-B-spline `rollout_local_policy.py:269`, so it is a B-spline choice and not their rig default), applied as `kp[:6] *= scale` with **kd passed back untouched** and the gripper excluded (`yam_server.py:390-396`). Constant rather than speed-dependent, relative to base gains so re-application cannot compound, time nominal. PACE and DemoSpeedup both scale kd as `**(exp/2)` chasing critical damping; upstream B-spline does not, so neither does this |
 | `methods/bspline/xvla_action.py` | `ee6d_bspline`, registered in xVLA's own action registry: single-arm ee6d control point in slots 0-9 where its structured loss expects xyz/rot6d/gripper, B-spline knot in slot 10 with a fourth loss term. Needed because xVLA slices its action by hardcoded index, so upstream's knot-first matrix trains a *time* as an x-coordinate |
 | `methods/bspline/processor.py` | `BSplineChunkStep` (`bspline_chunk`) + `BSplineDecodeStep` (`bspline_decode`) + `EpisodeSplines`. Holds every episode's **fit**, not a label per frame (7.7 MB vs 36 MB on pickplace); a sample's matrix is its chunk with the knot column shifted to that frame. Fits once at construction — random sampling means a batch of 32 touches ~32 episodes, so lazy refitting at 1.4 s/fit would cost ~45 s per batch. `transform_features` rewrites the action feature to the matrix's channel count. The decode step is the inverse and is what makes a checkpoint executable: it evaluates the predicted curve at `num_actions` points -- the speed lever, `a_exec(t) = a(nt)`, a decode-time choice needing no retraining -- maps back through the layout, and publishes the realised `bspline_rate` per sample, which varies with the predicted span |
 | `timed.py` | `TimedActions` contract: `dt` per action; `uniform`/`from_speeds`, `timestamps()` (exclusive cumsum, the UR10e's `(pose,t)` view), `duration()`; `DT_KEY` for pipelines |
@@ -114,13 +115,13 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
   `pickplace_diffusion_base` is the first diffusion run to go past a smoke test and
   is in flight now (see below); no diffusion policy has yet reached a checkpoint at
   its full step budget.
-- **The controlled cross-oracle comparison is now running, not yet available.**
-  ACT is trained on stack_cups and xVLA on LIBERO, so their precision fractions
-  (79.6% / 84.1%, episode 0, `rule=mean`) differ by dataset as much as by policy.
-  Comparing oracles properly needs two families trained on one dataset, which is
-  exactly what `run_demospeedup_pickplace.sh` schedules: the ACT half is done
-  (17.1% non-precision) and the diffusion half is training. Until its labelling
-  stage runs, no two oracles have been compared on one dataset.
+- **The controlled cross-oracle comparison exists** (2026-08-30). Both halves of the
+  pickplace 2x2 are labelled from their own family on the *same* 45 episodes: ACT
+  17.1% non-precision, Diffusion 14.7%. That replaces the earlier 79.6% / 84.1%
+  figures, which compared ACT-on-stack_cups against xVLA-on-LIBERO and so differed by
+  dataset as much as by policy. What is still missing is what the difference *means*:
+  neither arm is evaluated, so a 2.4 pp gap in how much of a demonstration each oracle
+  calls non-precision has no success rate attached to it.
 - **LIBERO's labels are the one stage still taken on trust from the fork.**
   `data/labels/xvla_libero10_ee6d/speedup_labels` holds all 400 episodes
   (`episode_<i>.npy` + `entropy_<i>.npy`), produced by the fork's stage-2 run;
@@ -323,25 +324,36 @@ are in-repo, so nothing in the labelling path depends on the fork any more.
 - **Batch 2's 3-seed PACE gate** — parked; upstream xVLA has a known ~10pp task-1
   deficit vs the fork that would confound absolute-SR comparison.
 
-## Experiments state (2026-08-30 ~12:40; diffusion baseline RUNNING)
+## Experiments state (2026-08-30 23:30; pickplace 2x2 complete, GPU idle)
 
 - **LIBERO A/B (xVLA)**: complete. Baseline 92.0% SR / 13.28 s vs DemoSpeedup
   86.5% / 6.99 s = 1.90× at −5.5 pp; task 2 (−30 pp) is the known speed-intolerant
   task. `outputs/eval/ds_libero10_*`.
-- **pickplace ACT: both arms trained, neither evaluated.** 100k × 32 in bf16
-  (`pickplace_act_base` finished 05:27, `pickplace_act_speedup` 11:44), labels from
-  the ACT baseline's own checkpoint (45 episodes, 31178 frames, **17.1%
-  non-precision**, mean fast-run 11.97 frames vs 1.21 if random — real signal, same
-  shape as cups). The retiming reaches ~2.16 raw frames per executed step, which is
-  what the labels imply and is a property of the labels, not a result. There is no
-  score for either arm: the offline evaluator that produced one was rejected as
-  unprincipled (see gaps), and the honest statement is that these checkpoints are
-  waiting on the robot.
-- **pickplace diffusion: baseline in flight.** `pickplace_diffusion_base`
-  (`--policy.n_obs_steps=1`, bf16, 100k × 32) started ~11:45, at ~19k/100k as of
-  12:38, 6.5 step/s, ETA ~16:10. The script then labels from it (`pickplace_dp`) and
-  trains `pickplace_diffusion_speedup`, completing the 2×2 and with it the
-  cross-oracle comparison. Nothing evaluates those arms yet — see gaps.
+- **pickplace 2x2: COMPLETE** (2026-08-30 23:27). All four arms trained to
+  100k x 32 in bf16 on `pickplace_cart7_v2_angleaxis_nogrip`, each labelled by its
+  own policy family, per the parity rule:
+
+  | arm | oracle | non-precision | state |
+  |---|---|---|---|
+  | `pickplace_act_base` | — | — | ✅ 100k |
+  | `pickplace_act_speedup` | ACT (its own baseline) | **17.1%** | ✅ 100k |
+  | `pickplace_diffusion_base` | — | — | ✅ 100k |
+  | `pickplace_diffusion_speedup` | Diffusion (`n_obs_steps=1`) | **14.7%** | ✅ 100k |
+
+  ACT labels: mean fast-run 11.97 frames against 1.21 if random — real signal.
+  Diffusion `pad_mode=hold` throughout, horizon halved 64→32 and n_action_steps
+  32→16. Final speedup-arm loss 0.003.
+  **This is the first controlled cross-oracle comparison in the project**: two policy
+  families labelling the *same* dataset, so 17.1% vs 14.7% differs by oracle and not
+  by task — the confound that made the earlier 79.6% / 84.1% figures uninterpretable.
+  **Nothing is evaluated.** These are real-robot arms and there is no evaluator: no
+  UR10e simulator, and the offline substitute was rejected. All four wait on the
+  robot.
+  One transient failure worth remembering: the first attempt at
+  `pickplace_diffusion_speedup` segfaulted before its first step (17:33, kernel
+  reported an instruction pointer on the stack — native-extension memory corruption,
+  not an OOM; 62 GB RAM with 53 free). It did not reproduce: a 5-step rerun was clean
+  and the full 100k then ran without incident.
 - **stack_cups**: ACT baseline ✅ (`outputs/train/cups_act_base`, 30k), labels ✅
   (12/12, 18.4% non-precision, run-length 13.9 vs 1.23 random), Diffusion baseline
   ❌ not trained. **DemoSpeedup ACT ❌ still not trained**: the 2026-08-29 23:36
@@ -414,3 +426,63 @@ Runtimes for every stage above are tabulated in the README (`## Runtimes`).
   an unbatched action chunk are both 3-D. Reshape against the policy config's
   declared feature shapes, the same way chunk fields come from
   `POLICY_CHUNK_FIELDS`.
+- **A policy reads far less than `input_features` lists, and the difference had to
+  be measured.** LeRobot lists every `observation.*` key as an input
+  (`utils/feature_utils.py:170`) and `make_policy` copies the lot into
+  `cfg.input_features` (`policies/factory.py:333-335`). It does *not* follow that
+  the network reads them, and on 2026-08-31 that distinction was got wrong here
+  before being checked — the entry this replaces claimed a 39k-step ACT baseline
+  had been trained on seven inputs and was void. It had not, and it is not.
+  What the code actually does, verified three ways:
+  * `robot_state_feature` is `ft.type is FeatureType.STATE and ft_name ==
+    OBS_STATE` (`configs/policies.py:133-139`) — an **exact name match**, not
+    "the first STATE feature". ACT and Diffusion then index `batch[OBS_STATE]`
+    directly (`modeling_act.py:415,467`, `modeling_diffusion.py:272`).
+  * the trained weights agree: `cups_merged_act_base`'s
+    `encoder_robot_state_input_proj.weight` is `(512, 6)` — the width of
+    `observation.state` alone, beside four other scalar `observation.*` columns
+    it was never given.
+  * the saved normalizer carries buffers for `frame_index`, `index`,
+    `episode_index`, `task_index` and `timestamp` as well, which on its own
+    disproves "has a normalizer buffer" ⇒ "is a model input". The normalizer is
+    indiscriminate; the policy is not. It also skips any key absent from the
+    observation (`normalize_processor.py:281`, `key in new_observation`), so a
+    checkpoint whose config lists columns the robot does not publish still runs.
+  So the real hazards are narrower, and only two of them bite:
+  1. **an extra camera is consumed.** `image_features` returns *every* VISUAL
+     feature (`configs/policies.py:151-154`), and ACT feeds each one through the
+     backbone and appends its whole feature map to the encoder sequence
+     (`modeling_act.py:472-487`) — on 480x640 that is ~300 more tokens per camera.
+     Not an extra ResNet: ACT shares **one** backbone across every camera
+     (`modeling_act.py:336`, applied in a loop at `:477`), which is upstream's own
+     design — `detr_vae.py:156,209` call `self.backbones[0]` for every `cam_id`
+     under the authors' `# HARDCODED` comment, and only the CNN-MLP *baseline*
+     (`build_cnnmlp`, `:396-398`) builds one backbone per camera. Confirmed against
+     the trained weights: `pickplace_act_base` has 100 `model.backbone.*` tensors
+     and no `backbones.N` key, for two cameras. Note also that the cameras are not
+     distinguished positionally — `encoder_cam_feat_pos_embed` is derived from the
+     feature-map shape, so two 480x640 streams get *identical* position embeddings
+     and the transformer separates them by content alone. Upstream does the same.
+  2. **a substituted `observation.state` is consumed.** The raw UR10e recordings
+     carry a 13-dim joints+cartesian+gripper bundle under that same name; only
+     the width distinguishes it from the 6-dim pose.
+  3. extra *scalar* `observation.*` columns cost dataloader I/O and normalizer
+     buffers and nothing else — hygiene, not correctness.
+  `pace_bench.data.specs` names the inputs per robot, `TRAINING_SETS` maps each
+  dataset an arm trains on to its spec, and `tests/test_dataset_specs.py` checks
+  every one present. It is worth keeping for (1) and (2) and because a dataset
+  that quietly differs from what a run assumes is otherwise invisible — but not
+  on the strength of (3), which is what it was first written for.
+  Standing conventions this leaves intact: a merge **allowlists** rather than
+  filters (`merge_datasets_cart6.build_target_features` names its four features
+  and never looks at the rest, which is why pickplace was never in question);
+  `crop_stalls.py` keeps every column unless `--keep-features` is passed, which
+  happened in 2 of 6 runs; and column edits are cheap while frame edits are not
+  — a dataset is ~98.5% video (cups: 549 MB video against 8.0 MB data), so
+  dropping a column rewrites parquet only and runs in seconds with the videos
+  hardlinked, while removing *frames* re-encodes every stream.
+  **The general lesson, which is the reason this entry is long:** "the config
+  lists it" is not evidence the model uses it. Check the consuming code, or the
+  weight shapes, before calling a run void. Renaming two output directories and
+  writing three tombstones on the strength of a config listing cost more than
+  reading `configs/policies.py:133` would have.

@@ -23,10 +23,11 @@ from collections import deque
 
 import torch
 
+from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
 from pace_bench.methods.bspline.processor import BSplineDecodeStep
 
 
-def attach_bspline(policy, decode: BSplineDecodeStep):
+def attach_bspline(policy, decode: BSplineDecodeStep, actuator: BSplineTrackingActuator | None = None):
     """Make ``policy`` decode its own predictions. Returns it, modified in place.
 
     Args:
@@ -34,12 +35,29 @@ def attach_bspline(policy, decode: BSplineDecodeStep):
             emit B-spline parameters.
         decode: Configured decode step. Its ``num_actions`` decides both how many
             actions each query yields and how fast the curve is traversed.
+        actuator: Stiffens the simulator so it can track waypoints that are further
+            apart. ``None`` still decodes and executes but leaves the plant nominal,
+            which is the action-side-only ablation.
     """
     policy.bspline = decode
+    policy.bspline_actuator = actuator
+    policy.bspline_env = None
     policy.bspline_queue = deque()
     #: Realised rate per query -- source frames advanced per executed action. Varies
     #: with the span the policy predicted, so it is recorded rather than assumed.
     policy.bspline_rate_log = []
+    # The eval runner writes `applied_speeds.json` and summarises it from
+    # `pace_speed_log`. For B-spline the realised rate *is* the applied speed-up, so
+    # the same list serves under both names rather than branching the artifact code.
+    policy.pace_speed_log = policy.bspline_rate_log
+
+    def bind_env(self, vec_env) -> None:
+        """Point the actuator at the vector env this policy is about to drive.
+
+        Needed for the same reason as PACE's: upstream's ``rollout`` gives the policy
+        no access to the environment, so the caller owning both introduces them.
+        """
+        self.bspline_env = vec_env
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, torch.Tensor], **_) -> torch.Tensor:
@@ -49,6 +67,14 @@ def attach_bspline(policy, decode: BSplineDecodeStep):
             # (B, T, ...) -> T entries of (B, ...), the queue upstream's rollout expects.
             self.bspline_queue.extend(actions.transpose(0, 1))
             self.bspline_rate_log.append(float(rates[0]))
+
+        # Re-applied every step, not once at binding: a robosuite reset rebuilds the
+        # robot and its controller, so a one-shot bump vanishes at the first episode
+        # boundary.
+        if self.bspline_actuator is not None and self.bspline_env is not None:
+            for member in self.bspline_env.envs:
+                self.bspline_actuator.apply(member)
+
         return self.bspline_queue.popleft()
 
     original_reset = policy.reset
@@ -57,6 +83,7 @@ def attach_bspline(policy, decode: BSplineDecodeStep):
         self.bspline_queue.clear()
         original_reset()
 
+    policy.bind_env = types.MethodType(bind_env, policy)
     policy.select_action = types.MethodType(select_action, policy)
     policy.reset = types.MethodType(reset, policy)
     return policy

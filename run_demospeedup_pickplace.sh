@@ -2,8 +2,8 @@
 # =============================================================================
 # DemoSpeedup on pickplace_cart7_v2_angleaxis_nogrip (UR10e, 45 eps / 31k frames)
 # =============================================================================
-# The full 2x2: {ACT, Diffusion} x {baseline, DemoSpeedup}, plus one entropy
-# labelling run per policy family.
+# The full 2x3: {ACT, Diffusion} x {baseline, DemoSpeedup, B-spline}, plus one
+# entropy labelling run per policy family.
 #
 #   1. ACT baseline                      chunk 100, 100k steps
 #   2. ACT labels        oracle = arm 1  -> outputs/label/pickplace_act
@@ -12,6 +12,13 @@
 #   5. Diffusion labels  oracle = arm 4  -> outputs/label/pickplace_dp
 #   6. Diffusion DemoSpeedup             horizon 64 -> 32, n_action_steps 32 -> 16,
 #                                        pad_mode=hold
+#   7. ACT B-spline                      chunk 100 -> a 16x11 parameter matrix,
+#                                        no labelling stage
+#   8. Diffusion B-spline                horizon 64 -> the same 16x11 matrix,
+#                                        no labelling stage
+#
+# Arms 7-8 make the two families symmetric: each of ACT and Diffusion now carries
+# all three methods that need weights, and PACE rides arms 1 and 4 at eval time.
 #
 # Everything trains fresh in THIS stack (user decision 2026-08-29): the old
 # Yunfei checkpoint is not used -- as oracle it would label with a policy from a
@@ -78,7 +85,7 @@ DATASET_ROOT=${PICKPLACE_ROOT:-$DATA_ROOT/datasets/real/pickplace_cart7_v2_angle
 # the pruner annotates with PEP 585 generics (list[tuple[...]]) that need 3.9+.
 # Invoked as `python3` it dies on import, and because it runs in the background
 # nothing surfaces that -- the first symptom is a full disk hours later.
-PRUNER=${PACE_PRUNER:-$(dirname "$REPO_ROOT")/prune_checkpoints.py}
+PRUNER=${PACE_PRUNER:-$REPO_ROOT/src/pace_bench/data/prune_checkpoints.py}
 KEEP=2
 [ -f "$PRUNER" ] || echo "WARNING: no pruner at $PRUNER (set PACE_PRUNER); keeping every checkpoint"
 
@@ -183,15 +190,15 @@ print("SIGNAL:", "OK" if mean_run > 3 * expected_random else "SUSPICIOUS - revie
 PYEOF
 }
 
-stage "1/6: ACT baseline (also the ACT arm's labelling oracle)"
+stage "1/8: ACT baseline (also the ACT arm's labelling oracle)"
 train pickplace_act_base act_baseline \
     --policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100 \
     --method.type=none
 
-stage "2/6: ACT entropy labelling (oracle = arm 1)"
+stage "2/8: ACT entropy labelling (oracle = arm 1)"
 label pickplace_act pickplace_act_base pickplace_act_label
 
-stage "3/6: ACT DemoSpeedup (chunk 100 -> 50, masked zero-pad)"
+stage "3/8: ACT DemoSpeedup (chunk 100 -> 50, masked zero-pad)"
 train pickplace_act_speedup act_demospeedup \
     --policy.type=act --policy.chunk_size=100 --policy.n_action_steps=100 \
     --method.type=demospeedup \
@@ -214,23 +221,82 @@ train pickplace_act_speedup act_demospeedup \
 #
 # Note the trade: the wider DP literature conditions on 2 frames, so this is a
 # slightly weaker policy than a stock DP -- upstream's choice, not ours.
-stage "4/6: Diffusion baseline (n_obs_steps=1, so it is also its own oracle)"
+stage "4/8: Diffusion baseline (n_obs_steps=1, so it is also its own oracle)"
 train pickplace_diffusion_base diffusion_baseline \
     --policy.type=diffusion --policy.n_obs_steps=1 \
     --method.type=none
 
-stage "5/6: Diffusion entropy labelling (oracle = arm 4; 100 DDPM steps/chunk, slow)"
+stage "5/8: Diffusion entropy labelling (oracle = arm 4; 100 DDPM steps/chunk, slow)"
 label pickplace_dp pickplace_diffusion_base pickplace_dp_label
 
-stage "6/6: Diffusion DemoSpeedup (horizon 64 -> 32, n_action_steps 32 -> 16, hold-pad)"
+stage "6/8: Diffusion DemoSpeedup (horizon 64 -> 32, n_action_steps 32 -> 16, hold-pad)"
 train pickplace_diffusion_speedup diffusion_demospeedup \
     --policy.type=diffusion --policy.n_obs_steps=1 \
     --method.type=demospeedup \
     --method.labels_path="$REPO_ROOT/outputs/label/pickplace_dp/speedup_labels" \
     --method.pad_mode=hold
 
+# B-spline needs no labelling stage: its targets are a geometric fit of the
+# demonstration, computed in the preprocessor when training starts (~43 s for all
+# 45 episodes, all of them inside max_error=0.01). So this is one arm, not two.
+#
+# chunk_size 10 + 2*degree 3 = a 16-row matrix, and that width -- not chunk_size --
+# is what becomes the policy's chunk and n_action_steps. 16 is upstream's own
+# real-robot configuration (`clean_bspline_policy_*.yaml`, horizon 16). It is also a
+# multiple of 8, so the same setting would suit Diffusion's temporal U-Net if that
+# arm is ever added; the recorded UR10e dataset's 20 (width 26) would not.
+#
+# The budget is the queue's, unchanged: 100k steps at batch 32 in bf16. The chunk
+# geometry differs from the ACT baseline's 100 and cannot not differ -- a B-spline
+# chunk indexes control points, not timesteps -- but parity is the budget, which is
+# what the other six arms hold to as well.
+#
+# num_actions is deliberately not set. It is the speed lever and a *decode-time*
+# choice needing no retraining (the paper's `a_exec(t) = a(nt)`), so it belongs to
+# evaluation, not here; unset it defaults to the matrix width, i.e. roughly
+# demonstration speed.
+#
+# No --dataset.image_transforms: augmentation stays off, as in every other arm.
+# LeRobot's default transform set includes `affine`, and `observation.images.d405`
+# is the wrist camera -- rigidly bolted to the end-effector, so a geometric
+# transform moves pixels without moving the action label and teaches the wrong
+# thing. `pace_bench.data.per_camera_augment` exists for the day that matters and
+# is not wired in.
+stage "7/8: ACT B-spline (16x11 parameter matrix, no labelling stage)"
+train pickplace_act_bspline act_bspline \
+    --policy.type=act \
+    --method.type=bspline --method.layout=cart7 --method.fps=20 \
+    --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
+
+# The same matrix on the other family, and the reason stage 7 fixed chunk_size at
+# 10 rather than the recorded dataset's 20. Diffusion's temporal U-Net halves the
+# horizon once per `down_dims` stage, so the matrix width has to be a multiple of
+# 2**len(down_dims) = 8: width 16 passes, the recorded 26 does not.
+# BSplineMethod.adjust_policy checks it and names the usable chunk sizes, because
+# LeRobot's own check runs in DiffusionConfig.__post_init__ -- before a method ever
+# sees the config -- so without it the run dies mid-forward on a shape mismatch
+# that names neither the horizon nor the method.
+#
+# n_obs_steps=1 carries over from arms 4-6 even though the oracle argument for it
+# does not apply here (B-spline has no labelling stage to be an oracle for). The
+# reason that remains is the one that matters for the comparison: the three
+# Diffusion arms must differ in their method and in nothing else, and it is
+# upstream DemoSpeedup's own setting for this family besides.
+#
+# Everything else is arm 7's, unchanged -- same layout, fps, degree and tolerance,
+# same 100k-step budget, num_actions still unset because the decode rate is an
+# evaluation choice. The two B-spline arms therefore fit identical curves and
+# differ only in the policy regressing them.
+stage "8/8: Diffusion B-spline (the same 16x11 matrix, no labelling stage)"
+train pickplace_diffusion_bspline diffusion_bspline \
+    --policy.type=diffusion --policy.n_obs_steps=1 \
+    --method.type=bspline --method.layout=cart7 --method.fps=20 \
+    --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
+
 echo
-echo "═══════════ PICKPLACE 2x2 QUEUE DONE ═══════════"
-for d in pickplace_act_base pickplace_act_speedup pickplace_diffusion_base pickplace_diffusion_speedup; do
+echo "═══════════ PICKPLACE 2x3 QUEUE DONE ═══════════"
+for d in pickplace_act_base pickplace_act_speedup pickplace_act_bspline \
+         pickplace_diffusion_base pickplace_diffusion_speedup \
+         pickplace_diffusion_bspline; do
     printf '  %-32s %s\n' "$d" "$([ -d "outputs/train/$d/checkpoints/last" ] && echo trained || echo MISSING)"
 done

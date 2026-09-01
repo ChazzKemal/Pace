@@ -502,3 +502,109 @@ class TestAttachBSpline:
         assert policy.resets == 1
         policy.select_action({})
         assert policy.queries == 2, "after a reset the next step must re-query"
+
+
+class TestBSplineActuation:
+    """Upstream's recipe, reproduced: arm kp only, kd and gripper left nominal.
+
+    This is where B-spline differs from both other methods. PACE scales kd as
+    `s**(exp/2)` and DemoSpeedup as `low_v**(exp/2)`, both chasing critical damping;
+    upstream B-spline scales `kp[:6]` and passes the base kd straight back
+    (`update_kp_kd(kp, self._base_kd.copy())`).
+    """
+
+    class FakeController:
+        def __init__(self):
+            self.kp_scale = None
+            self.kd_scale = None
+
+        def update_kp_scale(self, scale):
+            self.kp_scale = scale
+
+        def update_kd_scale(self, scale):
+            self.kd_scale = scale
+
+    class FakeGripper:
+        speed = 0.1
+
+    def handle(self):
+        import types as _types
+
+        controller, gripper = self.FakeController(), self.FakeGripper()
+        robot = _types.SimpleNamespace(controller=controller, gripper=gripper)
+        sim = _types.SimpleNamespace(robots=[robot])
+        return _types.SimpleNamespace(unwrapped=_types.SimpleNamespace(_env=_types.SimpleNamespace(env=sim)))
+
+    def test_it_scales_kp_by_upstreams_default(self):
+        from pace_bench.methods.bspline.actuator import DEFAULT_KP_SCALE, BSplineTrackingActuator
+
+        assert DEFAULT_KP_SCALE == 2.0  # rollout_x5_bspline.py --stiffness-kp-scale
+        handle = self.handle()
+        BSplineTrackingActuator().apply(handle)
+        assert handle.unwrapped._env.env.robots[0].controller.kp_scale == 2.0
+
+    def test_kd_is_left_nominal(self):
+        from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
+
+        handle = self.handle()
+        BSplineTrackingActuator().apply(handle)
+        assert handle.unwrapped._env.env.robots[0].controller.kd_scale is None
+
+    def test_the_gripper_is_left_nominal(self):
+        """DemoSpeedup scales gripper stroke rate; upstream B-spline explicitly does
+        not ("leave the gripper kp (last element) and all kd untouched")."""
+        from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
+
+        handle = self.handle()
+        before = handle.unwrapped._env.env.robots[0].gripper.speed
+        BSplineTrackingActuator().apply(handle)
+        assert handle.unwrapped._env.env.robots[0].gripper.speed == before
+
+    def test_time_runs_nominal(self):
+        """The speed-up is already in the action stream; scaling time too would apply
+        it twice."""
+        from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
+
+        assert BSplineTrackingActuator().apply(self.handle()) == 1.0
+
+    def test_reapplying_does_not_compound(self):
+        """It runs every step, because a robosuite reset rebuilds the controller."""
+        from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
+
+        handle, actuator = self.handle(), BSplineTrackingActuator(kp_scale=3.0)
+        for _ in range(4):
+            actuator.apply(handle)
+        assert handle.unwrapped._env.env.robots[0].controller.kp_scale == 3.0
+
+    def test_the_ablation_leaves_gains_alone(self):
+        from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
+
+        handle = self.handle()
+        BSplineTrackingActuator(disable_kp_scaling=True).apply(handle)
+        assert handle.unwrapped._env.env.robots[0].controller.kp_scale is None
+
+    def test_the_method_carries_upstreams_default(self):
+        assert BSplineMethod().stiffness_kp_scale == 2.0
+
+    def test_the_policy_actuates_every_step_once_bound(self, splines):
+        import types as _types
+
+        from pace_bench.eval.bspline_policy import attach_bspline
+        from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        matrix = torch.from_numpy(splines.parameters(0, 5).astype(np.float32))
+
+        class P:
+            def predict_action_chunk(self, batch):
+                return matrix[None]
+
+            def reset(self):
+                pass
+
+        handle = self.handle()
+        policy = attach_bspline(P(), BSplineDecodeStep(num_actions=4), BSplineTrackingActuator())
+        policy.bind_env(_types.SimpleNamespace(envs=[handle]))
+        for _ in range(4):
+            policy.select_action({})
+        assert handle.unwrapped._env.env.robots[0].controller.kp_scale == 2.0
