@@ -13,7 +13,10 @@
 policy_path: ""             # supply with --policy_path
 env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
 fps: 20.0
-n_action_steps: 32          # executed per query; must be < the policy's chunk_size
+n_action_steps: 50          # executed per query. The bound is LeRobot's own,
+                            # n_action_steps <= horizon - n_obs_steps + 1, which for
+                            # the ACT arms (chunk_size 100, n_obs_steps 1) is 100.
+                            # Fewer replans than 32 did, and more inference budget.
 time_to_home: 2.0           # Homing trajectory duration. crisp_py defaults to 5.0 and
                             # the deploy env YAML does not override it, so every run
                             # spent 5 s here. 2.0 is the value crisp_gym's own
@@ -28,12 +31,12 @@ sender:
   rt_priority: 0
 
 blend:
-  overlap: 8                # hold back 4 frames, fold into the next chunk's head
+  overlap: 4                # hold back 4 frames, fold into the next chunk's head
   mode: hermite             # bridges position AND velocity; linear only averages
   skip: 0
 
 loop:
-  overlap_threshold: 4      # inference budget = 2 x dt_eff = 100 ms at 20 Hz
+  overlap_threshold: 6      # inference budget = 6 x dt_eff = 300 ms at 20 Hz
 
 gains:
   scale_kp: false           # writes controller parameters on the robot; opt in

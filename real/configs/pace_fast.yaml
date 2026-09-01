@@ -8,3 +8,4 @@ method:
   min_speed: 1.0
   clamp_deg: 5.0
   n_lookahead: 2
+  action_stride: 2
