@@ -44,10 +44,25 @@ class EE6DBSplineActionSpace(BaseActionSpace):
     ROT_IDX = (3, 4, 5, 6, 7, 8)
     KNOT_IDX = (10,)
 
-    #: An MSE weight here, not the BCE one it is upstream: slot 9 carries the
-    #: gripper's *control point*, not a 0/1 command (see `postprocess`). Untuned, the
-    #: same status as KNOT_SCALE -- the stock value is inherited from a different loss.
-    GRIPPER_SCALE = 1.0
+    #: 10.0, which is upstream's own value for an MSE gripper -- `agibot_ee6d`
+    #: ("using MSE for all components") sets exactly this, while the 1.0 that stock
+    #: `ee6d` uses belongs to its `BCEWithLogitsLoss`. This space regresses slot 9
+    #: (see `postprocess`), so it inherited the wrong constant along with the wrong
+    #: loss, and the two were fixed a commit apart.
+    #:
+    #: What 1.0 cost, measured on `ds_libero10_bspline` at 20k steps -- each term
+    #: against its own mean-predictor floor, so the scales cancel:
+    #:
+    #:     term       scale   chance    final     R^2
+    #:     position     500    5.746    0.521    0.91
+    #:     knot          10    8.760    1.017    0.88
+    #:     rotate6D      10    0.255    0.081    0.68
+    #:     gripper        1    0.289    0.197    0.32
+    #:
+    #: The least-weighted channel was the least-learned one, by a wide margin, and it
+    #: is the channel that decides whether anything is grasped: the arm scored 0% on
+    #: every LIBERO-10 task while its total loss looked converged.
+    GRIPPER_SCALE = 10.0
     XYZ_SCALE = 500.0
     ROT_SCALE = 10.0
     #: The one weight with no reference to inherit from -- upstream xVLA has no knot
