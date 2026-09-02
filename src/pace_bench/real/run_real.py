@@ -50,9 +50,18 @@ from pace_bench.real.checkpoint import (
     without_postprocessor_steps,
 )
 from pace_bench.real.configs import materialise, resolve_policy_path
-from pace_bench.real.deploy_flags import blend_overlap_for
+from pace_bench.real.deploy_flags import blend_overlap_for, set_flag
 from pace_bench.real.deploy_steps import deploy_steps
 from pace_bench.real.picker import maybe_pick_config
+from pace_bench.real.record import (
+    ChunkClock,
+    PoseSampler,
+    read_cartesian_gains,
+    write_commands,
+    write_inference,
+    write_manifest,
+    write_poses,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +145,42 @@ class GripperConfig:
 
 
 @dataclass
+class RecordConfig:
+    """What this run leaves behind besides the robot having moved.
+
+    Every field here maps onto a crisp_gym deploy flag that already exists and that
+    ``19_deploy_policy.py`` has been using all along -- there are 397 ``trace.npz`` and
+    315 ``.mp4`` files in ``deploy_runs/`` to prove it. None of them were reachable
+    from this runner, because ``deploy_args`` seeds the namespace from the parser's
+    defaults and never overrode them, so every pace_bench run so far recorded timing
+    and nothing else.
+    """
+
+    #: Per-chunk obs->chunk pairing, written as trace.npz. Cheap without images.
+    #: NOTE: what it stores is the chunk as the *policy* emitted it -- capture is at
+    #: loop.py:156, ahead of --stride (253), the method pipeline (351) and the blend
+    #: hold-back (382). For B-spline that means spline parameters, not a trajectory.
+    trace: bool = True
+    #: Capture every Nth chunk only.
+    trace_every: int = 1
+    #: Skip the per-chunk camera JPEGs. On by default: the images dominate both the
+    #: buffer and the shutdown write, and the numerical arrays answer most questions.
+    trace_no_images: bool = True
+    #: Spawn one crisp_video_recorder subprocess per camera.
+    save_video: bool = False
+    #: Which cameras --save-video records; "all" for every camera the env has.
+    video_camera: str = "all"
+    #: Rate the achieved pose is sampled at, Hz. Independent of `fps`: the point is
+    #: to oversample the 20 Hz command stream so the transport lag can be recovered by
+    #: cross-correlation rather than assumed. 0 disables the sampler.
+    pose_rate_hz: float = 50.0
+    #: Suffix appended to the run folder name. Without it the 661 folders under
+    #: deploy_runs/ are bare timestamps, and configs that differ only by method are
+    #: indistinguishable after the fact. Left empty, the task and method are used.
+    run_tag: str = ""
+
+
+@dataclass
 class RealEvalConfig(MethodPipelineConfig):
     """Everything one robot evaluation needs. ``--method.type`` selects the method."""
 
@@ -162,6 +207,7 @@ class RealEvalConfig(MethodPipelineConfig):
     #: baked into the environment, where it would also apply to teleop and recording.
     time_to_home: float | None = None
     gripper: GripperConfig = field(default_factory=GripperConfig)
+    record: RecordConfig = field(default_factory=RecordConfig)
     sender: SenderConfig = field(default_factory=SenderConfig)
     blend: BlendConfig = field(default_factory=BlendConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
@@ -173,6 +219,19 @@ class RealEvalConfig(MethodPipelineConfig):
     @property
     def control_dt(self) -> float:
         return 1.0 / max(self.fps, 1e-9)
+
+
+def _default_run_tag(cfg: RealEvalConfig, method=None) -> str:
+    """A folder name that says what the run was, when the operator did not.
+
+    `phase_video_and_delay` names the run folder for the wall clock and appends
+    `--run-tag` if given. Nothing set it, so all 661 folders under `deploy_runs/` are
+    bare timestamps -- and since a method config differs from its neighbours by little
+    more than `--method.type`, finding last night's bspline run means opening
+    summary.json files one at a time.
+    """
+    parts = [p for p in (cfg.task, getattr(method, "type", None)) if p]
+    return "-".join(parts)
 
 
 def deploy_args(cfg: RealEvalConfig, method=None):
@@ -207,6 +266,19 @@ def deploy_args(cfg: RealEvalConfig, method=None):
     args.yes = True                  # the method and checkpoint were already validated
     if cfg.n_action_steps is not None:
         args.n_act = cfg.n_action_steps
+
+    # Recording flags. Set through `set_flag`, not by assignment: a Namespace accepts
+    # any attribute, so a flag renamed under a crisp_gym pin bump would land on a dead
+    # name and the run would record nothing while reporting that it had. That failure
+    # is invisible until you go looking for the artifacts, which is the one moment it
+    # is too late. (The older assignments above predate `set_flag` and are not yet
+    # guarded this way.)
+    set_flag(args, "record_trace", cfg.record.trace)
+    set_flag(args, "record_trace_every", cfg.record.trace_every)
+    set_flag(args, "record_trace_no_images", cfg.record.trace_no_images)
+    set_flag(args, "save_video", cfg.record.save_video)
+    set_flag(args, "video_camera", cfg.record.video_camera)
+    set_flag(args, "run_tag", cfg.record.run_tag or _default_run_tag(cfg, method))
 
     # Seam blending is vetoed for methods whose chunks do not overlap in motion, so
     # this overrides the config's `blend.overlap` rather than reading it: the veto must
@@ -287,10 +359,20 @@ def build_steps(cfg: RealEvalConfig, method: MethodConfig, dataset_stats=None) -
     )
 
 
-def dump_run_config(cfg: RealEvalConfig) -> Path:
-    """Write a re-parsable record of exactly this run, as run_libero.py does."""
-    cfg.out.mkdir(parents=True, exist_ok=True)
-    path = cfg.out / "run_config.yaml"
+def dump_run_config(cfg: RealEvalConfig, out_dir: Path | None = None) -> Path:
+    """Write a re-parsable record of exactly this run, as run_libero.py does.
+
+    Called twice. The first goes to ``cfg.out``, before the robot is touched, so a
+    launch that dies during bring-up still leaves a record of what was attempted. The
+    second goes into the run folder once ``phase_video_and_delay`` has named it --
+    which is the copy that matters, because ``cfg.out / run_config.yaml`` is a single
+    flat path that the *next* run overwrites. Every one of the 661 folders under
+    ``deploy_runs/`` was written without one, and none of them can now be matched back
+    to the config that produced it.
+    """
+    dest = Path(out_dir) if out_dir is not None else cfg.out
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / "run_config.yaml"
     with open(path, "w") as f:
         # Encoded against RealEvalConfig so the method's choice key is included,
         # which is what makes the file re-parsable with --config_path.
@@ -366,6 +448,8 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     n_obs, n_act = src.n_obs, src.n_act
 
     scaler = sender = rec = None
+    sampler = clock = None
+    video_recorders: list = []
     started_mono = time.monotonic()
     try:
         _t = time.monotonic()
@@ -373,13 +457,36 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         logger.info("phase_home took %.1f s", time.monotonic() - _t)
         session.phase_switch_controller(env, args)
         scaler = session.phase_scaler(env, args)
+        # Read once, after the controller is live and before anything moves. This is
+        # the coefficient that turns the tracking error recorded below into a force:
+        # joint efforts never reach this process (crisp_py drops msg.effort), but the
+        # controller is an impedance law, so wrench = kp * (target - achieved).
+        gains = read_cartesian_gains(env, args.controller_node, scaler=scaler)
         session.phase_pin_gripper_speed(env, args)
         session.phase_gil_hygiene(env, args)
         quiesce_target_pose_timer(env)
         ch = session.phase_publish_channels(env, args)
         sender, q = session.phase_start_sender(env, args, scaler, ch)
-        started_at, out_dir, recorders = session.phase_video_and_delay(
+        # When each inference ran and when each target was due, measured at the two
+        # points they pass through this process. `timeline.py` can reconstruct both
+        # from trace.npz and the anchoring rule, but this makes them a recorded fact
+        # -- including for the last chunk, whose chunks.csv row is never written
+        # when the run ends by Ctrl-C mid-drain.
+        clock = ChunkClock(q)
+        clock.wrap_source(src)
+        clock.tap_queue(q)
+        # Ground truth on its own clock. NOT hung off the sender's `state_capture_fn`:
+        # under the C++ sender that hook fires inside `put()`, which the producer calls
+        # K times back-to-back per chunk, so it would sample the arm in bursts rather
+        # than at a steady rate. See `record`'s module docstring.
+        if cfg.record.pose_rate_hz > 0:
+            sampler = PoseSampler(env, cfg.record.pose_rate_hz)
+            sampler.start()
+        started_at, out_dir, video_recorders = session.phase_video_and_delay(
             env, args, n_obs, n_act)
+        write_manifest(out_dir, cfg=cfg, method=method, deployed_path=pretrained,
+                       gains=gains)
+        dump_run_config(cfg, out_dir)
 
         rec = RunRecord(out_dir=out_dir, run_started_at=started_at, duration_s=0.0,
                         n_obs=n_obs, n_act=n_act, chunk_count=0, stopped_by="init")
@@ -405,6 +512,22 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                 q.put(None); sender.join(5.0)
             except Exception:
                 logger.exception("sender shutdown")
+        # Stop the video recorders once the arm has stopped, not before -- the drain
+        # above is still real motion. `stop()` sends SIGINT, which is what makes the
+        # mp4 valid: rclcpp shutdown -> node destructor -> cv::VideoWriter release ->
+        # trailer flushed (video.py:93-99). This runner spawned them and never stopped
+        # them; the subprocesses outlived the run and their mp4s had no trailer. It
+        # went unnoticed only because `save_video` was unreachable from here, so the
+        # list was always empty -- exposing the flag is what makes the leak real.
+        for vrec in video_recorders:
+            try:
+                vrec.stop(timeout=5.0)
+            except Exception:
+                logger.exception("video recorder shutdown")
+        if video_recorders:
+            logger.info("stopped %d video recorder(s)", len(video_recorders))
+        if sampler is not None:
+            sampler.stop()
         # Report from the finally, not the try: a run normally ends by Ctrl-C or by
         # an exception out of the loop, and the record is most wanted exactly then.
         if rec is not None:
@@ -414,6 +537,20 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                 write_run_artifacts(rec, args, sender, None)
             except Exception:
                 logger.exception("failed to write run artifacts")
+            # The sender has been accumulating one row per queued target into
+            # `_replay_log` for the whole run, and crisp_gym writes it nowhere.
+            try:
+                write_commands(getattr(sender, "_replay_log", []) or [], rec.out_dir,
+                               clock)
+                write_inference(clock, rec.out_dir)
+                if sampler is not None:
+                    write_poses(sampler.rows, rec.out_dir)
+            except Exception:
+                logger.exception("failed to write commands.csv / poses.csv")
+        if sampler is not None and sampler.n_errors:
+            logger.warning(
+                "achieved-pose read failed on %d sample(s) of %d; poses.csv is "
+                "correspondingly sparse", sampler.n_errors, len(sampler.rows))
         try:
             src.shutdown()
         except Exception:

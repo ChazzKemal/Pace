@@ -35,11 +35,11 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-CACHE = Path.home() / ".cache/huggingface/lerobot/deploy_runs"
+# The row-fate and chunk-boundary logic lives with the timeline so the HTML report
+# and this script cannot disagree about which rows executed or when.
+from pace_bench.real.timeline import chunk_bounds, load_run, reconstruct, stages
 
-#: A push gap this large means a new chunk was handed to the queue. Commands inside a
-#: chunk are pushed in a batch microseconds apart, so any real gap is a chunk boundary.
-CHUNK_GAP_S = 0.2
+CACHE = Path.home() / ".cache/huggingface/lerobot/deploy_runs"
 
 
 def newest_run() -> Path:
@@ -65,54 +65,6 @@ def read_csv(path: Path) -> dict[str, np.ndarray] | None:
             # chunks.csv carries text columns too (anchor_mode); keep them readable
             # rather than dropping the whole file over one non-numeric field.
             out[k] = np.array(col, dtype=object)
-    return out
-
-
-def chunk_bounds(cmd: dict) -> list[tuple[int, int]]:
-    """(start, end) into the command rows for each chunk, from the push-time gaps."""
-    t = cmd["t_wall"]
-    gaps = np.where(np.diff(t) > CHUNK_GAP_S)[0]
-    starts = np.r_[0, gaps + 1]
-    ends = np.r_[gaps + 1, len(t)]
-    return list(zip(starts.tolist(), ends.tolist()))
-
-
-def stages(predicted: np.ndarray, rc: dict) -> dict:
-    """Row indices surviving each stage, for one predicted chunk.
-
-    Order mirrors the deploy path: crisp_gym strides (loop.stride) before the method
-    pipeline, PACE strides and then truncates inside PaceSpeedStep, and the loop holds
-    back the blend overlap last.
-    """
-    import torch
-
-    from pace_bench.methods.config import PaceMethod
-    from pace_bench.methods.pace.speed import stride_indices
-
-    n = predicted.shape[0]
-    m = rc.get("method", {})
-    out = {"predicted": list(range(n))}
-
-    if m.get("type") != "pace":
-        out["strided"] = out["predicted"]
-        out["exempt_added"] = []
-    else:
-        cfg = PaceMethod(**{k: v for k, v in m.items() if k != "type"}).to_pace_config()
-        t = torch.from_numpy(predicted[None]).float()
-        kept = stride_indices(t, cfg)
-        plain = list(range(0, n, max(1, cfg.action_stride)))
-        out["strided"] = kept
-        out["exempt_added"] = sorted(set(kept) - set(plain))
-
-    n_act = rc.get("n_action_steps")
-    kept = out["strided"]
-    out["after_truncate"] = kept[:n_act] if n_act else kept
-    out["truncated_off"] = kept[len(out["after_truncate"]):]
-
-    overlap = int((rc.get("blend") or {}).get("overlap", 0) or 0)
-    hold = min(overlap, len(out["after_truncate"]) // 2) if overlap else 0
-    out["emitted"] = out["after_truncate"][:len(out["after_truncate"]) - hold] if hold else out["after_truncate"]
-    out["blend_held"] = out["after_truncate"][len(out["emitted"]):]
     return out
 
 
@@ -585,32 +537,26 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
         sys.exit(f"{run.name}: {d.missing}")
     n = d.n_chunks
 
-    # Per-chunk execution windows, and where the next inference began inside each.
-    ch = read_csv(run / "chunks.csv") or {}
-    q_inf = ch.get("q_before_inf")
-    synth = ch.get("synth_ms")
+    # Per-chunk execution windows and the inference that produced each, on one clock.
+    # Earlier versions placed the inference mark at (K - q_before_inf) / K through the
+    # previous chunk -- a fraction inferred from the queue depth. The timeline puts it
+    # where it actually ran (trace stamp minus synth_ms, or inference.csv when the run
+    # recorded one), which is what makes it comparable with the achieved poses.
+    tl = reconstruct(load_run(run))
+    base = tl.chunks[0].t_first if tl.chunks else float(d.cmd["t_wall"][0])
     spans = []
-    for i in range(n):
-        lo, hi = d.bounds[i]
-        dur = float((d.cmd["cycles"][lo:hi] * d.control_dt).sum())
-        t0 = float(d.cmd["t_wall"][lo] - d.cmd["t_wall"][0])
-        k = hi - lo
-        # Inference is requested when the queue drains to q_before_inf items, so the
-        # fraction of this chunk already consumed by then is (K - q) / K.
-        spans.append({"t0": t0, "dur": dur, "k": k,
-                      "synth": float(synth[i]) / 1000.0 if synth is not None and i < len(synth) else 0.0})
-
-    # `q_before_inf[i]` is the queue depth when the inference that produced chunk i was
-    # requested -- and at that moment the queue holds what is left of chunk i-1. So the
-    # mark belongs on the PREVIOUS chunk's bar, at (K_prev - q) / K_prev through it.
-    # Chunk 0 has no predecessor: its inference runs during bring-up, before anything
-    # executes, which is also why its queue depth is 0 rather than overlap_threshold.
-    for i in range(n):
-        prev = i - 1
-        if q_inf is None or i >= len(q_inf) or prev < 0 or not spans[prev]["k"]:
-            spans[i]["asked_at"] = None
-            continue
-        spans[i]["asked_at"] = 1.0 - float(q_inf[i]) / spans[prev]["k"]
+    for c in tl.chunks[:n]:
+        spans.append({
+            "t0": c.t_first - base, "dur": c.exec_s, "k": c.n_rows,
+            "synth": (c.inference_ms or 0.0) / 1000.0,
+            "req": None if c.t_req is None else c.t_req - base,
+            "bridge": (c.t_first_policy - c.t_first
+                       if c.n_bridge and c.t_first_policy is not None else 0.0),
+            "lat": c.latency_first_ms, "q": c.q_logged,
+        })
+    while len(spans) < n:
+        spans.append({"t0": 0.0, "dur": 0.0, "k": 0, "synth": 0.0, "req": None,
+                      "bridge": 0.0, "lat": None, "q": None})
 
     fig = plt.figure(figsize=(15.5, 9))
     fig.canvas.manager.set_window_title(run.name)
@@ -659,9 +605,8 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
             # Window from the RECONSTRUCTED execution times, not t_wall: every command
             # in a chunk carries the same push timestamp, so a t_wall window over one
             # chunk has zero width and selects no poses at all.
-            base = d.cmd["t_wall"][0] + d.lag_s
-            t0 = base + spans[lo_c]["t0"]
-            t1 = base + spans[hi_c]["t0"] + spans[hi_c]["dur"]
+            t0 = base + d.lag_s + spans[lo_c]["t0"]
+            t1 = base + d.lag_s + spans[hi_c]["t0"] + spans[hi_c]["dur"]
             w = (d.poses["t_wall"] >= t0) & (d.poses["t_wall"] <= t1)
             if w.any():
                 ax3.plot(d.poses["ach_x"][w], d.poses["ach_y"][w], d.poses["ach_z"][w],
@@ -675,29 +620,27 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
             state["cb"].update_normal(sc)
         state["cb"].set_label(label)
 
-        # When the next chunk was inferred, as a fraction of this one.
+        # When each chunk was inferred, against what was executing at the time.
         axi.clear()
         for i in range(lo_c, hi_c + 1):
             sp = spans[i]
             axi.barh(i, sp["dur"], left=sp["t0"], height=0.6, color="#2a78d6", alpha=.30)
-        # Each mark sits on the chunk that was RUNNING while the next one was inferred.
-        for i in range(max(lo_c, 1), hi_c + 1):
-            sp, prev = spans[i], spans[i - 1]
-            if sp["asked_at"] is None or not (lo_c <= i - 1 <= hi_c):
+            if sp["bridge"]:
+                axi.barh(i, sp["bridge"], left=sp["t0"], height=0.6, color="#eda100")
+        # Inference is drawn on the row of the chunk it PRODUCED, at the time it ran --
+        # which lands over the previous chunk's bar. That overlap is the picture: the
+        # model is done long before the queue ahead of the new chunk has drained.
+        for i in range(lo_c, hi_c + 1):
+            sp = spans[i]
+            if sp["req"] is None:
                 continue
-            x = prev["t0"] + sp["asked_at"] * prev["dur"]
-            axi.plot([x, x], [i - 1 - .34, i - 1 + .34], color="#b5533a", lw=1.6)
-            axi.barh(i - 1, max(sp["synth"], 0.02), left=x, height=0.6, color="#b5533a")
-        if lo_c == 0 and spans[0]["synth"]:
-            axi.barh(0, spans[0]["synth"], left=-spans[0]["synth"], height=0.6,
-                     color="#eda100")
-            axi.text(-spans[0]["synth"], -0.75,
-                     f"bring-up inference {spans[0]['synth'] * 1000:.0f} ms",
-                     fontsize=7, color="#8a6300")
+            axi.barh(i, max(sp["synth"], 0.02), left=sp["req"], height=0.6, color="#b5533a")
+            axi.plot([sp["req"], sp["req"]], [i - .42, i + .42], color="#b5533a", lw=1.4)
         axi.set_xlabel("seconds into the run", fontsize=8, labelpad=1)
         axi.set_ylabel("chunk", fontsize=8)
         axi.tick_params(labelsize=7.5)
-        axi.set_title("execution window; mark = next chunk's inference", fontsize=9, loc="left")
+        axi.set_title("blue: executing   orange: seam bridge   red: inference that produced the row",
+                      fontsize=8.5, loc="left")
         axi.grid(alpha=0.15, axis="x")
         axi.set_yticks(range(lo_c, hi_c + 1) if hi_c - lo_c < 12
                        else range(lo_c, hi_c + 1, max(1, (hi_c - lo_c) // 10)))
@@ -748,8 +691,12 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
         axt.clear(); axt.axis("off")
         gen = sum(len(d.chunks[i]) for i in range(lo_c, hi_c + 1)) if d.chunks is not None else 0
         used = len(rows)
-        fr = [sp["asked_at"] for sp in spans[lo_c:hi_c + 1] if sp.get("asked_at") is not None]
-        sy = [sp["synth"] * 1000 for sp in spans[lo_c:hi_c + 1]]
+        # Chunk 0 is inferred during bring-up, before anything executes; its latency
+        # is the startup delay, so the medians start at chunk 1.
+        lat = [sp["lat"] for sp in spans[max(lo_c, 1):hi_c + 1] if sp["lat"] is not None]
+        qs = [sp["q"] for sp in spans[max(lo_c, 1):hi_c + 1] if sp["q"] is not None]
+        sy = [sp["synth"] * 1000 for sp in spans[max(lo_c, 1):hi_c + 1] if sp["synth"]]
+        frame_ms = tl.median_frame_ms
         txt = [
             f"chunks {lo_c}-{hi_c}   method={d.rc.get('method', {}).get('type')}",
             "",
@@ -757,12 +704,13 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
             f"  actions executed       {used:>6}   ({used / max(gen, 1):.0%} of generated)",
             f"  dropped before sending {gen - used:>6}   striding, n_action_steps, blend",
             "",
-            "NEXT CHUNK INFERRED",
-            f"  requested {np.median(fr):.0%} through the PREVIOUS chunk" if fr else "  (no chunks.csv)",
-            f"  took {np.median(sy):.0f} ms median, {max(sy):.0f} ms worst"
-            f"   (chunk 0 is cold-start: {spans[0]['synth'] * 1000:.0f} ms)" if sy else "",
-            f"  leaving {(1 - np.median(fr)) * np.median([s['dur'] for s in spans]) * 1000:.0f} ms"
-            " of queue as margin" if fr else "",
+            "OBSERVATION TO EXECUTION",
+            (f"  first row published {np.median(lat):.0f} ms after the obs"
+             f"   ({np.median(lat) / frame_ms:.1f} frames of {frame_ms:.0f} ms)") if lat
+            else "  (no inference timing in this run)",
+            (f"  = {int(np.median(qs))} queued at request + 1 in flight + 1 anchor step") if qs else "",
+            (f"  inference {np.median(sy):.0f} ms median, {max(sy):.0f} ms worst -- hidden"
+             " inside the queue") if sy else "",
             "",
             *describe(d, lo_c)[2:8],
         ]
