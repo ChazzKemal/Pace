@@ -10,6 +10,7 @@ Every end-to-end run in this project, and the SLURM jobs that submit them.
 | LIBERO-10 evaluation | `eval_demospeedup_libero10.sh` | `slurm_eval_libero10.sbatch` | 2 rollout sweeps |
 | stack cups, unmerged | `run_demospeedup_stackcups.sh` | — (superseded, see below) | 3 training |
 | chain behind a running job | `wait_then_run_cups_merged.sh` | — (workstation only) | — |
+| both UR10e queues, back to back | `run_real_queues.sh` | — (workstation only) | whatever is left in the two queues above |
 
 The jobs are thin: a `#SBATCH` header, then they run the queue script beside them.
 Every skip guard, every training argument and all the reasoning behind them stays in
