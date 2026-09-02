@@ -137,10 +137,12 @@ class GainsConfig:
     scale_kp: bool = False
     kp_exp: float = 2.0
     kd_exp: float = 1.0
-    #: Damping relative to the controller's auto value 2*sqrt(kp). 1.0 leaves the
-    #: axes on auto. Above 1, an explicit kd = kd_ratio * 2*sqrt(kp_eff) is pushed
-    #: with kp at every segment (kd_exp is then kp_exp/2 so it tracks sqrt(kp_eff)),
-    #: and auto is restored at teardown. See pace_bench.real.gains.
+    #: Explicit damping at s = 1, pushed as kd_base * s**kd_exp with kp at every
+    #: segment; auto is restored at teardown. 0 leaves the axes on the controller's
+    #: auto value 2*sqrt(kp) (40 for kp 400). See pace_bench.real.gains.
+    kd_base: float = 0.0
+    #: Alternative to kd_base: damping as a multiple of auto, tracking sqrt(kp_eff).
+    #: Ignored when kd_base is set. 1.0 = auto.
     kd_ratio: float = 1.0
 
 
@@ -516,7 +518,8 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         # joint efforts never reach this process (crisp_py drops msg.effort), but the
         # controller is an impedance law, so wrench = kp * (target - achieved).
         gains = read_cartesian_gains(env, args.controller_node, scaler=scaler)
-        damping = raise_damping(scaler, kd_ratio=cfg.gains.kd_ratio, kp_exp=cfg.gains.kp_exp)
+        damping = raise_damping(scaler, kp_exp=cfg.gains.kp_exp, kd_exp=cfg.gains.kd_exp,
+                                kd_base=cfg.gains.kd_base, kd_ratio=cfg.gains.kd_ratio)
         session.phase_pin_gripper_speed(env, args)
         session.phase_gil_hygiene(env, args)
         quiesce_target_pose_timer(env)

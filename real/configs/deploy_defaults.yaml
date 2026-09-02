@@ -108,14 +108,17 @@ gains:
                             # (d = 2*sqrt(k)), so damping follows the new stiffness on
                             # its own and the scaler deliberately never pushes a d for
                             # an auto axis.
-  kd_ratio: 1.5             # Damping relative to the controller's auto d = 2*sqrt(k).
-                            # kd reads 0 on this rig (auto), which is critical damping
-                            # for a unit mass; with the arm's ~15 kg effective mass the
-                            # ratio is nearer 0.25, and the 17:39 run overshot the
-                            # commanded z by 35 mm after a fast seam. 1.5 pushes an
-                            # explicit kd = 1.5 * 2*sqrt(kp_eff) alongside kp at every
-                            # segment, so it still rises with speed, and puts auto
-                            # back at teardown. 1.0 leaves the axes on auto.
+  kd_base: 100              # Explicit damping at s = 1, in the controller's units
+                            # (kd reads 0 on this rig = auto, d = 2*sqrt(k) = 40 for
+                            # kp 400: critical damping for a unit mass, a ratio nearer
+                            # 0.25 for the arm's ~15 kg -- the 17:39 run overshot the
+                            # commanded z by 35 mm after a fast seam). 100 against
+                            # kp 400 is a ratio of about 0.65. Pushed with kp at
+                            # every segment as kd_base * s_eff**kd_exp; auto is put
+                            # back at teardown. 0 leaves the axes on auto.
+  kd_exp: 1.5               # kd grows faster than kp (kp_exp 1.0) as the method
+                            # speeds up, so the damping ratio rises with speed rather
+                            # than falling as it would on auto.
 
 gripper:
   hold_s: 0.7               # Splice mode. After the SENT gripper command closes, every

@@ -190,6 +190,15 @@ class TestRaiseDamping:
         kd, auto = sc.restored
         assert all(v == 0.0 for v in kd.values()) and all(auto.values())
 
+    def test_kd_base_is_pushed_verbatim_and_scales_with_kd_exp(self):
+        from pace_bench.real.gains import raise_damping
+        sc = FakeScaler(kp=400.0)
+        out = raise_damping(sc, kp_exp=1.0, kd_exp=1.5, kd_base=100.0, kd_ratio=1.5)
+        assert out["kd_base"] == 100.0 and out["kd_ratio"] is None
+        assert all(v == pytest.approx(100.0) for v in sc._original_kd.values())
+        assert sc.kd_exp == pytest.approx(1.5)          # kd_base wins over kd_ratio
+        assert not any(sc._kd_is_auto.values())
+
     def test_ratio_one_or_no_scaler_changes_nothing(self):
         from pace_bench.real.gains import raise_damping
         sc = FakeScaler()
