@@ -4,8 +4,8 @@ _include: deploy_defaults.yaml
 
 method:
   type: pace
-  max_speed: 2.0            # also sizes the gain scaler when gains.scale_kp is on
-  min_speed: 1.0
+  max_speed: 1.5            # also sizes the gain scaler when gains.scale_kp is on
+  min_speed: 1.5
   clamp_deg: 5.0
   n_lookahead: 2
   action_stride: 2          # execute every 2nd predicted action...
@@ -17,4 +17,5 @@ method:
                             # predicted, and has to get the repayment arithmetic right
                             # on a run 2-4 rows long. adaptive_stride does NOT cover
                             # this: it restores steps where the path bends, and a
-                            # grasp on a straight approach has no bend.
+                            # grasp on a straight approach has no bend. 
+  gripper_stride_eps: 0.10
