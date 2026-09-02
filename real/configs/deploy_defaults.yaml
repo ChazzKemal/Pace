@@ -62,13 +62,6 @@ loop:
                             # acceleration on the worst ones at one row of latency.
   bridge: cubic             # C1 with both tangents per executed row. quintic (C2)
                             # is available and did not beat it on the replay.
-  bridge_step_mm: 15        # The bridge grows past bridge_rows (up to bridge_rows_max)
-                            # so no row of it steps more than this. On the 17:39 run
-                            # seams of 100-196 mm were crossed in 4 rows -- 60 mm per
-                            # row, 1.8 m/s -- and the arm overshot the stop. 15 mm/row
-                            # is ~0.45 m/s at 34 ms rows; the run's normal p95 step
-                            # was 25.
-  bridge_rows_max: 12
 
 gains:
   scale_kp: true            # Scale controller stiffness with the speed the method

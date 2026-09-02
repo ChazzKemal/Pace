@@ -51,11 +51,6 @@ class PaceSpeed:
             dataset_stats=dataset_stats, control_dt=control_dt,
         )
 
-    @property
-    def last_keep(self) -> list[int] | None:
-        """Raw frame index of each output row of the last ``__call__``."""
-        return getattr(self.step, "last_keep", None)
-
     def __call__(self, chunk: Chunk) -> Chunk:
         # PaceSpeedStep is defined on (B, T, D); the deploy loop carries one chunk.
         t = torch.from_numpy(np.ascontiguousarray(chunk.actions)).unsqueeze(0)

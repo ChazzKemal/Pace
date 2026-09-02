@@ -107,9 +107,6 @@ class PaceSpeedStep(ProcessorStep):
         abs_actions = unnormalize_actions(actions, self.dataset_stats)
 
         keep = stride_indices(abs_actions, self.config)
-        # Remembered for the deploy loop, which needs each executed row's raw frame
-        # for the grasp hold and would otherwise recompute this per chunk.
-        self.last_keep = keep
         if len(keep) != actions.shape[1]:
             actions = actions[:, keep, :]
             abs_actions = abs_actions[:, keep, :]
