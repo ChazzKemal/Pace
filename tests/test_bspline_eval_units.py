@@ -133,3 +133,28 @@ class TestKnotScaleSurvivesSerialisation:
 
         step = BSplineDecodeStep(num_actions=8, arrangement="knot_first20")
         assert step.arrangement.knot_scale == 1.0
+
+
+class TestBothStepsRoundTripTheirConfig:
+    """A `get_config` key with no matching `__init__` parameter makes every checkpoint
+    the run writes unloadable, and the run itself never notices -- training builds its
+    steps from the config object, not from the checkpoint. Found the hard way: adding
+    `knot_scale` to `BSplineDecodeStep.get_config` by string replacement also added it
+    to `BSplineChunkStep.get_config`, whose `__init__` did not take it, so
+    `ds_libero10_bspline_v2` trained for 5000 steps writing checkpoints that raised
+    `unexpected keyword argument 'knot_scale'` on load.
+    """
+
+    def test_every_key_a_step_serialises_can_be_passed_back(self):
+        from pace_bench.methods.bspline.processor import BSplineChunkStep, BSplineDecodeStep
+
+        for step in (
+            BSplineChunkStep(arrangement="xvla_ee6d20", knot_scale=0.05, degree=3),
+            BSplineDecodeStep(num_actions=16, arrangement="xvla_ee6d20", knot_scale=0.05),
+            BSplineDecodeStep(num_actions=8, arrangement="knot_first20", layout="ee6d20"),
+        ):
+            config = step.get_config()
+            rebuilt = type(step)(**config)  # the exact call lerobot's registry makes
+            assert rebuilt.get_config() == config, (
+                f"{type(step).__name__} does not survive its own config"
+            )

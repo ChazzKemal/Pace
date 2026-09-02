@@ -134,12 +134,18 @@ class BSplineChunkStep(ProcessorStep):
         relative_knots: bool = False,
         degree: int = DEGREE,
         arrangement: MatrixArrangement | None = None,
+        knot_scale: float | None = None,
     ):
         self.splines = splines
         self.episode_starts = episode_starts or {}
         self.relative_knots = relative_knots
         self.degree = degree
         self.arrangement = coerce_arrangement(arrangement)
+        # Same reason as `BSplineDecodeStep`: a name does not carry `knot_scale`, which
+        # is 1/fps. `emit` multiplies the knot column by it, so a step rebuilt from the
+        # name alone would write knots twenty times too large into the training target.
+        if knot_scale is not None and self.arrangement is not None:
+            self.arrangement = replace(self.arrangement, knot_scale=float(knot_scale))
 
     @property
     def channels(self) -> int:
