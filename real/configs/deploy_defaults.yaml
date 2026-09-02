@@ -48,7 +48,13 @@ loop:
                             # Both senders work -- nothing is ever retracted from the
                             # sender, only from the plan -- so sender.cpp is the A/B
                             # switch; frames.csv slack/overshoot decide.
-  replan_every: 12          # H: rows between observations.
+  replan_every: 0           # H: rows between observations. 0 = auto, which is
+                            # n_action_steps - commit_rows - 1 (30 here): every
+                            # kept row past the discarded head is executed -- 1
+                            # committed, bridge_rows of bridge, the rest verbatim --
+                            # and the next splice lands where the plan ends. A
+                            # positive value replans sooner: fresher observations,
+                            # but bridge_rows of every H rows are interpolation.
   commit_rows: 1            # h_c: rows after the observation never retracted -- the
                             # one the sender is holding. 2 only delays the seam.
   bridge_rows: 4            # h_b: bridge length. Replay of the recorded predictions:

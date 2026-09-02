@@ -137,12 +137,19 @@ class TestFeedRules:
         assert list(rows_to_push(2, 1)) == [2]         # row 1 published: hand over 2
         assert list(rows_to_push(3, 1)) == []
 
-    def test_replan_on_the_period_or_when_the_plan_runs_short(self):
-        cfg = SpliceConfig(replan_every=12, bridge_rows=4)
-        assert needs_replan(0, -10**9, 0, 0, cfg)             # nothing yet
-        assert not needs_replan(5, 0, 7, 32, cfg)
-        assert needs_replan(12, 0, 14, 32, cfg)                # H rows since the last obs
-        assert needs_replan(5, 0, 26, 32, cfg)                 # only 6 rows left < h_b + 3
+    def test_replan_on_the_period_or_when_the_plan_runs_out(self):
+        assert needs_replan(0, -10**9, 0, 0, 12)               # nothing yet
+        assert not needs_replan(5, 0, 7, 32, 12)
+        assert needs_replan(12, 0, 14, 32, 12)                 # H rows since the last obs
+        assert not needs_replan(5, 0, 31, 32, 12)              # one row still to push
+        assert needs_replan(5, 0, 32, 32, 12)                  # nothing left to push
+
+    def test_auto_period_uses_every_kept_row(self):
+        # 32 kept: 1 committed + 4 bridge + 26 verbatim = 31 rows after the obs, so the
+        # next observation is at row 30 and its splice (30 + 2) lands where the plan ends.
+        assert SpliceConfig(replan_every=0, commit_rows=1).resolve_replan_every(32) == 30
+        assert SpliceConfig(replan_every=0, commit_rows=2).resolve_replan_every(32) == 29
+        assert SpliceConfig(replan_every=12).resolve_replan_every(32) == 12
 
 
 # --------------------------------------------------------------------- the loop
@@ -239,7 +246,8 @@ def _stub_crisp_gym(monkeypatch, dt):
 
 class TestLoop:
     @pytest.mark.parametrize("sender_cls", [FakeSender, FakeCppSender])
-    def test_one_row_ahead_and_time_aligned_splices(self, monkeypatch, sender_cls):
+    @pytest.mark.parametrize("period", [12, 0])     # explicit, and auto (= 32 - 1 - 1 = 30)
+    def test_one_row_ahead_and_time_aligned_splices(self, monkeypatch, sender_cls, period):
         from pace_bench.real.splice_loop import published_count, run_splice_loop
 
         dt = 0.02
@@ -263,26 +271,27 @@ class TestLoop:
             stage_samples_producer={k: [] for k in
                                     ("get_obs_ms", "synth_ms", "build_ms", "push_ms", "drain_wait_ms")},
             pred_dt_samples=[], trace_records=[], chunk_rows=[])
-        args = types.SimpleNamespace(max_chunks=5, record_trace=True, record_trace_every=1)
+        args = types.SimpleNamespace(max_chunks=5 if period else 3, record_trace=True, record_trace_every=1)
         env = types.SimpleNamespace(action_to_rotation=None)
-        cfg = SpliceConfig(replan_every=12, commit_rows=1, bridge_rows=4)
+        cfg = SpliceConfig(replan_every=period, commit_rows=1, bridge_rows=4)
+        H = cfg.resolve_replan_every(32)
         splices = run_splice_loop(
             env=env, chunk_source=Source(), q=q, sender=sender, args=args, rec=rec,
             dt_base=dt, obs_schema=None, gripper_enabled=False, gripper_unnormalize_fn=None,
-            obs_buf=[], last_obs=[None], steps=[], cfg=cfg)
+            obs_buf=[], last_obs=[None], steps=[], cfg=cfg, n_action_steps=32)
         # let the sender drain what was queued, then stop it
         time.sleep(0.2)
         q.put(None)
         sender.join(1.0)
 
-        assert rec.chunk_count == 5 and rec.stopped_by == "normal"
-        assert len(splices) == 5 and splices[0].n_bridge == 0
+        assert rec.chunk_count == args.max_chunks and rec.stopped_by == "normal"
+        assert len(splices) == args.max_chunks and splices[0].n_bridge == 0
         for s in splices[1:]:
             assert s.k_s == s.k_obs + 2, s                    # commit_rows = 1: obs row + held row
             assert s.i_star == s.k_s + 4 - s.k_obs            # time-aligned entry
             assert s.n_bridge == 4 and not s.late
         # Replans came on the period, measured in published rows.
-        assert all(b - a >= 12 for a, b in itertools.pairwise(requests))
+        assert all(b - a >= H for a, b in itertools.pairwise(requests))
         # The sender published frame indices in order with no gaps, and never had more
         # than one row queued behind the one it was holding.
         idx = [p[0] for p in sender.published]

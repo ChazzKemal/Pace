@@ -118,7 +118,7 @@ class LoopConfig:
     #: row behind a `bridge_rows` cubic. `overlap_threshold` and `blend.*` are unused
     #: there. "queue" is crisp_gym's producer loop unchanged.
     mode: str = "splice"
-    replan_every: int = 12
+    replan_every: int = 0      # 0 = n_action_steps - commit_rows - 1
     commit_rows: int = 1
     bridge_rows: int = 4
     bridge: str = "cubic"
@@ -526,7 +526,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                                  commit_rows=cfg.loop.commit_rows,
                                  bridge_rows=cfg.loop.bridge_rows,
                                  bridge=cfg.loop.bridge),
-                **common)
+                n_action_steps=n_act, **common)
         elif cfg.loop.mode == "queue":
             run_producer_loop(lookbehind_buf=deque(maxlen=8), **common)
         else:

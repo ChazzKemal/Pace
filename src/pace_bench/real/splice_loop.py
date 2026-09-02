@@ -72,8 +72,17 @@ GRIP = 6
 class SpliceConfig:
     """The three numbers that define the seam, plus the polynomial."""
 
-    #: H -- executed rows between observations.
-    replan_every: int = 12
+    #: H -- executed rows between observations. 0 = auto: as late as the kept plan
+    #: allows, ``n_action_steps - commit_rows - 1``, so every kept row past the
+    #: discarded head is executed (1 committed + h_b bridge + the rest verbatim) and
+    #: the next splice lands exactly where the plan ends. A positive value replans
+    #: sooner, trading bridge rows (h_b per seam) for fresher observations.
+    replan_every: int = 0
+
+    def resolve_replan_every(self, n_action_steps: int) -> int:
+        if self.replan_every > 0:
+            return int(self.replan_every)
+        return max(int(n_action_steps) - max(int(self.commit_rows), 1) - 1, 1)
     #: h_c -- rows after the observation that are never retracted. 1 = the row the
     #: sender is holding. 2 leaves one more queued, which only delays the seam.
     commit_rows: int = 1
@@ -242,19 +251,24 @@ def rows_to_push(k_next: int, executing: int, commit_rows: int = 1) -> range:
 
 
 def needs_replan(executing: int, k_obs_last: int, k_next: int, n_plan: int,
-                 cfg: SpliceConfig) -> bool:
-    """Replan on the period -- or earlier if the plan is about to run out."""
+                 replan_every: int) -> bool:
+    """Replan on the period -- or now, if the plan has nothing left to push.
+
+    The old plan only has to reach the splice row: everything from there on is
+    replaced, so there is no need for slack beyond "the next row exists". In auto
+    mode the period lands exactly on that boundary and both conditions coincide.
+    """
     if n_plan == 0:
         return True
-    if executing - k_obs_last >= cfg.replan_every:
+    if executing - k_obs_last >= replan_every:
         return True
-    return (n_plan - k_next) < cfg.bridge_rows + 3
+    return (n_plan - k_next) < 1
 
 
 def run_splice_loop(
     *, env, chunk_source, q, sender, args, rec, dt_base: float, obs_schema,
     gripper_enabled: bool, gripper_unnormalize_fn, obs_buf, last_obs, steps,
-    cfg: SpliceConfig,
+    cfg: SpliceConfig, n_action_steps: int | None = None,
 ) -> list[Splice]:
     """Run until ``--max-chunks``, the source is exhausted, or Ctrl-C.
 
@@ -303,8 +317,11 @@ def run_splice_loop(
             action=act32[0], deadline_mono=deadline, frame_idx=k,
             s_eff=float(s_eff[0]), cycles=int(cycles[0])))
 
-    logger.info("Phase 4: splice loop -- H=%d rows, h_c=%d, h_b=%d, %s bridge. Ctrl-C to stop.",
-                cfg.replan_every, cfg.commit_rows, cfg.bridge_rows, cfg.bridge)
+    # The period is resolved from the kept-plan length; n_action_steps comes from the
+    # source when the caller knows it, else from the first pipeline output.
+    H = cfg.resolve_replan_every(n_action_steps) if n_action_steps else None
+    logger.info("Phase 4: splice loop -- H=%s rows, h_c=%d, h_b=%d, %s bridge. Ctrl-C to stop.",
+                H if H is not None else "auto", cfg.commit_rows, cfg.bridge_rows, cfg.bridge)
     try:
         while True:
             if args.max_chunks > 0 and chunk_count >= args.max_chunks:
@@ -320,7 +337,7 @@ def run_splice_loop(
             # it; the first chunk has no edge to wait for.
             edge = p != p_prev
             p_prev = p
-            if not needs_replan(p, k_obs_last, k_next, len(plan), cfg) or not (edge or len(plan) == 0):
+            if not needs_replan(p, k_obs_last, k_next, len(plan), H or 10**9) or not (edge or len(plan) == 0):
                 time.sleep(0.001)
                 continue
 
@@ -365,6 +382,9 @@ def run_splice_loop(
 
             _t = time.perf_counter()
             out = run_pipeline(Chunk.nominal(chunk.astype(np.float64)), steps)
+            if H is None:
+                H = cfg.resolve_replan_every(len(out.actions))
+                logger.info("replan_every resolved to %d rows from a %d-row plan", H, len(out.actions))
             # The splice row is the first row not yet handed to the sender. The feed
             # rule makes that k_obs + commit_rows + 1 on every chunk but the first
             # (which has no plan to splice into), and nothing is pushed while
