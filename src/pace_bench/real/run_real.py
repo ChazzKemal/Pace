@@ -520,7 +520,8 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
             "obs_buf": buf, "last_obs": last, "steps": steps,
         }
         if cfg.loop.mode == "splice":
-            splices = run_splice_loop(
+            run_splice_loop(
+                splices=splices,
                 sender=sender,
                 cfg=SpliceConfig(replan_every=cfg.loop.replan_every,
                                  commit_rows=cfg.loop.commit_rows,

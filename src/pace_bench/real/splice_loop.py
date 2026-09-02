@@ -268,13 +268,14 @@ def needs_replan(executing: int, k_obs_last: int, k_next: int, n_plan: int,
 def run_splice_loop(
     *, env, chunk_source, q, sender, args, rec, dt_base: float, obs_schema,
     gripper_enabled: bool, gripper_unnormalize_fn, obs_buf, last_obs, steps,
-    cfg: SpliceConfig, n_action_steps: int | None = None,
+    cfg: SpliceConfig, n_action_steps: int | None = None, splices: list | None = None,
 ) -> list[Splice]:
     """Run until ``--max-chunks``, the source is exhausted, or Ctrl-C.
 
     Telemetry goes on the caller's ``RunRecord`` with the same keys the producer loop
-    writes, so ``summary.json``/``chunks.csv``/``trace.npz`` keep their shape; the
-    per-splice facts are returned for ``splices.csv``.
+    writes, so ``summary.json``/``chunks.csv``/``trace.npz`` keep their shape. The
+    per-splice facts are appended to ``splices`` as they happen -- pass the list in,
+    as with ``rec``: a run normally ends by Ctrl-C, which unwinds past the return.
     """
     from crisp_gym.deploy.obs import _get_obs_zerofill
     from crisp_gym.deploy.pipeline import Chunk, run_pipeline
@@ -283,7 +284,8 @@ def run_splice_loop(
     from crisp_gym.deploy.timing import _pre_compute_chunk_arrays, build_speed_queue_arrays
 
     plan = Plan()
-    splices: list[Splice] = []
+    if splices is None:
+        splices = []
     k_next = 0
     k_obs_last = -10**9
     deadline: float | None = None
