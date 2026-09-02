@@ -225,11 +225,12 @@ run ds_libero10_speedup xvla_demospeedup \
 # for the fit and restores them on decode. num_actions stays unset -- the decode
 # rate is an evaluation choice.
 # NEW OUTPUT DIR, deliberately. `ds_libero10_bspline` is the arm trained before
-# 2026-09-02, when `ee6d_bspline.preprocess` still zeroed slot 9 of the noisy action
-# -- so its gripper control point was unlearnable and it scored 0% on every LIBERO-10
-# task. That checkpoint is kept rather than overwritten: it is the evidence for the
-# bug, and reusing the name would have the queue's skip guard walk straight past it.
-run ds_libero10_bspline_nomask xvla_bspline_nomask \
+# 2026-09-02, when GRIPPER_SCALE was still 1.0 -- a BCE weight left on an MSE channel,
+# which left the gripper control point at R^2 0.32 while every other channel reached
+# 0.68-0.91, and the arm scored 0% on every LIBERO-10 task. That checkpoint is kept
+# rather than overwritten: it is the evidence, and reusing the name would have the
+# queue's skip guard walk straight past it.
+run ds_libero10_bspline_v2 xvla_bspline_v2 \
     --policy.action_mode=ee6d_bspline \
     --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
     --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
