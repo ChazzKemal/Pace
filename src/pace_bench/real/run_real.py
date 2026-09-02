@@ -22,6 +22,7 @@ the one property no offline check covers.
 # "must be called with a dataclass type or instance". The `X | None` syntax used
 # below needs no future import on Python 3.10+.
 import logging
+import signal
 import sys
 import time
 from collections import deque
@@ -464,6 +465,51 @@ def _raw_index_fn(steps):
     return lambda chunk: pace.last_keep
 
 
+def own_the_interrupt() -> None:
+    """Make Ctrl-C reach *this* code while ROS is still alive.
+
+    ``rclpy.init()`` (inside ``build_env``) installs its own SIGINT/SIGTERM
+    handlers, which invalidate the ROS context the instant the signal arrives.
+    Our ``finally`` then runs against a dead context, and ``ReplayScaler.restore``
+    -- which needs one SetParameters round-trip -- can only log that it CANNOT
+    restore kp/kd. Every Ctrl-C'd run since gain scaling went on has left the
+    controller at the last scaled gains, which is what the next run then tunes
+    against.
+
+    So once the env is up, rclpy's handlers are removed and Python's default one
+    put back: SIGINT raises KeyboardInterrupt in the main thread (inside the loop,
+    where the ``finally`` handles it), and SIGTERM does the same. The context is
+    shut down by us, last, after the gains are back.
+    """
+    try:
+        from rclpy.signals import uninstall_signal_handlers
+        uninstall_signal_handlers()
+    except Exception:
+        logger.exception("could not remove rclpy's signal handlers; a Ctrl-C may "
+                         "leave scaled gains on the controller")
+        return
+
+    def _term(signum, frame):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, _term)
+    logger.info("Ctrl-C now raises KeyboardInterrupt here; rclpy stays up until teardown")
+
+
+def restore_gains(scaler) -> None:
+    """Put kp/kd back, loudly if it cannot be done."""
+    if scaler is None:
+        return
+    try:
+        if not rclpy.ok():
+            logger.error("rclpy context is down; kp/kd CANNOT be restored from here. "
+                         "Run `ros2 run tum09_custom reset_crisp_kp.py` before the next run.")
+        scaler.restore()
+    except Exception:
+        logger.exception("gain restore failed; run `ros2 run tum09_custom reset_crisp_kp.py`")
+
+
 def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     """Bring the robot up, run the method's pipeline, tear down.
 
@@ -475,6 +521,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     _t = time.monotonic()
     env = session.build_env(args)
     logger.info("build_env took %.1f s", time.monotonic() - _t)
+    own_the_interrupt()
 
     if cfg.time_to_home is not None:
         was = getattr(env.robot.config, "time_to_home", None)
@@ -589,6 +636,9 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                 q.put(None); sender.join(5.0)
             except Exception:
                 logger.exception("sender shutdown")
+        # Gains go back the moment the arm has stopped -- before the artifact
+        # writes, which can take seconds, and long before rclpy.shutdown().
+        restore_gains(scaler)
         # Stop the video recorders once the arm has stopped, not before -- the drain
         # above is still real motion. `stop()` sends SIGINT, which is what makes the
         # mp4 valid: rclcpp shutdown -> node destructor -> cv::VideoWriter release ->
@@ -633,8 +683,6 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
             src.shutdown()
         except Exception:
             logger.exception("chunk source shutdown")
-        if scaler is not None:
-            scaler.restore()
         try:
             env.close()
         except Exception:
