@@ -128,8 +128,19 @@ class EE6DBSplineActionSpace(BaseActionSpace):
         sigmoid could not express one: fitting a binary 0/1 channel overshoots to
         [-0.366, +1.366] at every edge (measured across libero_10_ee6d, 8.8% of
         coefficients beyond [-0.05, 1.05]), and that overshoot is precisely what
-        encodes the edge. Clipping the gripper to [0, 1] is a *decode*-side decision,
-        made in `BSplineDecodeStep` on executable actions, not on coefficients.
+        encodes the edge.
+
+        Nothing clips the decoded gripper either, and it would not help if it did.
+        `LiberoProcessorStep`'s sibling `xvla_rotation_6d_to_axis_angle` already ends
+        with ``np.where(g > 0.5, 1.0, -1.0)``, so the env takes a hard decision at 0.5
+        regardless -- clipping to [0, 1] moves nothing across that line. What matters is
+        that the *regression* put the curve confidently on one side of it: measured on
+        the GRIPPER_SCALE=1.0 arm, the decoded gripper hovered at mean +0.426 and the
+        threshold turned that hover into a flip every 6.1 executed steps, against one
+        every 76.1 frames in the demonstrations. That is the whole reason this channel's
+        weight is not a free parameter -- it is the only one the env passes through a
+        hard nonlinearity, so a regression error that would be negligible anywhere else
+        becomes categorical here.
         """
         return action
 
