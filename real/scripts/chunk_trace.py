@@ -597,15 +597,27 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
         k = hi - lo
         # Inference is requested when the queue drains to q_before_inf items, so the
         # fraction of this chunk already consumed by then is (K - q) / K.
-        frac = (1.0 - float(q_inf[i]) / k) if q_inf is not None and i < len(q_inf) and k else None
-        spans.append({"t0": t0, "dur": dur, "k": k, "frac": frac,
+        spans.append({"t0": t0, "dur": dur, "k": k,
                       "synth": float(synth[i]) / 1000.0 if synth is not None and i < len(synth) else 0.0})
+
+    # `q_before_inf[i]` is the queue depth when the inference that produced chunk i was
+    # requested -- and at that moment the queue holds what is left of chunk i-1. So the
+    # mark belongs on the PREVIOUS chunk's bar, at (K_prev - q) / K_prev through it.
+    # Chunk 0 has no predecessor: its inference runs during bring-up, before anything
+    # executes, which is also why its queue depth is 0 rather than overlap_threshold.
+    for i in range(n):
+        prev = i - 1
+        if q_inf is None or i >= len(q_inf) or prev < 0 or not spans[prev]["k"]:
+            spans[i]["asked_at"] = None
+            continue
+        spans[i]["asked_at"] = 1.0 - float(q_inf[i]) / spans[prev]["k"]
 
     fig = plt.figure(figsize=(15.5, 9))
     fig.canvas.manager.set_window_title(run.name)
     ax3 = fig.add_axes([0.01, 0.26, 0.50, 0.68], projection="3d")
-    axi = fig.add_axes([0.58, 0.60, 0.40, 0.33])
-    axt = fig.add_axes([0.58, 0.24, 0.40, 0.30]); axt.axis("off")
+    axi = fig.add_axes([0.58, 0.76, 0.40, 0.17])
+    axf = fig.add_axes([0.58, 0.615, 0.40, 0.05])
+    axt = fig.add_axes([0.58, 0.17, 0.40, 0.35]); axt.axis("off")
     ax_rs = fig.add_axes([0.08, 0.13, 0.44, 0.03])
     ax_rb = fig.add_axes([0.60, 0.06, 0.13, 0.13])
     init = (start, start) if start is not None and 0 <= start < n else (0, max(n - 1, 1))
@@ -668,21 +680,64 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
         for i in range(lo_c, hi_c + 1):
             sp = spans[i]
             axi.barh(i, sp["dur"], left=sp["t0"], height=0.6, color="#2a78d6", alpha=.30)
-            if sp["frac"] is not None:
-                x = sp["t0"] + sp["frac"] * sp["dur"]
-                axi.plot([x, x], [i - .34, i + .34], color="#b5533a", lw=1.6)
-                axi.barh(i, max(sp["synth"], 0.02), left=x, height=0.6, color="#b5533a")
-        axi.set_xlabel("seconds into the run"); axi.set_ylabel("chunk")
-        axi.set_title("execution window, and when the next chunk was inferred", fontsize=10)
+        # Each mark sits on the chunk that was RUNNING while the next one was inferred.
+        for i in range(max(lo_c, 1), hi_c + 1):
+            sp, prev = spans[i], spans[i - 1]
+            if sp["asked_at"] is None or not (lo_c <= i - 1 <= hi_c):
+                continue
+            x = prev["t0"] + sp["asked_at"] * prev["dur"]
+            axi.plot([x, x], [i - 1 - .34, i - 1 + .34], color="#b5533a", lw=1.6)
+            axi.barh(i - 1, max(sp["synth"], 0.02), left=x, height=0.6, color="#b5533a")
+        if lo_c == 0 and spans[0]["synth"]:
+            axi.barh(0, spans[0]["synth"], left=-spans[0]["synth"], height=0.6,
+                     color="#eda100")
+            axi.text(-spans[0]["synth"], -0.75,
+                     f"bring-up inference {spans[0]['synth'] * 1000:.0f} ms",
+                     fontsize=7, color="#8a6300")
+        axi.set_xlabel("seconds into the run", fontsize=8, labelpad=1)
+        axi.set_ylabel("chunk", fontsize=8)
+        axi.tick_params(labelsize=7.5)
+        axi.set_title("execution window; mark = next chunk's inference", fontsize=9, loc="left")
         axi.grid(alpha=0.15, axis="x")
         axi.set_yticks(range(lo_c, hi_c + 1) if hi_c - lo_c < 12
                        else range(lo_c, hi_c + 1, max(1, (hi_c - lo_c) // 10)))
         axi.set_ylim(hi_c + 0.6, lo_c - 0.6)
 
+        # What became of each predicted row, for the first chunk in view.
+        axf.clear()
+        st = stages(d.chunks[lo_c], d.rc)
+        npred = len(st["predicted"])
+        fate = np.zeros(npred, dtype=int)
+        for i in st["strided"]:
+            fate[i] = 1
+        for i in st["exempt_added"]:
+            fate[i] = 2
+        for i in st["truncated_off"]:
+            fate[i] = 3
+        for i in st["blend_held"]:
+            fate[i] = 4
+        palette = ("#d8dde2", "#2a78d6", "#eb6834", "#9aa4ad", "#eda100")
+        axf.bar(np.arange(npred), np.ones(npred), width=1.0,
+                color=[palette[f] for f in fate], linewidth=0)
+        axf.set_xlim(-0.5, npred - 0.5); axf.set_ylim(0, 1)
+        axf.set_yticks([]); axf.tick_params(labelsize=7)
+        axf.set_xlabel("predicted row index", fontsize=7.5, labelpad=1)
+        n_ex = len(st["exempt_added"])
+        axf.set_title(
+            f"chunk {lo_c}: what became of each predicted row"
+            + (f"   —   gripper exemption held {n_ex} rows "
+               f"({n_ex / max(npred, 1):.0%} of the chunk)" if n_ex else ""),
+            fontsize=8.5, loc="left")
+        for c, lab in zip(palette, ("dropped by stride", "executed", "gripper exemption",
+                                    "cut by n_action_steps", "held for blend")):
+            axf.bar([np.nan], [np.nan], color=c, label=lab)
+        axf.legend(loc="upper center", bbox_to_anchor=(0.5, -1.55), ncol=5,
+                   frameon=False, fontsize=6.8, handlelength=1.1, columnspacing=1.1)
+
         axt.clear(); axt.axis("off")
         gen = sum(len(d.chunks[i]) for i in range(lo_c, hi_c + 1)) if d.chunks is not None else 0
         used = len(rows)
-        fr = [sp["frac"] for sp in spans[lo_c:hi_c + 1] if sp["frac"] is not None]
+        fr = [sp["asked_at"] for sp in spans[lo_c:hi_c + 1] if sp.get("asked_at") is not None]
         sy = [sp["synth"] * 1000 for sp in spans[lo_c:hi_c + 1]]
         txt = [
             f"chunks {lo_c}-{hi_c}   method={d.rc.get('method', {}).get('type')}",
@@ -692,8 +747,9 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
             f"  dropped before sending {gen - used:>6}   striding, n_action_steps, blend",
             "",
             "NEXT CHUNK INFERRED",
-            f"  after {np.median(fr):.0%} of the current chunk had run" if fr else "  (no chunks.csv)",
-            f"  inference took {np.median(sy):.0f} ms median, {max(sy):.0f} ms worst" if sy else "",
+            f"  requested {np.median(fr):.0%} through the PREVIOUS chunk" if fr else "  (no chunks.csv)",
+            f"  took {np.median(sy):.0f} ms median, {max(sy):.0f} ms worst"
+            f"   (chunk 0 is cold-start: {spans[0]['synth'] * 1000:.0f} ms)" if sy else "",
             f"  leaving {(1 - np.median(fr)) * np.median([s['dur'] for s in spans]) * 1000:.0f} ms"
             " of queue as margin" if fr else "",
             "",
