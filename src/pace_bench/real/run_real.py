@@ -144,7 +144,14 @@ class GripperConfig:
     """
 
     #: Frames held at nominal speed after an open->close edge (`pace`, `none`).
+    #: Queue mode only; the splice loop uses `hold_s`.
     slowdown_frames: int = 5
+    #: Seconds of demo time the arm runs at demo cadence after the *sent* gripper
+    #: command closes, and how far past a predicted gripper movement PACE keeps
+    #: every frame instead of striding. One number for one physical fact: the jaws
+    #: need >= 0.57 s at the driver maximum. The 17:00 run on 2026-09-02 had 250 ms
+    #: of hold against that stroke and resumed 2.9x while the cup was still open.
+    hold_s: float = 0.7
     #: Gripper channel is inverted in some recordings.
     invert: bool = False
     #: Rows each gripper-motion row is repeated for (`bspline`). B-spline compresses
@@ -362,6 +369,15 @@ def resolve_method(cfg: RealEvalConfig) -> MethodConfig:
 
 def build_steps(cfg: RealEvalConfig, method: MethodConfig, dataset_stats=None) -> list:
     """The deploy pipeline this run will hand to crisp_gym's producer loop."""
+    if cfg.gripper.hold_s > 0 and hasattr(method, "gripper_stride_exempt_frames"):
+        # The stride exemption and the grasp hold describe the same stroke, so they
+        # are sized from the same number; otherwise strided rows land inside the
+        # hold and "demo cadence" becomes 100 ms rows.
+        frames = round(cfg.gripper.hold_s * cfg.fps)
+        if method.gripper_stride_exempt_frames != frames:
+            logger.info("gripper_stride_exempt_frames %d -> %d (gripper.hold_s=%.2f s at %g fps)",
+                        method.gripper_stride_exempt_frames, frames, cfg.gripper.hold_s, cfg.fps)
+            method.gripper_stride_exempt_frames = frames
     return deploy_steps(
         method, args=deploy_args(cfg, method),
         n_action_steps=cfg.n_action_steps,
@@ -418,6 +434,25 @@ def quiesce_target_pose_timer(env) -> None:
     if cancelled:
         time.sleep(2.0 / max(robot.config.publish_frequency, 1.0))
     logger.info("target_pose timer(s) cancelled before handover: %d", cancelled)
+
+
+def _raw_index_fn(method):
+    """Which raw frame each pipeline output row came from, for the grasp hold.
+
+    PACE strides, so its output rows map to raw frames through `stride_indices` --
+    the same call `PaceSpeed.plan` makes, on the same config, so the two agree row
+    for row. Every other method keeps the demo cadence and needs no map.
+    """
+    if getattr(method, "type", None) != "pace":
+        return None
+    import numpy as np
+    import torch
+
+    from pace_bench.methods.pace.speed import stride_indices
+
+    pc = method.to_pace_config()
+    return lambda chunk: stride_indices(
+        torch.from_numpy(np.ascontiguousarray(chunk, dtype=np.float32))[None], pc)
 
 
 def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
@@ -526,8 +561,10 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                 cfg=SpliceConfig(replan_every=cfg.loop.replan_every,
                                  commit_rows=cfg.loop.commit_rows,
                                  bridge_rows=cfg.loop.bridge_rows,
-                                 bridge=cfg.loop.bridge),
-                n_action_steps=n_act, **common)
+                                 bridge=cfg.loop.bridge,
+                                 hold_s=cfg.gripper.hold_s, fps=cfg.fps,
+                                 grip_invert=cfg.gripper.invert),
+                n_action_steps=n_act, raw_index_fn=_raw_index_fn(method), **common)
         elif cfg.loop.mode == "queue":
             run_producer_loop(lookbehind_buf=deque(maxlen=8), **common)
         else:

@@ -92,6 +92,15 @@ class SpliceConfig:
     bridge_rows: int = 4
     #: "cubic" (C¹, tangents in per-row units) or "quintic" (C²).
     bridge: str = "cubic"
+    #: Grasp hold: for this many seconds of demo time after the *sent* gripper
+    #: command crosses to closed, every row dwells at demo cadence -- 50 ms per raw
+    #: frame it covers. Sized to the jaw stroke, not to a frame count; the same value
+    #: sizes the stride exemption so the rows inside the hold are one frame each.
+    hold_s: float = 0.7
+    #: Demo frame rate; hold_s is measured in demo frames of ``1 / fps``.
+    fps: float = 20.0
+    #: Gripper channel inverted (1 = closed) in this checkpoint's convention.
+    grip_invert: bool = False
 
 
 def cubic_bridge(p0, v0, p1, v1, n: int) -> np.ndarray:
@@ -155,12 +164,17 @@ class Plan:
 
     actions: list[np.ndarray] = field(default_factory=list)
     speeds: list[float] = field(default_factory=list)
+    #: Raw (demo) frames each row advances: 1 for a kept-every-frame row, 2 for a
+    #: strided one, fractional for a bridge row (the frames it spans over its rows).
+    #: The grasp hold turns this into a dwell.
+    spans: list[float] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.actions)
 
     def splice(self, k_s: int, new_actions: np.ndarray, new_speeds: np.ndarray, *,
-               k_obs: int, cfg: SpliceConfig, chunk: int = 0) -> Splice:
+               k_obs: int, cfg: SpliceConfig, chunk: int = 0,
+               raw_index=None) -> Splice:
         """Replace everything from row ``k_s`` on with a bridge into the new chunk.
 
         Output row ``i`` of the pipeline is the policy's prediction for executed row
@@ -179,8 +193,13 @@ class Plan:
         i_s = k_s - k_obs                       # first output row not yet spoken for
         if i_s < 0:
             raise ValueError(f"splice row {k_s} precedes the observation row {k_obs}")
+        raw = (np.asarray(raw_index, dtype=float)[:len(new_actions)] if raw_index is not None
+               else np.arange(len(new_actions), dtype=float))
+        if len(raw) != len(new_actions):
+            raise ValueError(f"raw_index has {len(raw)} entries for {len(new_actions)} rows")
+        step = np.diff(raw, append=raw[-1] + (raw[-1] - raw[-2] if len(raw) > 1 else 1.0))
         retracted = max(len(self.actions) - k_s, 0)
-        del self.actions[k_s:], self.speeds[k_s:]
+        del self.actions[k_s:], self.speeds[k_s:], self.spans[k_s:]
         if len(self.actions) != k_s:
             raise ValueError(f"plan has {len(self.actions)} rows; cannot splice at {k_s}")
 
@@ -211,10 +230,51 @@ class Plan:
         self.actions.extend(np.asarray(r, dtype=np.float64) for r in added)
         self.speeds.extend(float(s) for s in new_speeds[i_s:i_s + len(bridge)])
         self.speeds.extend(float(s) for s in new_speeds[i_star:])
-        assert len(self.speeds) == len(self.actions)
+        if len(bridge):
+            # The bridge covers raw[i*] - raw[i_s] frames over h_b rows.
+            self.spans.extend([max(float(raw[i_star] - raw[i_s]) / len(bridge), 1e-3)] * len(bridge))
+        self.spans.extend(float(max(v, 1e-3)) for v in step[i_star:])
+        assert len(self.speeds) == len(self.actions) == len(self.spans)
         return Splice(chunk=chunk, k_obs=k_obs, k_s=k_s, i_star=int(i_star),
                       n_bridge=len(bridge), gap_mm=gap, rows_retracted=retracted,
                       rows_added=len(added))
+
+
+class GraspHold:
+    """Demo cadence for ``hold_frames`` raw frames after the sent command closes.
+
+    Keyed on the gripper value the loop is about to push -- not on any chunk's
+    rows -- so it sees every grasp exactly once, whichever chunk predicted it and
+    whether the rows are bridge or verbatim, and it carries across a splice. Same
+    close convention as crisp_gym's ``GripperCloseWindow``: below 0.5 is closed,
+    after the optional inversion; edge-triggered on open -> closed, so staying
+    closed never re-arms it.
+
+    ``step`` returns a speed *cap*: ``1 / span`` makes a row dwell ``span x dt_base``
+    -- 50 ms for a one-frame row, 100 ms for a strided one, in between for a bridge
+    row. With the stride exemption sized to the same window every row inside the
+    hold is one frame and the cap is simply 1.0.
+    """
+
+    def __init__(self, hold_frames: float, *, invert: bool = False) -> None:
+        self.hold_frames = float(hold_frames)
+        self.invert = bool(invert)
+        self.remaining = 0.0
+        self.prev_closed: bool | None = None
+        self.n_holds = 0
+
+    def step(self, grip: float, span: float) -> float | None:
+        g = 1.0 - float(grip) if self.invert else float(grip)
+        closed = g < 0.5
+        if closed and self.prev_closed is False and self.hold_frames > 0:
+            self.remaining = self.hold_frames
+            self.n_holds += 1
+        self.prev_closed = closed
+        if self.remaining <= 0:
+            return None
+        span = max(float(span), 1e-3)
+        self.remaining -= span
+        return 1.0 / span
 
 
 def published_count(sender) -> int:
@@ -269,6 +329,7 @@ def run_splice_loop(
     *, env, chunk_source, q, sender, args, rec, dt_base: float, obs_schema,
     gripper_enabled: bool, gripper_unnormalize_fn, obs_buf, last_obs, steps,
     cfg: SpliceConfig, n_action_steps: int | None = None, splices: list | None = None,
+    raw_index_fn=None,
 ) -> list[Splice]:
     """Run until ``--max-chunks``, the source is exhausted, or Ctrl-C.
 
@@ -276,6 +337,10 @@ def run_splice_loop(
     writes, so ``summary.json``/``chunks.csv``/``trace.npz`` keep their shape. The
     per-splice facts are appended to ``splices`` as they happen -- pass the list in,
     as with ``rec``: a run normally ends by Ctrl-C, which unwinds past the return.
+
+    ``raw_index_fn(chunk) -> list[int]`` says which raw frame each pipeline output
+    row came from (PACE's ``stride_indices``); without it every row counts as one
+    frame, which is right for methods that do not stride.
     """
     from crisp_gym.deploy.obs import _get_obs_zerofill
     from crisp_gym.deploy.pipeline import Chunk, run_pipeline
@@ -286,6 +351,7 @@ def run_splice_loop(
     plan = Plan()
     if splices is None:
         splices = []
+    hold = GraspHold(cfg.hold_s * cfg.fps, invert=cfg.grip_invert)
     k_next = 0
     k_obs_last = -10**9
     deadline: float | None = None
@@ -302,8 +368,16 @@ def run_splice_loop(
     def push(k: int) -> None:
         nonlocal deadline
         row = plan.actions[k][None, :]
+        speed = plan.speeds[k]
+        n_before = hold.n_holds
+        cap = hold.step(row[0, GRIP], plan.spans[k])
+        if cap is not None:
+            speed = min(speed, cap)
+        if hold.n_holds != n_before:
+            logger.info("grasp hold: close command at row %d, demo cadence for %.2f s",
+                        k, cfg.hold_s)
         cycles, dt_eff, s_eff = build_speed_queue_arrays(
-            np.array([plan.speeds[k]]), dt_base, 1, retime=True)
+            np.array([speed]), dt_base, 1, retime=True)
         xyz, quat, grip, act32 = _pre_compute_chunk_arrays(
             row, args=args, gripper_enabled=gripper_enabled,
             gripper_unnormalize_fn=gripper_unnormalize_fn,
@@ -394,7 +468,8 @@ def run_splice_loop(
             # sender is then waiting in get() for exactly this row.
             k_s = k_next
             info = plan.splice(k_s, out.actions, out.speeds, k_obs=k_obs, cfg=cfg,
-                               chunk=chunk_count - 1)
+                               chunk=chunk_count - 1,
+                               raw_index=raw_index_fn(chunk) if raw_index_fn else None)
             build_ms = (time.perf_counter() - _t) * 1000.0
             stages["build_ms"].append(build_ms)
             stages["push_ms"].append(0.0)

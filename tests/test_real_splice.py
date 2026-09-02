@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from pace_bench.real.splice_loop import (
+    GraspHold,
     Plan,
     SpliceConfig,
     cubic_bridge,
@@ -128,6 +129,57 @@ class TestPlanSplice:
             plan.splice(3, line([0, 0, 0], [1, 0, 0], 8), np.ones(8), k_obs=5, cfg=self.cfg)
 
 
+class TestSpans:
+    cfg = SpliceConfig(commit_rows=1, bridge_rows=4, bridge="cubic")
+
+    def test_rows_carry_the_raw_frames_they_advance(self):
+        plan = Plan()
+        raw0 = list(range(0, 64, 2))
+        plan.splice(0, line([0, 0, 0], [1, 0, 0], 32), np.ones(32), k_obs=0, cfg=self.cfg, raw_index=raw0)
+        assert plan.spans[:3] == [2.0, 2.0, 2.0]
+        # A chunk whose exemption kept raw 4..11 every frame: kept = 0,2,4,5,...,11,12,14,...
+        raw1 = [0, 2] + list(range(4, 12)) + list(range(12, 12 + 2 * 22, 2))
+        info = plan.splice(12, line([0, 0, 0], [1, 0, 0], 32), np.ones(32), k_obs=10, cfg=self.cfg, raw_index=raw1)
+        # bridge rows 12..15 span raw[i*=6]=8 minus raw[i_s=2]=4 over 4 rows: 1 frame each
+        assert plan.spans[12:16] == [1.0] * 4
+        # then verbatim from out[6] = raw 8: 8->9->10->11 one frame, 11->12 one, 12->14 two
+        assert plan.spans[16:21] == [1.0, 1.0, 1.0, 1.0, 2.0]
+        assert info.i_star == 6
+
+    def test_without_a_raw_index_every_row_is_one_frame(self):
+        plan = Plan()
+        plan.splice(0, line([0, 0, 0], [1, 0, 0], 8), np.ones(8), k_obs=0, cfg=self.cfg)
+        assert plan.spans == [1.0] * 8
+
+
+class TestGraspHold:
+    def test_arms_on_the_close_edge_and_consumes_frames_by_span(self):
+        h = GraspHold(4)
+        assert h.step(1.0, 1) is None                 # open
+        assert h.step(0.9, 1) is None                 # still open
+        assert h.step(0.2, 1) == pytest.approx(1.0)   # edge: hold row 1 of 4 frames
+        assert h.step(0.0, 2) == pytest.approx(0.5)   # strided row: 100 ms cap, uses 2 frames
+        assert h.step(0.0, 1) == pytest.approx(1.0)   # 4th frame
+        assert h.step(0.0, 1) is None                 # hold exhausted
+        assert h.n_holds == 1
+
+    def test_staying_closed_does_not_rearm_and_reopening_does_not_fire(self):
+        h = GraspHold(2)
+        h.step(1.0, 1); h.step(0.0, 1); h.step(0.0, 1)
+        assert h.step(0.0, 1) is None and h.n_holds == 1
+        assert h.step(1.0, 1) is None                 # opening: no hold
+        assert h.step(0.0, 1) is not None and h.n_holds == 2   # a second grasp
+
+    def test_inverted_channel(self):
+        h = GraspHold(2, invert=True)
+        assert h.step(0.0, 1) is None                 # 0 = open when inverted
+        assert h.step(1.0, 1) == pytest.approx(1.0)   # 1 = closed
+
+    def test_a_first_row_that_is_already_closed_is_not_an_edge(self):
+        h = GraspHold(2)
+        assert h.step(0.0, 1) is None and h.n_holds == 0
+
+
 class TestFeedRules:
     def test_two_rows_go_out_before_anything_is_published(self):
         assert list(rows_to_push(0, -1)) == [0, 1]
@@ -209,8 +261,13 @@ class FakeCppSender(FakeSender):
             # n_published deliberately NOT advanced: the real handle fills it at join().
 
 
-def _stub_crisp_gym(monkeypatch, dt):
-    """Just enough of crisp_gym.deploy for the loop to import, with no robot."""
+def _stub_crisp_gym(monkeypatch, dt, keep_fn=None, speed=1.0):
+    """Just enough of crisp_gym.deploy for the loop to import, with no robot.
+
+    `keep_fn(chunk) -> indices` stands in for the method pipeline's striding and
+    `speed` for its per-row multiplier; the timing stub honours the multiplier so a
+    hold's dwell is observable in the fake sender's publish times.
+    """
     def pipeline_stub():
         m = types.ModuleType("crisp_gym.deploy.pipeline")
 
@@ -221,13 +278,20 @@ def _stub_crisp_gym(monkeypatch, dt):
             @classmethod
             def nominal(cls, a):
                 return cls(np.asarray(a), np.ones(len(a)))
+
+        def run_pipeline(chunk, steps):
+            a = chunk.actions
+            if keep_fn is not None:
+                a = a[keep_fn(a)]
+            return Chunk(a, np.full(len(a), float(speed)))
         m.Chunk = Chunk
-        m.run_pipeline = lambda chunk, steps: chunk
+        m.run_pipeline = run_pipeline
         return m
 
     timing = types.ModuleType("crisp_gym.deploy.timing")
     timing.build_speed_queue_arrays = lambda s, dt_base, n, retime: (
-        np.full(n, 25), np.full(n, dt_base), np.ones(n))
+        np.rint(dt_base / np.asarray(s, dtype=float) / 0.002).astype(int),
+        dt_base / np.asarray(s, dtype=float), np.asarray(s, dtype=float))
     timing._pre_compute_chunk_arrays = lambda row, **kw: (
         row[:, :3], np.tile([0, 0, 0, 1.0], (len(row), 1)), row[:, 6], row.astype(np.float32))
     obs = types.ModuleType("crisp_gym.deploy.obs")
@@ -304,3 +368,61 @@ class TestLoop:
         # splices were time-aligned, so the seams introduced no jump.
         x = np.array([p[2][0] for p in sender.published])
         assert np.abs(np.diff(x) - 1.0).max() < 0.05
+
+    def test_grasp_in_the_discarded_head_still_gets_the_full_hold(self, monkeypatch):
+        """The failure of the 17:00 run: the policy predicts the close at raw rows 4-6,
+        the splice discards out[0..5] and bridges over them. The hold has to key on
+        the command actually sent and run at demo cadence for the whole window."""
+        from pace_bench.real.splice_loop import run_splice_loop
+
+        dt = 0.02                      # demo cadence in this test
+        EPS, WIN = 0.1, 10             # exemption window = hold window = 10 frames
+
+        def keep(a):                   # stride 2, every frame within WIN of a gripper move
+            g = a[:, 6]; moving = np.abs(np.diff(g)) > EPS
+            keep = set(range(0, len(a), 2))
+            for j in np.where(moving)[0]:
+                keep.update(range(j, min(len(a), j + 2 + WIN)))
+            return sorted(keep)[:32]
+
+        _stub_crisp_gym(monkeypatch, dt, keep_fn=keep, speed=2.0)   # 2x: 10 ms rows outside the hold
+        q = queue.Queue(); sender = FakeSender(q); sender.start()
+        n_req = [0]
+
+        class Source:
+            def request(self, obs_buf):
+                n_req[0] += 1
+                c = line([0, 0, 0], [1, 0, 0], 100, grip=1.0)
+                if n_req[0] == 2:      # second chunk: close predicted at raw rows 4..6
+                    c[4:, 6] = 0.0
+                return c
+
+        rec = types.SimpleNamespace(
+            chunk_count=0, stopped_by="init", starvation_event_count=0,
+            stage_samples_producer={k: [] for k in
+                                    ("get_obs_ms", "synth_ms", "build_ms", "push_ms", "drain_wait_ms")},
+            pred_dt_samples=[], trace_records=[], chunk_rows=[])
+        args = types.SimpleNamespace(max_chunks=3, record_trace=False, record_trace_every=1)
+        cfg = SpliceConfig(replan_every=12, bridge_rows=4, hold_s=WIN * dt, fps=1 / dt)
+        run_splice_loop(env=types.SimpleNamespace(action_to_rotation=None), chunk_source=Source(),
+                        q=q, sender=sender, args=args, rec=rec, dt_base=dt, obs_schema=None,
+                        gripper_enabled=False, gripper_unnormalize_fn=None, obs_buf=[],
+                        last_obs=[None], steps=[], cfg=cfg, n_action_steps=32, raw_index_fn=keep)
+        time.sleep(0.3); q.put(None); sender.join(1.0)
+
+        t = np.array([p[1] for p in sender.published])
+        g = np.array([p[2][6] for p in sender.published])
+        first_closed = int(np.argmax(g < 0.5))
+        assert first_closed > 0, "the close command never went out"
+        # The sender publishes AT each deadline, and deadline[i+1] = deadline[i] +
+        # dt_eff[i+1], so the interval t[i+1] - t[i] is row i+1's dwell.
+        dwell_of = np.diff(t)                      # dwell_of[i] = dwell of row i + 1
+        row_dwell = np.r_[np.nan, dwell_of]        # index by row
+        # Outside the hold rows go at 2x (10 ms); from the close command on, WIN rows
+        # dwell at demo cadence (20 ms) -- the bridge rows included -- then 2x resumes.
+        assert np.nanmedian(row_dwell[1:first_closed]) == pytest.approx(dt / 2, abs=0.004)
+        held = row_dwell[first_closed:first_closed + WIN]
+        assert np.all(np.abs(held - dt) < 0.006), held
+        after = row_dwell[first_closed + WIN:first_closed + WIN + 5]
+        assert np.median(after) == pytest.approx(dt / 2, abs=0.004), after
+

@@ -102,7 +102,14 @@ gains:
                             # its own and the scaler deliberately never pushes a d for
                             # an auto axis.
 gripper:
-  slowdown_frames: 5        # nominal speed across a grasp; the 85 mm stroke needs
+  hold_s: 0.7               # Splice mode. After the SENT gripper command closes, every
+                            # row dwells at demo cadence (50 ms per raw frame) for this
+                            # long, and PACE keeps every frame for the same window
+                            # after a predicted gripper movement instead of striding.
+                            # Sized to the jaw stroke (>= 0.57 s at the driver max).
+                            # The 17:00 run on 2026-09-02 held 250 ms and was back at
+                            # 2.9x with the cup still open. Queue mode ignores this.
+  slowdown_frames: 5        # queue mode only. nominal speed across a grasp; the 85 mm stroke needs
                             # ~0.57 s even at the driver maximum and cannot be
                             # sped up. NOTE: historical runs used 0.
   invert: false
