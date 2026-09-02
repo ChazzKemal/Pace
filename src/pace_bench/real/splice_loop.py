@@ -41,8 +41,15 @@ rather than skipping, and its own deadline for that row is two dwells out. So a
 late frame needs inference plus the splice to exceed two dwells (68 ms at 1.5x,
 100 ms at 1x) against a measured ~25 ms. ``frames.csv`` slack says if it happens.
 
-The C++ sender is not used here: it cannot retract queued rows, and the one thing
-it buys -- cadence under GIL contention -- is what a one-row queue no longer needs.
+Both senders work, and ``sender.cpp`` chooses as before. Nothing is ever retracted
+*from the sender*: with ``commit_rows = 1`` the queue is empty at every splice and
+the retraction happens in :class:`Plan`. What the loop needs from a sender is a live
+count of published rows. The Python thread keeps ``n_published``; the C++ process
+advances its stats ring head right after each publish (``crisp_sender.cpp:599``),
+which :func:`published_count` reads from shared memory -- the handle's own
+``n_published`` is only filled in at ``join()``. The C++ sender keeps the better
+cadence (``clock_nanosleep`` on an absolute deadline, no GIL); the Python one is the
+comparison. ``frames.csv`` slack and overshoot decide between them.
 """
 
 from __future__ import annotations
@@ -201,6 +208,25 @@ class Plan:
                       rows_added=len(added))
 
 
+def published_count(sender) -> int:
+    """Rows the sender has published so far, read live from either sender.
+
+    ``CppSenderHandle`` exposes ``n_published`` too, but fills it in only when
+    ``join()`` ingests the stats ring; the live number is the ring's head, which the
+    C++ loop bumps right after each publish. Detected by the shared-memory handle
+    rather than by class so a stub in tests can stand in for either.
+    """
+    mm = getattr(sender, "_stats_mm", None)
+    if mm is not None:
+        import struct
+        try:
+            from crisp_gym.deploy.cpp_sender import _SH_HEAD_OFF
+        except ImportError:  # the layout has had head at offset 0 since v1
+            _SH_HEAD_OFF = 0
+        return int(struct.unpack_from("<Q", mm, _SH_HEAD_OFF)[0])
+    return int(getattr(sender, "n_published", 0))
+
+
 def rows_to_push(k_next: int, executing: int, commit_rows: int = 1) -> range:
     """Which plan rows to hand the sender now, given the row it is publishing.
 
@@ -254,8 +280,8 @@ def run_splice_loop(
     stages = rec.stage_samples_producer
 
     def executing() -> int:
-        # The sender counts publishes; row p is executing once it has published p+1 rows.
-        return int(getattr(sender, "n_published", 0)) - 1
+        # Row p is executing once p+1 rows have been published.
+        return published_count(sender) - 1
 
     def push(k: int) -> None:
         nonlocal deadline

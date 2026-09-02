@@ -44,8 +44,10 @@ loop:
                             # each chunk behind overlap_threshold+2 rows of queue, so
                             # its first verbatim row ran 12 rows (406 ms) after the
                             # observation; here it is commit_rows+bridge_rows+1 rows.
-                            # overlap_threshold and blend.* are unused in this mode;
-                            # sender.cpp is forced off (the C++ ring cannot retract).
+                            # overlap_threshold and blend.* are unused in this mode.
+                            # Both senders work -- nothing is ever retracted from the
+                            # sender, only from the plan -- so sender.cpp is the A/B
+                            # switch; frames.csv slack/overshoot decide.
   replan_every: 12          # H: rows between observations.
   commit_rows: 1            # h_c: rows after the observation never retracted -- the
                             # one the sender is holding. 2 only delays the seam.

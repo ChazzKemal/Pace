@@ -160,11 +160,15 @@ class _Item:
 
 
 class FakeSender(threading.Thread):
-    """crisp_gym's sender in miniature: pop, sleep to the deadline, publish."""
+    """crisp_gym's Python sender in miniature: pop, sleep to the deadline, publish."""
 
     def __init__(self, q):
         super().__init__(daemon=True)
         self.q, self.n_published, self.published = q, 0, []
+
+    def _record(self, item):
+        self.published.append((item.frame_idx, time.monotonic(), item.action.copy(),
+                               self.q.qsize()))
 
     def run(self):
         while True:
@@ -172,9 +176,30 @@ class FakeSender(threading.Thread):
             if item is None:
                 return
             time.sleep(max(0.0, item.deadline_mono - time.monotonic()))
-            self.published.append((item.frame_idx, time.monotonic(), item.action.copy(),
-                                   self.q.qsize()))
+            self._record(item)
             self.n_published += 1
+
+
+class FakeCppSender(FakeSender):
+    """The C++ handle's observable surface: `n_published` is stale until join(), and
+    the live publish count is the stats ring head at offset 0 of `_stats_mm`."""
+
+    def __init__(self, q):
+        super().__init__(q)
+        self._stats_mm = bytearray(64)
+        self._head = 0
+
+    def run(self):
+        import struct
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            time.sleep(max(0.0, item.deadline_mono - time.monotonic()))
+            self._record(item)
+            self._head += 1
+            struct.pack_into("<Q", self._stats_mm, 0, self._head)   # live, like crisp_sender.cpp:599
+            # n_published deliberately NOT advanced: the real handle fills it at join().
 
 
 def _stub_crisp_gym(monkeypatch, dt):
@@ -213,13 +238,14 @@ def _stub_crisp_gym(monkeypatch, dt):
 
 
 class TestLoop:
-    def test_one_row_ahead_and_time_aligned_splices(self, monkeypatch):
-        from pace_bench.real.splice_loop import run_splice_loop
+    @pytest.mark.parametrize("sender_cls", [FakeSender, FakeCppSender])
+    def test_one_row_ahead_and_time_aligned_splices(self, monkeypatch, sender_cls):
+        from pace_bench.real.splice_loop import published_count, run_splice_loop
 
         dt = 0.02
         _stub_crisp_gym(monkeypatch, dt)
         q = queue.Queue()
-        sender = FakeSender(q)
+        sender = sender_cls(q)
         sender.start()
         requests = []
 
@@ -227,7 +253,7 @@ class TestLoop:
             def request(self, obs_buf):
                 # The policy sees the row that is executing and predicts a straight line
                 # from there, so consecutive chunks agree and the seam should be smooth.
-                k = max(sender.n_published - 1, 0)
+                k = max(published_count(sender) - 1, 0)
                 requests.append(k)
                 time.sleep(0.006)                           # "inference"
                 return line([float(k), 0, 0], [1, 0, 0], 32)

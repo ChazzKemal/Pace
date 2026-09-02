@@ -478,12 +478,9 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         session.phase_gil_hygiene(env, args)
         quiesce_target_pose_timer(env)
         ch = session.phase_publish_channels(env, args)
-        if cfg.loop.mode == "splice" and getattr(args, "cpp_sender", False):
-            # The splice retracts rows the sender has not popped yet; the C++ ring
-            # cannot give them back. The Python thread can, and with one row queued
-            # the GIL contention the C++ sender existed for no longer matters.
-            logger.warning("loop.mode=splice needs the Python sender; overriding sender.cpp")
-            args.cpp_sender = False
+        # Both senders drive the splice loop: with commit_rows=1 nothing is ever
+        # retracted from the sender itself, only from the plan. `sender.cpp` is the
+        # A/B switch; frames.csv slack and overshoot say which cadence is better.
         sender, q = session.phase_start_sender(env, args, scaler, ch)
         # When each inference ran and when each target was due, measured at the two
         # points they pass through this process. `timeline.py` can reconstruct both
