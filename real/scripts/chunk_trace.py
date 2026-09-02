@@ -56,7 +56,16 @@ def read_csv(path: Path) -> dict[str, np.ndarray] | None:
         rows = list(csv.DictReader(f))
     if not rows:
         return None
-    return {k: np.array([float(r[k]) for r in rows]) for k in rows[0]}
+    out = {}
+    for k in rows[0]:
+        col = [r[k] for r in rows]
+        try:
+            out[k] = np.array([float(v) for v in col])
+        except ValueError:
+            # chunks.csv carries text columns too (anchor_mode); keep them readable
+            # rather than dropping the whole file over one non-numeric field.
+            out[k] = np.array(col, dtype=object)
+    return out
 
 
 def chunk_bounds(cmd: dict) -> list[tuple[int, int]]:
@@ -526,90 +535,186 @@ def _backend(save: Path | None) -> str:
     )
 
 
-def gui(run: Path, start: int = 0, save: Path | None = None) -> int:
-    """Commanded path in 3-D, coloured by the speed PACE chose, chunk by chunk.
+def pick_run_interactively() -> Path | None:
+    """The curses run list, used on its own so --gui need not be given a path."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    runs = discover_runs()
+    if not runs:
+        sys.exit(f"no runs under {CACHE}")
 
-    Shaped after crisp_gym's examples/27_speedup_slider_viewer.py, which does this for
-    a *dataset* episode while tuning the schedule. This does it for a *recorded deploy*,
-    so the colours are the speeds that actually ran and the achieved path is drawn
-    beside them -- the question is no longer "what would this schedule do" but "what
-    did the arm do when it ran".
+    chosen = {}
 
-    WebAgg by default so an SSH'd session gets a browser UI with no X server; export
-    MPLBACKEND=TkAgg for a native window over ssh -X.
+    def _screen_once(scr):
+        curses.curs_set(0)
+        with contextlib.suppress(AttributeError, curses.error):
+            curses.set_escdelay(25)
+        row = _pick_run(scr, runs, _colors())
+        if row is not None:
+            chosen["path"] = row.path
+
+    with contextlib.suppress(curses.error, KeyboardInterrupt):
+        curses.wrapper(_screen_once)
+    return chosen.get("path")
+
+
+def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
+    """The whole run in 3-D: what the policy generated, what actually ran, and when.
+
+    Shaped after crisp_gym's examples/27_speedup_slider_viewer.py, which colours a
+    *dataset* episode by a schedule being tuned. This shows a *recorded deploy*, so
+    three things are drawn together that only exist after a run:
+
+    * every action the policy generated (faint), against the subset that executed --
+      the gap between them is striding, truncation and the blend hold-back, made
+      visual rather than arithmetic;
+    * the achieved path beside the commanded one, which is where amplitude loss shows;
+    * when inference for the *next* chunk began, as a fraction of the current one.
+      The producer asks for it once the queue falls to `overlap_threshold`, so this is
+      the real inference budget rather than the configured one.
+
+    WebAgg by default when tornado is present, else TkAgg with a display. See _backend.
     """
     import os
     os.environ.setdefault("MPLBACKEND", _backend(save))
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import Slider
+    from matplotlib.widgets import RadioButtons, RangeSlider
 
     d = RunData(run)
     if d.missing:
         sys.exit(f"{run.name}: {d.missing}")
+    n = d.n_chunks
 
-    fig = plt.figure(figsize=(13, 8))
+    # Per-chunk execution windows, and where the next inference began inside each.
+    ch = read_csv(run / "chunks.csv") or {}
+    q_inf = ch.get("q_before_inf")
+    synth = ch.get("synth_ms")
+    spans = []
+    for i in range(n):
+        lo, hi = d.bounds[i]
+        dur = float((d.cmd["cycles"][lo:hi] * d.control_dt).sum())
+        t0 = float(d.cmd["t_wall"][lo] - d.cmd["t_wall"][0])
+        k = hi - lo
+        # Inference is requested when the queue drains to q_before_inf items, so the
+        # fraction of this chunk already consumed by then is (K - q) / K.
+        frac = (1.0 - float(q_inf[i]) / k) if q_inf is not None and i < len(q_inf) and k else None
+        spans.append({"t0": t0, "dur": dur, "k": k, "frac": frac,
+                      "synth": float(synth[i]) / 1000.0 if synth is not None and i < len(synth) else 0.0})
+
+    fig = plt.figure(figsize=(15.5, 9))
     fig.canvas.manager.set_window_title(run.name)
-    ax3 = fig.add_axes([0.02, 0.28, 0.48, 0.66], projection="3d")
-    axs = fig.add_axes([0.62, 0.63, 0.35, 0.29])
-    axt = fig.add_axes([0.56, 0.13, 0.43, 0.44])
-    axt.axis("off")
-    ax_sl = fig.add_axes([0.10, 0.12, 0.70, 0.03])
-    sl = Slider(ax_sl, "chunk", 0, max(d.n_chunks - 1, 0), valinit=0, valstep=1)
+    ax3 = fig.add_axes([0.01, 0.26, 0.50, 0.68], projection="3d")
+    axi = fig.add_axes([0.58, 0.60, 0.40, 0.33])
+    axt = fig.add_axes([0.58, 0.24, 0.40, 0.30]); axt.axis("off")
+    ax_rs = fig.add_axes([0.08, 0.13, 0.44, 0.03])
+    ax_rb = fig.add_axes([0.60, 0.06, 0.13, 0.13])
+    init = (start, start) if start is not None and 0 <= start < n else (0, max(n - 1, 1))
+    rs = RangeSlider(ax_rs, "chunks", 0, max(n - 1, 1), valinit=init, valstep=1)
+    rb = RadioButtons(ax_rb, ("colour: s_eff", "colour: chunk", "hide generated"))
+    state = {"cb": None, "mode": 0}
 
-    state = {"cb": None}
-
-    def draw(idx: int) -> None:
-        idx = int(idx)
-        lo, hi = d.bounds[idx]
-        cx = d.cmd["cmd_x"][lo:hi]; cy = d.cmd["cmd_y"][lo:hi]; cz = d.cmd["cmd_z"][lo:hi]
-        se = d.cmd["s_eff"][lo:hi]
-        dwell = d.cmd["cycles"][lo:hi] * d.control_dt
-        t = np.concatenate([[0.0], np.cumsum(dwell)[:-1]])
-
+    def draw(*_):
+        lo_c, hi_c = (int(v) for v in rs.val)
+        mode = state["mode"]
         ax3.clear()
-        ax3.plot(cx, cy, cz, color="0.6", lw=0.7, alpha=0.7)
-        sc = ax3.scatter(cx, cy, cz, c=se, cmap="viridis", s=26,
-                         vmin=1.0, vmax=max(float(se.max()), 1.01))
+
+        # Everything the policy generated, for the chunks in view.
+        if mode != 2 and d.chunks is not None:
+            g = np.concatenate([d.chunks[i][:, :3] for i in range(lo_c, hi_c + 1)])
+            ax3.scatter(g[:, 0], g[:, 1], g[:, 2], s=3, c="0.75", alpha=0.35,
+                        label="generated, not executed")
+
+        rows = np.concatenate([np.arange(*d.bounds[i]) for i in range(lo_c, hi_c + 1)])
+        cx, cy, cz = (d.cmd[f"cmd_{a}"][rows] for a in "xyz")
+        if mode == 1:
+            cid = np.concatenate([np.full(d.bounds[i][1] - d.bounds[i][0], i)
+                                  for i in range(lo_c, hi_c + 1)])
+            sc = ax3.scatter(cx, cy, cz, c=cid, cmap="turbo", s=16)
+            label = "chunk index"
+        else:
+            se = d.cmd["s_eff"][rows]
+            sc = ax3.scatter(cx, cy, cz, c=se, cmap="viridis", s=16,
+                             vmin=1.0, vmax=max(float(se.max()), 1.01))
+            label = "s_eff"
+
+        # Chunk starts, so a point in space can be tied back to a chunk number.
+        for i in range(lo_c, hi_c + 1):
+            b = d.bounds[i][0]
+            ax3.text(d.cmd["cmd_x"][b], d.cmd["cmd_y"][b], d.cmd["cmd_z"][b],
+                     str(i), fontsize=7, color="#b5533a")
+
         if d.poses is not None:
-            t0 = d.cmd["t_wall"][lo] + d.lag_s
-            w = (d.poses["t_wall"] >= t0) & (d.poses["t_wall"] <= t0 + t[-1] + dwell[-1])
+            # Window from the RECONSTRUCTED execution times, not t_wall: every command
+            # in a chunk carries the same push timestamp, so a t_wall window over one
+            # chunk has zero width and selects no poses at all.
+            base = d.cmd["t_wall"][0] + d.lag_s
+            t0 = base + spans[lo_c]["t0"]
+            t1 = base + spans[hi_c]["t0"] + spans[hi_c]["dur"]
+            w = (d.poses["t_wall"] >= t0) & (d.poses["t_wall"] <= t1)
             if w.any():
                 ax3.plot(d.poses["ach_x"][w], d.poses["ach_y"][w], d.poses["ach_z"][w],
-                         color="#eb6834", lw=1.6, alpha=0.9, label="achieved")
-                ax3.legend(loc="upper left", fontsize=8)
+                         color="#eb6834", lw=1.4, alpha=0.9, label="achieved")
         ax3.set_xlabel("x (m)"); ax3.set_ylabel("y (m)"); ax3.set_zlabel("z (m)")
-        ax3.set_title(f"chunk {idx} — commanded, coloured by s_eff", fontsize=10)
+        ax3.set_title(f"chunks {lo_c}-{hi_c} of {n - 1}", fontsize=10)
+        ax3.legend(loc="upper left", fontsize=7.5)
         if state["cb"] is None:
-            # pad clears the z tick labels, which sit outside the 3-D axes box
             state["cb"] = fig.colorbar(sc, ax=ax3, fraction=0.02, pad=0.10, shrink=0.55)
-            state["cb"].set_label("s_eff")
         else:
             state["cb"].update_normal(sc)
+        state["cb"].set_label(label)
 
-        axs.clear()
-        axs.step(t, se, where="post", color="#eb6834", lw=1.7)
-        axs.set_xlabel("seconds into the chunk"); axs.set_ylabel("s_eff")
-        axs.set_title("speed schedule", fontsize=10)
-        axs.grid(alpha=0.2)
+        # When the next chunk was inferred, as a fraction of this one.
+        axi.clear()
+        for i in range(lo_c, hi_c + 1):
+            sp = spans[i]
+            axi.barh(i, sp["dur"], left=sp["t0"], height=0.6, color="#2a78d6", alpha=.30)
+            if sp["frac"] is not None:
+                x = sp["t0"] + sp["frac"] * sp["dur"]
+                axi.plot([x, x], [i - .34, i + .34], color="#b5533a", lw=1.6)
+                axi.barh(i, max(sp["synth"], 0.02), left=x, height=0.6, color="#b5533a")
+        axi.set_xlabel("seconds into the run"); axi.set_ylabel("chunk")
+        axi.set_title("execution window, and when the next chunk was inferred", fontsize=10)
+        axi.grid(alpha=0.15, axis="x")
+        axi.set_yticks(range(lo_c, hi_c + 1) if hi_c - lo_c < 12
+                       else range(lo_c, hi_c + 1, max(1, (hi_c - lo_c) // 10)))
+        axi.set_ylim(hi_c + 0.6, lo_c - 0.6)
 
         axt.clear(); axt.axis("off")
-        # Everything except the closing caveat paragraph, which is in the docs.
-        lines = [ln for ln in describe(d, idx) if not ln.startswith("  Over a whole run")]
-        cut = next((i for i, ln in enumerate(lines) if ln.startswith("  the window is")), len(lines))
-        axt.text(0, 1, "\n".join(lines[:cut]), family="monospace",
-                 fontsize=7.2, va="top", transform=axt.transAxes)
+        gen = sum(len(d.chunks[i]) for i in range(lo_c, hi_c + 1)) if d.chunks is not None else 0
+        used = len(rows)
+        fr = [sp["frac"] for sp in spans[lo_c:hi_c + 1] if sp["frac"] is not None]
+        sy = [sp["synth"] * 1000 for sp in spans[lo_c:hi_c + 1]]
+        txt = [
+            f"chunks {lo_c}-{hi_c}   method={d.rc.get('method', {}).get('type')}",
+            "",
+            f"  actions generated      {gen:>6}",
+            f"  actions executed       {used:>6}   ({used / max(gen, 1):.0%} of generated)",
+            f"  dropped before sending {gen - used:>6}   striding, n_action_steps, blend",
+            "",
+            "NEXT CHUNK INFERRED",
+            f"  after {np.median(fr):.0%} of the current chunk had run" if fr else "  (no chunks.csv)",
+            f"  inference took {np.median(sy):.0f} ms median, {max(sy):.0f} ms worst" if sy else "",
+            f"  leaving {(1 - np.median(fr)) * np.median([s['dur'] for s in spans]) * 1000:.0f} ms"
+            " of queue as margin" if fr else "",
+            "",
+            *describe(d, lo_c)[2:8],
+        ]
+        axt.text(0, 1, "\n".join(t for t in txt if t is not None), family="monospace",
+                 fontsize=7.6, va="top", transform=axt.transAxes)
         fig.canvas.draw_idle()
 
-    sl.on_changed(draw)
-    start = max(0, min(int(start), d.n_chunks - 1))
-    sl.set_val(start)          # drives draw() and keeps the slider label honest
-    if start == 0:
-        draw(0)                # set_val is a no-op at the initial value
+    def on_radio(lbl):
+        state["mode"] = ("colour: s_eff", "colour: chunk", "hide generated").index(lbl)
+        draw()
+
+    rs.on_changed(draw)
+    rb.on_clicked(on_radio)
+    draw()
     if save:
         fig.savefig(save, dpi=130)
-        print(f"wrote {save}  (chunk {start} of {d.n_chunks})")
+        print(f"wrote {save}  ({n} chunks)")
         return 0
-    print(f"{run.name}: {d.n_chunks} chunks — drag the slider to page them")
+    print(f"{run.name}: {n} chunks — drag the range slider to filter")
     plt.show()
     return 0
 
@@ -617,7 +722,8 @@ def gui(run: Path, start: int = 0, save: Path | None = None) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("run_dir", nargs="?", help="deploy_runs/<ts>; default: newest")
-    ap.add_argument("-c", "--chunk", type=int, default=0)
+    ap.add_argument("-c", "--chunk", type=int, default=None,
+                    help="one chunk; in --gui this focuses the filter on it")
     ap.add_argument("-o", "--out", default=None, help="write a PNG as well")
     ap.add_argument("--gui", action="store_true",
                     help="3-D viewer: commanded path coloured by s_eff, chunk slider")
@@ -627,12 +733,14 @@ def main() -> int:
     # No run named and nothing else asked for: browse. An explicit --chunk or --out
     # means the caller wants one answer on stdout, so honour that without a screen.
     if a.gui:
-        return gui(Path(a.run_dir) if a.run_dir else newest_run(),
-                   a.chunk, Path(a.out) if a.out else None)
-    if not a.run_dir and a.chunk == 0 and not a.out and not a.no_tui:
+        run = Path(a.run_dir) if a.run_dir else pick_run_interactively()
+        if run is None:
+            return 0
+        return gui(run, a.chunk, Path(a.out) if a.out else None)
+    if not a.run_dir and a.chunk is None and not a.out and not a.no_tui:
         return browse_tui()
     run = Path(a.run_dir) if a.run_dir else newest_run()
-    return report(run, a.chunk, Path(a.out) if a.out else None)
+    return report(run, a.chunk or 0, Path(a.out) if a.out else None)
 
 
 if __name__ == "__main__":
