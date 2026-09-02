@@ -91,6 +91,14 @@ class LiberoEvalConfig(MethodPipelineConfig):
     # trajectory more finely spends more steps covering it, so leaving the cap fixed
     # would score slow execution as failure whatever the control quality.
     episode_length: int | None = None
+    # Episodes per task to render to mp4, written under `<out>/task_<id>/videos/`.
+    # 0 (the default) renders nothing, which is what a scoring run wants: rendering
+    # forces every frame through the offscreen renderer and roughly doubles the
+    # wall clock, and a 200-episode sweep does not need 200 videos. Raise it when a
+    # number needs explaining rather than reporting -- a 0% arm is a trajectory
+    # question, and the score alone cannot say whether the arm freezes, drifts,
+    # overshoots, or thrashes.
+    max_episodes_rendered: int = 0
     actuation: ActuationConfig = field(default_factory=ActuationConfig)
 
 
@@ -167,7 +175,13 @@ def build_speed_step(cfg: LiberoEvalConfig, stats: dict | None) -> PaceSpeedStep
 
 @draccus.wrap()
 def main(cfg: LiberoEvalConfig) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # force=True because robosuite installs a root handler at import time, and a
+    # plain basicConfig is a no-op once the root logger has one -- which silently
+    # swallowed every INFO this module emits, including "restored a trained pos_emb".
+    # An eval whose provenance lines are invisible is an eval you cannot check.
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True
+    )
 
     # `from_pretrained` reads `action_mode` straight out of the checkpoint's config,
     # and a B-spline xVLA checkpoint names an action space only this repo defines.
@@ -262,10 +276,16 @@ def main(cfg: LiberoEvalConfig) -> None:
             )
             if actuate
             else None,
+            # Decoding happens inside `select_action`, upstream of the postprocessor
+            # that would undo normalization -- so the statistics have to come with it.
+            # None here for every IDENTITY checkpoint, which is what `action_stats`
+            # returns for them, and the unnormalizer is then a no-op.
+            action_stats=None if stats is None else stats.get("action"),
         )
         logger.info(
-            "method=%s | %s | kp x%.2f",
+            "method=%s | %s | kp x%.2f | parameters %s",
             cfg.method.type, decode.get_config(), cfg.method.stiffness_kp_scale,
+            "unnormalized before decode" if stats else "already absolute",
         )
     else:
         paced = attach_pace(policy, build_speed_step(cfg, stats), actuator)
@@ -323,6 +343,8 @@ def main(cfg: LiberoEvalConfig) -> None:
                 postprocessor=postprocessor,
                 n_episodes=cfg.n_episodes,
                 start_seed=cfg.seed,
+                max_episodes_rendered=cfg.max_episodes_rendered,
+                videos_dir=task_out / "videos",
             )
         close_envs(envs)
 

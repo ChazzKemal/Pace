@@ -80,11 +80,30 @@ class EE6DBSplineActionSpace(BaseActionSpace):
         }
 
     def preprocess(self, proprio, action, mode="train"):
-        """Mask the gripper channel exactly as the stock ee6d space does."""
-        proprio_m, action_m = proprio.clone(), action.clone()
+        """Unmasked, unlike the stock ee6d space -- and this is not a small difference.
+
+        Upstream zeroes slot 9 of the *noisy* action (`modeling_xvla.py:223` in
+        training, `:262` at every denoising step) while scoring the unmasked target.
+        That is coherent there: slot 9 is a binary command read off a BCE head, so the
+        channel is classified from the observation and never integrated along the flow.
+
+        Here slot 9 is a least-squares coefficient regressed with MSE. Masking it hands
+        the model x_t with that channel pinned to zero and then asks it to recover x_0,
+        which no amount of training can do: with no information about where the channel
+        started, the conditional mean is the optimal prediction and the model duly
+        learns it. Measured on `ds_libero10_bspline`, the predicted gripper control
+        points sat at mean +0.459 with 86.8% inside (0.1, 0.9) -- the mean of a binary
+        {0, 1} channel -- against ground-truth fits that put ~3% there. The gripper
+        never committed to open or closed, so nothing was ever grasped and the arm
+        scored 0% on every LIBERO-10 task while its regression losses looked converged.
+
+        `proprio` keeps its mask: that channel really is the gripper's *state*, a 0/1
+        reading, and hiding it is upstream's choice about observation leakage rather
+        than anything to do with the action space.
+        """
+        proprio_m = proprio.clone()
         proprio_m[..., self.gripper_idx] = 0.0
-        action_m[..., self.gripper_idx] = 0.0
-        return proprio_m, action_m
+        return proprio_m, action
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Returned as regressed -- no sigmoid, unlike the stock ee6d space.

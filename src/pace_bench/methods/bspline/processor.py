@@ -19,6 +19,7 @@ hours.
 """
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -205,6 +206,7 @@ class BSplineChunkStep(ProcessorStep):
             "relative_knots": self.relative_knots,
             "degree": self.degree,
             "arrangement": None if self.arrangement is None else self.arrangement.name,
+            "knot_scale": None if self.arrangement is None else self.arrangement.knot_scale,
         }
 
     def transform_features(
@@ -250,6 +252,7 @@ class BSplineDecodeStep(ProcessorStep):
         align: bool = False,
         fps: float = 20.0,
         predict_before_end: float = 0.0,
+        knot_scale: float | None = None,
     ):
         if num_actions < 1:
             raise ValueError(f"num_actions must be >= 1, got {num_actions}")
@@ -260,6 +263,14 @@ class BSplineDecodeStep(ProcessorStep):
         # policy_postprocessor.json -- get_config serialises them by name.
         self.layout = coerce_layout(layout)
         self.arrangement = coerce_arrangement(arrangement)
+        # A name does not carry `knot_scale`: it is 1/fps, a property of the run rather
+        # than of the arrangement, so `xvla_ee6d20` rebuilt from its name comes back
+        # with the default 1.0. `recover` would then divide the knot column by 1 where
+        # `emit` multiplied it by 0.05, and every decoded curve would span twenty times
+        # too long -- a wrong trajectory that still decodes, still executes, and reports
+        # nothing. Serialised alongside the name (see `get_config`) and reapplied here.
+        if knot_scale is not None and self.arrangement is not None:
+            self.arrangement = replace(self.arrangement, knot_scale=float(knot_scale))
         #: Resume each chunk where the previous one left the arm, rather than at the
         #: curve's own beginning. Sequential control only -- see `decode_batch`.
         self.align = bool(align)
@@ -384,13 +395,20 @@ class BSplineDecodeStep(ProcessorStep):
         return new_transition
 
     def get_config(self) -> dict[str, Any]:
+        # `fps` and `predict_before_end` belong here for the same reason the rest do: a
+        # step rebuilt from a checkpoint that omits them silently takes the defaults
+        # (20.0 and 0.0), and predict_before_end=0 executes the tail of every curve --
+        # the least constrained part of the fit -- instead of re-planning before it.
         return {
             "num_actions": self.num_actions,
             "degree": self.degree,
             "relative_knots": self.relative_knots,
             "align": self.align,
+            "fps": self.fps,
+            "predict_before_end": self.predict_before_end,
             "layout": None if self.layout is None else self.layout.name,
             "arrangement": None if self.arrangement is None else self.arrangement.name,
+            "knot_scale": None if self.arrangement is None else self.arrangement.knot_scale,
         }
 
     def transform_features(

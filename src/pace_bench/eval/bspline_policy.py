@@ -27,7 +27,32 @@ from pace_bench.methods.bspline.actuator import BSplineTrackingActuator
 from pace_bench.methods.bspline.processor import BSplineDecodeStep
 
 
-def attach_bspline(policy, decode: BSplineDecodeStep, actuator: BSplineTrackingActuator | None = None):
+def _unnormalizer(stats: dict | None):
+    """``(B, rows, channels)`` of normalized parameters -> natural units.
+
+    None stats mean the policy's actions are absolute already -- which is every xVLA
+    arm that keeps `NormalizationMode.IDENTITY` -- and then this is the identity.
+    """
+    if not stats or "mean" not in stats or "std" not in stats:
+        return lambda parameters: parameters
+
+    mean = torch.as_tensor(stats["mean"])
+    std = torch.as_tensor(stats["std"])
+
+    def unnormalize(parameters: torch.Tensor) -> torch.Tensor:
+        m = mean.to(parameters.device, parameters.dtype)
+        s = std.to(parameters.device, parameters.dtype)
+        return parameters * s + m
+
+    return unnormalize
+
+
+def attach_bspline(
+    policy,
+    decode: BSplineDecodeStep,
+    actuator: BSplineTrackingActuator | None = None,
+    action_stats: dict | None = None,
+):
     """Make ``policy`` decode its own predictions. Returns it, modified in place.
 
     Args:
@@ -38,9 +63,17 @@ def attach_bspline(policy, decode: BSplineDecodeStep, actuator: BSplineTrackingA
         actuator: Stiffens the simulator so it can track waypoints that are further
             apart. ``None`` still decodes and executes but leaves the plant nominal,
             which is the action-side-only ablation.
+        action_stats: The unnormalizer's ``action`` statistics, or None when the
+            policy's actions are already absolute. **Required whenever the checkpoint
+            normalizes its action**, because this bypasses the postprocessor -- see
+            the note on `select_action`.
     """
     policy.bspline = decode
     policy.bspline_actuator = actuator
+    # Undoing normalization is normally the postprocessor's job, and this decodes
+    # *before* the postprocessor runs -- so if the checkpoint normalizes, the
+    # parameters have to be restored here or the curve is built out of z-scores.
+    policy.bspline_unnormalize = _unnormalizer(action_stats)
     policy.bspline_env = None
     policy.bspline_queue = deque()
     #: Realised rate per query -- source frames advanced per executed action. Varies
@@ -63,6 +96,18 @@ def attach_bspline(policy, decode: BSplineDecodeStep, actuator: BSplineTrackingA
     def select_action(self, batch: dict[str, torch.Tensor], **_) -> torch.Tensor:
         if not self.bspline_queue:
             parameters = self.predict_action_chunk(batch)
+            # `predict_action_chunk` returns the policy's raw output, which for a
+            # checkpoint with MEAN_STD action normalization is in z-scores. The decode
+            # step needs natural units -- its knot column is a time in source frames --
+            # and it never sees the postprocessor that would have restored them,
+            # because upstream's rollout applies that only to what `select_action`
+            # RETURNS, by which point the curve has already been evaluated.
+            #
+            # Silent when wrong, and the way it is wrong is not obvious: normalized
+            # knots average about zero, so every chunk spans ~0 frames, every decode
+            # yields one action, and the arm crawls a step at a time while the run
+            # reports a perfectly ordinary success rate of zero.
+            parameters = self.bspline_unnormalize(parameters)
             # Sequential: row i of this batch is env i, one chunk after another on
             # its own curve -- so each row aligns to its own anchor. Without this the
             # step falls back to its batch-of-one rule and a vector env decodes every

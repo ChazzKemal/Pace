@@ -17,9 +17,22 @@
 #                applies the constant tracking bump (kp/kd and gripper x low_v)
 #   pace         the baseline's own weights -- PACE acts at eval time, so it needs no
 #                arm of its own -- at the recorded look4cb+skip2 setting, 1.5x cap
-#   bspline      decodes each predicted curve at 8 points instead of its 16-row width,
-#                i.e. ~2x, chosen to sit near DemoSpeedup's measured 1.91x so the
-#                success rates are read at a comparable speed
+#   bspline      decodes each predicted curve at 16 points, measured at 1.82x so the
+#                success rates are read near DemoSpeedup's 1.91x
+#
+# That 16 is measured, not reasoned. It was 8 until 2026-09-02, on the argument that
+# 8 points instead of the matrix's 16 rows is ~2x -- which is wrong, because the row
+# count is not the time span. The span is the knot range, ~33 source frames on
+# libero_10_ee6d, so decoding ground-truth parameters at 8 replays an episode at
+# 4.12x. Realised speed against num_actions, on ground-truth fits (no policy):
+#
+#     num_actions    4     8    12    16    22    30    40
+#     speed       9.44x 4.12x 2.53x 1.82x 1.30x 0.93x 0.70x
+#     pos RMSE     0.36  0.77  0.51  0.48  0.87  1.27  1.21   cm
+#     rot RMSE     0.25  0.60  0.43  0.39  0.80  1.30  1.18   deg
+#
+# Sub-centimetre everywhere, so the representation costs nothing across this range and
+# num_actions really is a free speed dial. Use 30 for a 1x reading.
 #
 # Arms are independent processes, so an arm whose weights are ready can run while
 # another is still training -- `--wait` exists for the one that is not ready, and the
@@ -59,6 +72,7 @@ fi
 BASE=outputs/train/ds_libero10_base/checkpoints/last/pretrained_model
 SPEEDUP=outputs/train/ds_libero10_speedup/checkpoints/last/pretrained_model
 BSPLINE=outputs/train/ds_libero10_bspline/checkpoints/last/pretrained_model
+POSEMB=outputs/train/ds_libero10_bspline_uniform_posemb/checkpoints/last/pretrained_model
 
 run_arm() {
     local arm=$1
@@ -75,11 +89,26 @@ run_arm() {
                          --method.lookahead_agg=cumulative_bending --method.lookahead_target=angle) ;;
       # The fit parameters are reconstruction, not choices: they must be what the
       # checkpoint trained under. Only num_actions is free, and it is the speed lever.
-      bspline)     args=(--policy_path="$BSPLINE" --n_action_steps=8
+      bspline)     args=(--policy_path="$BSPLINE" --n_action_steps=16
                          --method.type=bspline --method.layout=ee6d20
                          --method.arrangement=xvla_ee6d20 --method.chunk_size=10
                          --method.degree=3 --method.max_error=0.01 --method.fps=20
-                         --method.num_actions=8) ;;
+                         --method.num_actions=16) ;;
+      # The second B-spline arm, and the only difference that matters is what it was
+      # allowed to learn: 16 rows of xVLA's positional embedding, which the frozen arm
+      # above had to reuse as pretrained. That changes the action space too -- the
+      # parameters are scored uniformly (`bspline_uniform`) on a knot-first matrix
+      # rather than through the ee6d head -- so the fit flags below are the
+      # checkpoint's, not the arm above's, and must not be copied between them.
+      # `restore` in run_libero loads pos_emb.safetensors; without it this arm would
+      # silently run the pretrained table and read as a null result.
+      bspline_posemb) args=(--policy_path="$POSEMB" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=knot_first20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.xvla_action_space=bspline_uniform
+                         --method.normalize_parameters=true
+                         --method.num_actions=16) ;;
       *) echo "unknown arm: $arm" >&2; return 1 ;;
     esac
     local ckpt=${args[0]#--policy_path=}
