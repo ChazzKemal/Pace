@@ -282,6 +282,16 @@ def write_inference(clock: ChunkClock | None, out_dir: Path) -> Path | None:
     return _write_csv(Path(out_dir) / "inference.csv", fields, rows, "inference")
 
 
+def write_splices(splices: list, out_dir: Path) -> Path | None:
+    """``splices.csv``: one row per replan under ``loop.mode: splice`` -- the
+    observation row, the splice row, the output row the chunk entered at, and the
+    bridge. This is the ground truth ``timeline.py`` uses for those runs."""
+    if not splices:
+        return None
+    rows = [dict(vars(s)) for s in splices]
+    return _write_csv(Path(out_dir) / "splices.csv", list(rows[0].keys()), rows, "splice")
+
+
 def command_table(replay_log: list[dict], clock: ChunkClock | None = None,
                   ) -> tuple[list[str], list[dict]]:
     """Flatten the sender's replay rows into CSV columns.
@@ -481,7 +491,10 @@ def write_manifest(out_dir: Path, *, cfg, method, deployed_path: str,
             "blend": {"overlap": cfg.blend.overlap, "mode": cfg.blend.mode,
                       "skip": cfg.blend.skip},
             "loop": {"overlap_threshold": cfg.loop.overlap_threshold,
-                     "stride": cfg.loop.stride},
+                     "stride": cfg.loop.stride,
+                     **{k: getattr(cfg.loop, k) for k in
+                        ("mode", "replan_every", "commit_rows", "bridge_rows", "bridge")
+                        if hasattr(cfg.loop, k)}},
             "gripper": {"slowdown_frames": cfg.gripper.slowdown_frames,
                         "invert": cfg.gripper.invert,
                         "bspline_low_v": cfg.gripper.bspline_low_v},

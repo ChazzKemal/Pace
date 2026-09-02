@@ -37,6 +37,23 @@ blend:
 
 loop:
   overlap_threshold: 6      # inference budget = 6 x dt_eff = 300 ms at 20 Hz
+  mode: splice              # One row ahead of the arm, a replan every `replan_every`
+                            # rows, the new chunk spliced in at the row it predicted
+                            # FOR THAT MOMENT behind a short cubic bridge. Measured on
+                            # the 2026-09-02 runs, the producer loop ("queue") appended
+                            # each chunk behind overlap_threshold+2 rows of queue, so
+                            # its first verbatim row ran 12 rows (406 ms) after the
+                            # observation; here it is commit_rows+bridge_rows+1 rows.
+                            # overlap_threshold and blend.* are unused in this mode;
+                            # sender.cpp is forced off (the C++ ring cannot retract).
+  replan_every: 12          # H: rows between observations.
+  commit_rows: 1            # h_c: rows after the observation never retracted -- the
+                            # one the sender is holding. 2 only delays the seam.
+  bridge_rows: 4            # h_b: bridge length. Replay of the recorded predictions:
+                            # 3 is the knee for the median seam, 4 also halves peak
+                            # acceleration on the worst ones at one row of latency.
+  bridge: cubic             # C1 with both tangents per executed row. quintic (C2)
+                            # is available and did not beat it on the replay.
 
 gains:
   scale_kp: true            # Scale controller stiffness with the speed the method

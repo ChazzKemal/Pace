@@ -61,7 +61,9 @@ from pace_bench.real.record import (
     write_inference,
     write_manifest,
     write_poses,
+    write_splices,
 )
+from pace_bench.real.splice_loop import SpliceConfig, run_splice_loop
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,15 @@ class LoopConfig:
 
     overlap_threshold: int = 2
     stride: int = 1
+    #: "splice" runs `splice_loop.run_splice_loop`: one row ahead of the arm, a
+    #: replan every `replan_every` rows, the new chunk spliced at the time-aligned
+    #: row behind a `bridge_rows` cubic. `overlap_threshold` and `blend.*` are unused
+    #: there. "queue" is crisp_gym's producer loop unchanged.
+    mode: str = "splice"
+    replan_every: int = 12
+    commit_rows: int = 1
+    bridge_rows: int = 4
+    bridge: str = "cubic"
 
 
 @dataclass
@@ -450,6 +461,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     scaler = sender = rec = None
     sampler = clock = None
     video_recorders: list = []
+    splices: list = []
     started_mono = time.monotonic()
     try:
         _t = time.monotonic()
@@ -466,6 +478,12 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         session.phase_gil_hygiene(env, args)
         quiesce_target_pose_timer(env)
         ch = session.phase_publish_channels(env, args)
+        if cfg.loop.mode == "splice" and getattr(args, "cpp_sender", False):
+            # The splice retracts rows the sender has not popped yet; the C++ ring
+            # cannot give them back. The Python thread can, and with one row queued
+            # the GIL contention the C++ sender existed for no longer matters.
+            logger.warning("loop.mode=splice needs the Python sender; overriding sender.cpp")
+            args.cpp_sender = False
         sender, q = session.phase_start_sender(env, args, scaler, ch)
         # When each inference ran and when each target was due, measured at the two
         # points they pass through this process. `timeline.py` can reconstruct both
@@ -497,14 +515,25 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
             buf.append(_get_obs_zerofill(env, schema, last))
 
         started_mono = time.monotonic()
-        run_producer_loop(
-            env=env, chunk_source=src, q=q, args=args, rec=rec,
-            dt_base=cfg.control_dt, obs_schema=schema,
-            gripper_enabled=ch.gripper_enabled,
-            gripper_unnormalize_fn=ch.gripper_unnormalize_fn,
-            obs_buf=buf, last_obs=last, lookbehind_buf=deque(maxlen=8),
-            steps=steps,
-        )
+        common = {
+            "env": env, "chunk_source": src, "q": q, "args": args, "rec": rec,
+            "dt_base": cfg.control_dt, "obs_schema": schema,
+            "gripper_enabled": ch.gripper_enabled,
+            "gripper_unnormalize_fn": ch.gripper_unnormalize_fn,
+            "obs_buf": buf, "last_obs": last, "steps": steps,
+        }
+        if cfg.loop.mode == "splice":
+            splices = run_splice_loop(
+                sender=sender,
+                cfg=SpliceConfig(replan_every=cfg.loop.replan_every,
+                                 commit_rows=cfg.loop.commit_rows,
+                                 bridge_rows=cfg.loop.bridge_rows,
+                                 bridge=cfg.loop.bridge),
+                **common)
+        elif cfg.loop.mode == "queue":
+            run_producer_loop(lookbehind_buf=deque(maxlen=8), **common)
+        else:
+            raise ValueError(f"loop.mode must be 'splice' or 'queue', not {cfg.loop.mode!r}")
     finally:
         # Drain the sender BEFORE reporting, so its counters are final.
         if sender is not None:
@@ -543,6 +572,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                 write_commands(getattr(sender, "_replay_log", []) or [], rec.out_dir,
                                clock)
                 write_inference(clock, rec.out_dir)
+                write_splices(splices, rec.out_dir)
                 if sampler is not None:
                     write_poses(sampler.rows, rec.out_dir)
             except Exception:

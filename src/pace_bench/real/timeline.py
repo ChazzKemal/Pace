@@ -271,6 +271,8 @@ class Timeline:
     action_stride: int = 1
     #: Whether inference times are measured (inference.csv) or reconstructed.
     inference_source: str = "none"
+    #: "queue" (crisp_gym's producer loop) or "splice" (splice_loop.py).
+    mode: str = "queue"
 
     def _median(self, attr: str) -> float | None:
         v = [getattr(c, attr) for c in self.chunks if getattr(c, attr) is not None]
@@ -302,8 +304,8 @@ class Timeline:
     @property
     def stride_mismatch(self) -> bool:
         """The Hermite tangents are in units that differ by the stride (module doc)."""
-        return (self.blend_overlap > 0 and self.blend_mode == "hermite"
-                and self.action_stride > 1)
+        return (self.mode == "queue" and self.blend_overlap > 0
+                and self.blend_mode == "hermite" and self.action_stride > 1)
 
 
 @dataclass
@@ -313,6 +315,8 @@ class RunFiles:
     frames: dict | None = None
     inference: dict | None = None
     trace: dict | None = None
+    #: ``splices.csv`` from ``loop.mode: splice`` runs -- the recorded seam facts.
+    splices: dict | None = None
     summary: dict = field(default_factory=dict)
     rc: dict = field(default_factory=dict)
 
@@ -339,6 +343,7 @@ def load_run(run_dir: Path) -> RunFiles:
         chunks=read_csv(run_dir / "chunks.csv"),
         frames=read_csv(run_dir / "frames.csv"),
         inference=read_csv(run_dir / "inference.csv"),
+        splices=read_csv(run_dir / "splices.csv"),
         trace=trace,
         summary=json.loads(sp.read_text()) if sp.exists() else {},
         rc=rc,
@@ -410,11 +415,22 @@ def reconstruct(run: RunFiles) -> Timeline:
     preds = run.trace.get("chunk") if run.trace else None
     slack = run.frames.get("slack_ms") if run.frames else None
 
+    # Under the splice loop the seam facts are recorded, not reconstructed.
+    sp = run.splices
+    if sp is not None and "n_bridge" in sp:
+        tl.mode = "splice"
+        bridge_by_chunk = {int(c): int(n) for c, n in zip(sp["chunk"], sp["n_bridge"])}
+    else:
+        tl.mode = str((rc.get("loop") or {}).get("mode", "queue") or "queue")
+        bridge_by_chunk = None
+
     for ci, (lo, hi) in enumerate(bounds):
         # Executed rows that are the seam bridge rather than policy output. Needs the
         # predicted chunk for the adaptive/exempt stride paths; plain striding does not.
         n_bridge = 0
-        if ci > 0 and tl.blend_overlap > 0:
+        if bridge_by_chunk is not None:
+            n_bridge = min(bridge_by_chunk.get(ci, 0), hi - lo)
+        elif ci > 0 and tl.blend_overlap > 0:
             if preds is not None and ci < len(preds):
                 st = stages(np.asarray(preds[ci]), rc)
                 n_bridge = bridge_rows(rc, len(preds[ci]), st["emitted"])
@@ -467,7 +483,17 @@ def describe(tl: Timeline) -> list[tuple[str, str]]:
     inf = tl.median_inference_ms
     qs = [c.q_logged for c in tl.chunks[1:] if c.q_logged is not None]
     q = int(np.median(qs)) if qs else tl.overlap_threshold
-    if lat is not None:
+    if lat is not None and tl.mode == "splice":
+        nb = [c.n_bridge for c in tl.chunks[1:]]
+        out.append(("Chunks are spliced at the time-aligned row", (
+            f"Median {lat:.0f} ms ({lat / frame:.1f} frames of {frame:.0f} ms) from the "
+            f"observation to the first bridge row"
+            + (f", {latp:.0f} ms ({latp / frame:.1f} frames) to the first verbatim row, "
+               f"which is the one the policy predicted for that moment"
+               if latp is not None else "")
+            + f". Bridge {int(np.median(nb)) if nb else 0} rows; inference {inf:.0f} ms, "
+            "run inside the dwell of the observed row.")))
+    elif lat is not None:
         detail = (f"Median {lat:.0f} ms ({lat / frame:.1f} frames of {frame:.0f} ms) "
                   f"from the observation to this chunk's first published row. That is "
                   f"the {q} frames queued when inference was requested"
