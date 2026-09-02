@@ -716,22 +716,33 @@ def gui(run: Path, start: int | None = None, save: Path | None = None) -> int:
             fate[i] = 3
         for i in st["blend_held"]:
             fate[i] = 4
-        palette = ("#d8dde2", "#2a78d6", "#eb6834", "#9aa4ad", "#eda100")
+        # An exempt row that the truncation or the blend then cut never executed. It
+        # would otherwise repaint as ordinary truncation, hiding the fact that the
+        # gripper protection was applied and then thrown away.
+        discarded = set(st["exempt_added"]) & (set(st["truncated_off"]) | set(st["blend_held"]))
+        for i in discarded:
+            fate[i] = 5
+        palette = ("#d8dde2", "#2a78d6", "#eb6834", "#9aa4ad", "#eda100", "#b5231a")
         axf.bar(np.arange(npred), np.ones(npred), width=1.0,
                 color=[palette[f] for f in fate], linewidth=0)
         axf.set_xlim(-0.5, npred - 0.5); axf.set_ylim(0, 1)
         axf.set_yticks([]); axf.tick_params(labelsize=7)
         axf.set_xlabel("predicted row index", fontsize=7.5, labelpad=1)
         n_ex = len(st["exempt_added"])
-        axf.set_title(
-            f"chunk {lo_c}: what became of each predicted row"
-            + (f"   —   gripper exemption held {n_ex} rows "
-               f"({n_ex / max(npred, 1):.0%} of the chunk)" if n_ex else ""),
-            fontsize=8.5, loc="left")
+        n_lost = len(discarded)
+        note = ""
+        if n_ex:
+            note = f"   —   gripper exemption held {n_ex} rows"
+            note += (f", but {n_lost} were then DISCARDED" if n_lost
+                     else f" ({n_ex / max(npred, 1):.0%} of the chunk)")
+        axf.set_title(f"chunk {lo_c}: what became of each predicted row" + note,
+                      fontsize=8.5, loc="left",
+                      color="#b5231a" if n_lost else "black")
         for c, lab in zip(palette, ("dropped by stride", "executed", "gripper exemption",
-                                    "cut by n_action_steps", "held for blend")):
+                                    "cut by n_action_steps", "held for blend",
+                                    "exempt, then discarded")):
             axf.bar([np.nan], [np.nan], color=c, label=lab)
-        axf.legend(loc="upper center", bbox_to_anchor=(0.5, -1.55), ncol=5,
+        axf.legend(loc="upper center", bbox_to_anchor=(0.5, -1.55), ncol=6,
                    frameon=False, fontsize=6.8, handlelength=1.1, columnspacing=1.1)
 
         axt.clear(); axt.axis("off")
