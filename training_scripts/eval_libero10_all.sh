@@ -72,6 +72,9 @@ fi
 BASE=outputs/train/ds_libero10_base/checkpoints/last/pretrained_model
 SPEEDUP=outputs/train/ds_libero10_speedup/checkpoints/last/pretrained_model
 BSPLINE=outputs/train/ds_libero10_bspline/checkpoints/last/pretrained_model
+# The GRIPPER_SCALE=10 retrain. Same arm, same budget, same flags -- the only
+# difference is the loss weight on slot 9, so the two are directly comparable.
+BSPLINE_V2=outputs/train/ds_libero10_bspline_v2/checkpoints/last/pretrained_model
 POSEMB=outputs/train/ds_libero10_bspline_uniform_posemb/checkpoints/last/pretrained_model
 
 run_arm() {
@@ -90,6 +93,11 @@ run_arm() {
       # The fit parameters are reconstruction, not choices: they must be what the
       # checkpoint trained under. Only num_actions is free, and it is the speed lever.
       bspline)     args=(--policy_path="$BSPLINE" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.num_actions=16) ;;
+      bspline_v2)  args=(--policy_path="$BSPLINE_V2" --n_action_steps=16
                          --method.type=bspline --method.layout=ee6d20
                          --method.arrangement=xvla_ee6d20 --method.chunk_size=10
                          --method.degree=3 --method.max_error=0.01 --method.fps=20
