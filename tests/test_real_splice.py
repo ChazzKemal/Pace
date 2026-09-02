@@ -158,12 +158,15 @@ class TestAdaptiveBridge:
 
 
 class FakeScaler:
-    """ReplayScaler's cached state after apply(), with kd on auto."""
+    """ReplayScaler's cached state after apply(), with kd on auto: kp 400 on the
+    translation axes, 100 on rotation, as on the rig."""
 
-    def __init__(self, kp=400.0):
-        self._original_kp = {f"task.k_pos_{a}": kp for a in "xyz"}
-        self._original_kd = {f"task.d_pos_{a}": 0.0 for a in "xyz"}
-        self._kd_is_auto = {f"task.d_pos_{a}": True for a in "xyz"}
+    def __init__(self, kp=400.0, k_rot=100.0):
+        self._original_kp = {**{f"task.k_pos_{a}": kp for a in "xyz"},
+                             **{f"task.k_rot_{a}": k_rot for a in "xyz"}}
+        self._original_kd = {**{f"task.d_pos_{a}": 0.0 for a in "xyz"},
+                             **{f"task.d_rot_{a}": 0.0 for a in "xyz"}}
+        self._kd_is_auto = {k: True for k in self._original_kd}
         self.kd_exp = 1.0
         self.restored = None
 
@@ -178,7 +181,7 @@ class TestRaiseDamping:
         out = raise_damping(sc, kd_ratio=1.5, kp_exp=1.5)
         # 1.5 x 2 sqrt(400) = 60 on every axis, now non-auto, scaling as s^(1.5/2)
         assert out["kd_at_s1"]["task.d_pos_x"] == pytest.approx(60.0)
-        assert all(v == pytest.approx(60.0) for v in sc._original_kd.values())
+        assert out["kd_at_s1"]["task.d_rot_x"] == pytest.approx(30.0)   # 1.5 x 2 sqrt(100)
         assert not any(sc._kd_is_auto.values())
         assert sc.kd_exp == pytest.approx(0.75)
 
@@ -195,9 +198,21 @@ class TestRaiseDamping:
         sc = FakeScaler(kp=400.0)
         out = raise_damping(sc, kp_exp=1.0, kd_exp=1.5, kd_base=100.0, kd_ratio=1.5)
         assert out["kd_base"] == 100.0 and out["kd_ratio"] is None
-        assert all(v == pytest.approx(100.0) for v in sc._original_kd.values())
         assert sc.kd_exp == pytest.approx(1.5)          # kd_base wins over kd_ratio
-        assert not any(sc._kd_is_auto.values())
+        # translation gets 100; rotation is NOT touched -- it stays on auto
+        for a in "xyz":
+            assert sc._original_kd[f"task.d_pos_{a}"] == pytest.approx(100.0)
+            assert sc._kd_is_auto[f"task.d_pos_{a}"] is False
+            assert sc._original_kd[f"task.d_rot_{a}"] == 0.0
+            assert sc._kd_is_auto[f"task.d_rot_{a}"] is True
+        assert "task.d_rot_x" not in out["kd_at_s1"]
+
+    def test_rotation_gets_its_own_base_only_when_asked(self):
+        from pace_bench.real.gains import raise_damping
+        sc = FakeScaler()
+        out = raise_damping(sc, kp_exp=1.0, kd_exp=1.5, kd_base=100.0, kd_base_rot=30.0)
+        assert out["kd_at_s1"]["task.d_rot_x"] == pytest.approx(30.0)
+        assert sc._kd_is_auto["task.d_rot_x"] is False
 
     def test_ratio_one_or_no_scaler_changes_nothing(self):
         from pace_bench.real.gains import raise_damping

@@ -142,6 +142,10 @@ class GainsConfig:
     #: segment; auto is restored at teardown. 0 leaves the axes on the controller's
     #: auto value 2*sqrt(kp) (40 for kp 400). See pace_bench.real.gains.
     kd_base: float = 0.0
+    #: The same for the rotation axes (k_rot 100 here, auto d_rot 20). 0 keeps them
+    #: on auto even when kd_base is set -- they are a different stiffness in
+    #: different units, and the translational number on them makes the arm vibrate.
+    kd_base_rot: float = 0.0
     #: Alternative to kd_base: damping as a multiple of auto, tracking sqrt(kp_eff).
     #: Ignored when kd_base is set. 1.0 = auto.
     kd_ratio: float = 1.0
@@ -566,7 +570,8 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         # controller is an impedance law, so wrench = kp * (target - achieved).
         gains = read_cartesian_gains(env, args.controller_node, scaler=scaler)
         damping = raise_damping(scaler, kp_exp=cfg.gains.kp_exp, kd_exp=cfg.gains.kd_exp,
-                                kd_base=cfg.gains.kd_base, kd_ratio=cfg.gains.kd_ratio)
+                                kd_base=cfg.gains.kd_base, kd_base_rot=cfg.gains.kd_base_rot,
+                                kd_ratio=cfg.gains.kd_ratio)
         session.phase_pin_gripper_speed(env, args)
         session.phase_gil_hygiene(env, args)
         quiesce_target_pose_timer(env)

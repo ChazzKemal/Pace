@@ -108,7 +108,8 @@ gains:
                             # (d = 2*sqrt(k)), so damping follows the new stiffness on
                             # its own and the scaler deliberately never pushes a d for
                             # an auto axis.
-  kd_base: 100              # Explicit damping at s = 1, in the controller's units
+  kd_base: 100              # TRANSLATION axes only. Explicit damping at s = 1, in
+                            # the controller's units
                             # (kd reads 0 on this rig = auto, d = 2*sqrt(k) = 40 for
                             # kp 400: critical damping for a unit mass, a ratio nearer
                             # 0.25 for the arm's ~15 kg -- the 17:39 run overshot the
@@ -116,7 +117,11 @@ gains:
                             # kp 400 is a ratio of about 0.65. Pushed with kp at
                             # every segment as kd_base * s_eff**kd_exp; auto is put
                             # back at teardown. 0 leaves the axes on auto.
-  kd_exp: 1.5               # kd grows faster than kp (kp_exp 1.0) as the method
+  kd_base_rot: 0            # Rotation axes: 0 = stay on auto (k_rot 100 -> d_rot 20).
+                            # kd_base was pushed onto them too on the 18:43 run
+                            # (d_rot 100, 5-9x auto) and the arm vibrated. Give them
+                            # their own number here if you ever want more.
+  kd_exp: 1.0               # kd grows faster than kp (kp_exp 1.0) as the method
                             # speeds up, so the damping ratio rises with speed rather
                             # than falling as it would on auto.
 
