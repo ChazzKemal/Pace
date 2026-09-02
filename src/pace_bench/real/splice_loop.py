@@ -92,6 +92,13 @@ class SpliceConfig:
     bridge_rows: int = 4
     #: "cubic" (C¹, tangents in per-row units) or "quintic" (C²).
     bridge: str = "cubic"
+    #: The bridge grows beyond ``bridge_rows`` (up to ``bridge_rows_max``) so that
+    #: no row of it steps more than ``bridge_step_mm``. The gap a seam has to cover
+    #: is set by how far the policy's plan sits from the command stream -- 45 mm
+    #: median and up to 196 mm on the 17:39 run -- and crossing 196 mm in 4 rows is
+    #: 60 mm per row, a burst the arm then overshoots. 0 disables the adaptation.
+    bridge_rows_max: int = 12
+    bridge_step_mm: float = 15.0
     #: Grasp hold: for this many seconds of demo time after the *sent* gripper
     #: command crosses to closed, every row dwells at demo cadence -- 50 ms per raw
     #: frame it covers. Sized to the jaw stroke, not to a frame count; the same value
@@ -150,7 +157,10 @@ class Splice:
     inference_ms: float = 0.0
     get_obs_ms: float = 0.0
     build_ms: float = 0.0
-    late: bool = False
+    #: Inference + splice took longer than one dwell, so the sender had already
+    #: published the committed row and was waiting for this one. Not a missed
+    #: deadline -- that needs two dwells, and frames.csv slack records those.
+    over_dwell: bool = False
 
 
 @dataclass
@@ -204,6 +214,18 @@ class Plan:
             raise ValueError(f"plan has {len(self.actions)} rows; cannot splice at {k_s}")
 
         can_bridge = h_b > 0 and k_s >= 2 and (i_s + h_b + 1) < len(new_actions)
+        if can_bridge and cfg.bridge_step_mm > 0:
+            # Lengthen the bridge until no row steps more than bridge_step_mm. The
+            # landing row moves with h_b, so the gap is re-measured once.
+            p0_xyz = self.actions[k_s - 1][:3]
+            room = len(new_actions) - i_s - 2
+            for _ in range(2):
+                gap_mm = float(np.linalg.norm(new_actions[i_s + h_b][:3] - p0_xyz)) * 1000.0
+                need = int(np.ceil(gap_mm / float(cfg.bridge_step_mm)))
+                h_new = min(max(need, int(cfg.bridge_rows)), int(cfg.bridge_rows_max), room)
+                if h_new == h_b:
+                    break
+                h_b = max(h_new, 1)
         if not can_bridge:
             i_star, bridge = i_s, np.zeros((0, new_actions.shape[1]))
             gap = 0.0
@@ -475,9 +497,10 @@ def run_splice_loop(
             stages["push_ms"].append(0.0)
             stages["drain_wait_ms"].append(0.0)
             info.inference_ms, info.get_obs_ms, info.build_ms = inf_ms, get_obs_ms, build_ms
-            # Late: the sender has already published k_obs+1 and is waiting for k_s.
-            info.late = executing() >= k_s - 1 and k_s > 0
-            if info.late:
+            # Over one dwell: the sender has already published the committed row
+            # and is waiting for k_s. Its own deadline is a dwell further out.
+            info.over_dwell = executing() >= k_s - 1 and k_s > 0
+            if info.over_dwell:
                 starvation += 1
             splices.append(info)
             k_obs_last = k_obs
@@ -493,7 +516,8 @@ def run_splice_loop(
                 "chunk %d: inf=%.1fms obs@row %d splice@row %d -> out[%d:], bridge %d rows "
                 "over %.0f mm, retracted %d, plan now %d rows%s",
                 chunk_count, inf_ms, k_obs, k_s, info.i_star, info.n_bridge,
-                info.gap_mm, info.rows_retracted, len(plan), "  LATE" if info.late else "")
+                info.gap_mm, info.rows_retracted, len(plan),
+                "  over one dwell" if info.over_dwell else "")
     finally:
         rec.chunk_count = chunk_count
         rec.stopped_by = stopped_by

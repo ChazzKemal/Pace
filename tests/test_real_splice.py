@@ -56,7 +56,7 @@ class TestBridges:
 
 
 class TestPlanSplice:
-    cfg = SpliceConfig(commit_rows=1, bridge_rows=4, bridge="cubic")
+    cfg = SpliceConfig(commit_rows=1, bridge_rows=4, bridge="cubic", bridge_step_mm=0)   # rows are unit-less here
 
     def test_first_chunk_is_placed_verbatim_with_no_bridge(self):
         plan = Plan()
@@ -129,8 +129,77 @@ class TestPlanSplice:
             plan.splice(3, line([0, 0, 0], [1, 0, 0], 8), np.ones(8), k_obs=5, cfg=self.cfg)
 
 
+class TestAdaptiveBridge:
+    def test_bridge_grows_so_no_row_steps_more_than_the_cap(self):
+        cfg = SpliceConfig(bridge_rows=4, bridge_rows_max=12, bridge_step_mm=15.0)
+        plan = Plan()
+        plan.splice(0, line([0, 0, 0], [0.001, 0, 0], 32), np.ones(32), k_obs=0, cfg=cfg)
+        # New chunk 200 mm away in y: 4 rows would be 50 mm per row.
+        new = line([0.012, 0.2, 0], [0.001, 0, 0], 32)
+        info = plan.splice(12, new, np.ones(32), k_obs=10, cfg=cfg)
+        assert info.n_bridge == 12                      # ceil(200 / 15) = 14, capped at 12
+        assert info.i_star == 2 + 12
+        steps = np.linalg.norm(np.diff(np.array(plan.actions)[11:11 + 14, :3], axis=0), axis=1) * 1000
+        assert steps.max() < 30                         # vs ~50 with 4 rows
+
+    def test_small_gaps_keep_the_nominal_bridge(self):
+        cfg = SpliceConfig(bridge_rows=4, bridge_rows_max=12, bridge_step_mm=15.0)
+        plan = Plan()
+        plan.splice(0, line([0, 0, 0], [0.001, 0, 0], 32), np.ones(32), k_obs=0, cfg=cfg)
+        info = plan.splice(12, line([0.012, 0.01, 0], [0.001, 0, 0], 32), np.ones(32), k_obs=10, cfg=cfg)
+        assert info.n_bridge == 4
+
+    def test_zero_step_disables_the_adaptation(self):
+        cfg = SpliceConfig(bridge_rows=4, bridge_step_mm=0.0)
+        plan = Plan()
+        plan.splice(0, line([0, 0, 0], [0.001, 0, 0], 32), np.ones(32), k_obs=0, cfg=cfg)
+        info = plan.splice(12, line([0, 0.3, 0], [0.001, 0, 0], 32), np.ones(32), k_obs=10, cfg=cfg)
+        assert info.n_bridge == 4
+
+
+class FakeScaler:
+    """ReplayScaler's cached state after apply(), with kd on auto."""
+
+    def __init__(self, kp=400.0):
+        self._original_kp = {f"task.k_pos_{a}": kp for a in "xyz"}
+        self._original_kd = {f"task.d_pos_{a}": 0.0 for a in "xyz"}
+        self._kd_is_auto = {f"task.d_pos_{a}": True for a in "xyz"}
+        self.kd_exp = 1.0
+        self.restored = None
+
+    def restore(self):
+        self.restored = (dict(self._original_kd), dict(self._kd_is_auto))
+
+
+class TestRaiseDamping:
+    def test_pushes_ratio_times_auto_and_tracks_sqrt_kp(self):
+        from pace_bench.real.gains import raise_damping
+        sc = FakeScaler(kp=400.0)
+        out = raise_damping(sc, kd_ratio=1.5, kp_exp=1.5)
+        # 1.5 x 2 sqrt(400) = 60 on every axis, now non-auto, scaling as s^(1.5/2)
+        assert out["kd_at_s1"]["task.d_pos_x"] == pytest.approx(60.0)
+        assert all(v == pytest.approx(60.0) for v in sc._original_kd.values())
+        assert not any(sc._kd_is_auto.values())
+        assert sc.kd_exp == pytest.approx(0.75)
+
+    def test_restore_puts_auto_back(self):
+        from pace_bench.real.gains import raise_damping
+        sc = FakeScaler()
+        raise_damping(sc, kd_ratio=1.5, kp_exp=1.5)
+        sc.restore()
+        kd, auto = sc.restored
+        assert all(v == 0.0 for v in kd.values()) and all(auto.values())
+
+    def test_ratio_one_or_no_scaler_changes_nothing(self):
+        from pace_bench.real.gains import raise_damping
+        sc = FakeScaler()
+        assert raise_damping(sc, kd_ratio=1.0, kp_exp=1.5) is None
+        assert all(sc._kd_is_auto.values()) and sc.kd_exp == 1.0
+        assert raise_damping(None, kd_ratio=1.5, kp_exp=1.5) is None
+
+
 class TestSpans:
-    cfg = SpliceConfig(commit_rows=1, bridge_rows=4, bridge="cubic")
+    cfg = SpliceConfig(commit_rows=1, bridge_rows=4, bridge="cubic", bridge_step_mm=0)   # rows are unit-less here
 
     def test_rows_carry_the_raw_frames_they_advance(self):
         plan = Plan()
@@ -337,7 +406,7 @@ class TestLoop:
             pred_dt_samples=[], trace_records=[], chunk_rows=[])
         args = types.SimpleNamespace(max_chunks=5 if period else 3, record_trace=True, record_trace_every=1)
         env = types.SimpleNamespace(action_to_rotation=None)
-        cfg = SpliceConfig(replan_every=period, commit_rows=1, bridge_rows=4)
+        cfg = SpliceConfig(replan_every=period, commit_rows=1, bridge_rows=4, bridge_step_mm=0)
         H = cfg.resolve_replan_every(32)
         splices = run_splice_loop(
             env=env, chunk_source=Source(), q=q, sender=sender, args=args, rec=rec,
@@ -353,7 +422,7 @@ class TestLoop:
         for s in splices[1:]:
             assert s.k_s == s.k_obs + 2, s                    # commit_rows = 1: obs row + held row
             assert s.i_star == s.k_s + 4 - s.k_obs            # time-aligned entry
-            assert s.n_bridge == 4 and not s.late
+            assert s.n_bridge == 4 and not s.over_dwell
         # Replans came on the period, measured in published rows.
         assert all(b - a >= H for a, b in itertools.pairwise(requests))
         # The sender published frame indices in order with no gaps, and never had more
@@ -403,7 +472,7 @@ class TestLoop:
                                     ("get_obs_ms", "synth_ms", "build_ms", "push_ms", "drain_wait_ms")},
             pred_dt_samples=[], trace_records=[], chunk_rows=[])
         args = types.SimpleNamespace(max_chunks=3, record_trace=False, record_trace_every=1)
-        cfg = SpliceConfig(replan_every=12, bridge_rows=4, hold_s=WIN * dt, fps=1 / dt)
+        cfg = SpliceConfig(replan_every=12, bridge_rows=4, hold_s=WIN * dt, fps=1 / dt, bridge_step_mm=0)
         run_splice_loop(env=types.SimpleNamespace(action_to_rotation=None), chunk_source=Source(),
                         q=q, sender=sender, args=args, rec=rec, dt_base=dt, obs_schema=None,
                         gripper_enabled=False, gripper_unnormalize_fn=None, obs_buf=[],

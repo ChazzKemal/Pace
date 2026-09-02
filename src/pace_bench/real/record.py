@@ -460,7 +460,7 @@ def _dependency_provenance(module_path: Path, own_root: Path) -> dict:
 
 
 def write_manifest(out_dir: Path, *, cfg, method, deployed_path: str,
-                   gains: dict | None = None) -> Path | None:
+                   gains: dict | None = None, damping: dict | None = None) -> Path | None:
     """Write ``manifest.json``: which checkpoint this run actually executed.
 
     The gap this closes is the one that makes 661 existing run folders hard to trust.
@@ -500,7 +500,9 @@ def write_manifest(out_dir: Path, *, cfg, method, deployed_path: str,
                         "bspline_low_v": cfg.gripper.bspline_low_v,
                         "hold_s": getattr(cfg.gripper, "hold_s", None)},
             "gains": {"scale_kp": cfg.gains.scale_kp, "kp_exp": cfg.gains.kp_exp,
-                      "kd_exp": cfg.gains.kd_exp},
+                      "kd_exp": cfg.gains.kd_exp,
+                      "kd_ratio": getattr(cfg.gains, "kd_ratio", 1.0)},
+            "damping_pushed": damping,
             "controller_gains_at_startup": gains,
             "git": {
                 "pace": _git_sha(pace_root),

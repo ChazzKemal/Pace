@@ -51,7 +51,8 @@ from pace_bench.real.checkpoint import (
 )
 from pace_bench.real.configs import materialise, resolve_policy_path
 from pace_bench.real.deploy_flags import blend_overlap_for, set_flag
-from pace_bench.real.deploy_steps import deploy_steps
+from pace_bench.real.deploy_steps import PaceSpeed, deploy_steps
+from pace_bench.real.gains import raise_damping
 from pace_bench.real.picker import maybe_pick_config
 from pace_bench.real.record import (
     ChunkClock,
@@ -122,6 +123,11 @@ class LoopConfig:
     commit_rows: int = 1
     bridge_rows: int = 4
     bridge: str = "cubic"
+    #: The bridge grows past `bridge_rows` (up to `bridge_rows_max`) so that no
+    #: row of it steps more than `bridge_step_mm`. A 20 cm seam crossed in 4 rows
+    #: is 60 mm per row -- 1.8 m/s -- and the arm overshoots the stop.
+    bridge_rows_max: int = 12
+    bridge_step_mm: float = 15.0
 
 
 @dataclass
@@ -131,6 +137,11 @@ class GainsConfig:
     scale_kp: bool = False
     kp_exp: float = 2.0
     kd_exp: float = 1.0
+    #: Damping relative to the controller's auto value 2*sqrt(kp). 1.0 leaves the
+    #: axes on auto. Above 1, an explicit kd = kd_ratio * 2*sqrt(kp_eff) is pushed
+    #: with kp at every segment (kd_exp is then kp_exp/2 so it tracks sqrt(kp_eff)),
+    #: and auto is restored at teardown. See pace_bench.real.gains.
+    kd_ratio: float = 1.0
 
 
 @dataclass
@@ -436,23 +447,19 @@ def quiesce_target_pose_timer(env) -> None:
     logger.info("target_pose timer(s) cancelled before handover: %d", cancelled)
 
 
-def _raw_index_fn(method):
+def _raw_index_fn(steps):
     """Which raw frame each pipeline output row came from, for the grasp hold.
 
-    PACE strides, so its output rows map to raw frames through `stride_indices` --
-    the same call `PaceSpeed.plan` makes, on the same config, so the two agree row
-    for row. Every other method keeps the demo cadence and needs no map.
+    PACE strides, so its output rows map to raw frames through `stride_indices`.
+    Rather than call it a second time per chunk -- it cost ~25 ms of the splice on
+    the 17:39 run, more than inference -- the step remembers the indices of its
+    last `plan()` and the loop reads them back after running the pipeline. Every
+    other method keeps the demo cadence and needs no map.
     """
-    if getattr(method, "type", None) != "pace":
+    pace = next((s for s in steps if isinstance(s, PaceSpeed)), None)
+    if pace is None:
         return None
-    import numpy as np
-    import torch
-
-    from pace_bench.methods.pace.speed import stride_indices
-
-    pc = method.to_pace_config()
-    return lambda chunk: stride_indices(
-        torch.from_numpy(np.ascontiguousarray(chunk, dtype=np.float32))[None], pc)
+    return lambda chunk: pace.last_keep
 
 
 def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
@@ -509,6 +516,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         # joint efforts never reach this process (crisp_py drops msg.effort), but the
         # controller is an impedance law, so wrench = kp * (target - achieved).
         gains = read_cartesian_gains(env, args.controller_node, scaler=scaler)
+        damping = raise_damping(scaler, kd_ratio=cfg.gains.kd_ratio, kp_exp=cfg.gains.kp_exp)
         session.phase_pin_gripper_speed(env, args)
         session.phase_gil_hygiene(env, args)
         quiesce_target_pose_timer(env)
@@ -535,7 +543,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         started_at, out_dir, video_recorders = session.phase_video_and_delay(
             env, args, n_obs, n_act)
         write_manifest(out_dir, cfg=cfg, method=method, deployed_path=pretrained,
-                       gains=gains)
+                       gains=gains, damping=damping)
         dump_run_config(cfg, out_dir)
 
         rec = RunRecord(out_dir=out_dir, run_started_at=started_at, duration_s=0.0,
@@ -561,10 +569,12 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
                 cfg=SpliceConfig(replan_every=cfg.loop.replan_every,
                                  commit_rows=cfg.loop.commit_rows,
                                  bridge_rows=cfg.loop.bridge_rows,
+                                 bridge_rows_max=cfg.loop.bridge_rows_max,
+                                 bridge_step_mm=cfg.loop.bridge_step_mm,
                                  bridge=cfg.loop.bridge,
                                  hold_s=cfg.gripper.hold_s, fps=cfg.fps,
                                  grip_invert=cfg.gripper.invert),
-                n_action_steps=n_act, raw_index_fn=_raw_index_fn(method), **common)
+                n_action_steps=n_act, raw_index_fn=_raw_index_fn(steps), **common)
         elif cfg.loop.mode == "queue":
             run_producer_loop(lookbehind_buf=deque(maxlen=8), **common)
         else:

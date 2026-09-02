@@ -13,7 +13,7 @@
 policy_path: ""             # supply with --policy_path
 env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
 fps: 20.0
-n_action_steps: 32          # executed per query. The bound is LeRobot's own,
+n_action_steps: 28          # executed per query. The bound is LeRobot's own,
                             # n_action_steps <= horizon - n_obs_steps + 1, which for
                             # the ACT arms (chunk_size 100, n_obs_steps 1) is 100.
                             # Fewer replans than 32 did, and more inference budget.
@@ -62,6 +62,13 @@ loop:
                             # acceleration on the worst ones at one row of latency.
   bridge: cubic             # C1 with both tangents per executed row. quintic (C2)
                             # is available and did not beat it on the replay.
+  bridge_step_mm: 15        # The bridge grows past bridge_rows (up to bridge_rows_max)
+                            # so no row of it steps more than this. On the 17:39 run
+                            # seams of 100-196 mm were crossed in 4 rows -- 60 mm per
+                            # row, 1.8 m/s -- and the arm overshot the stop. 15 mm/row
+                            # is ~0.45 m/s at 34 ms rows; the run's normal p95 step
+                            # was 25.
+  bridge_rows_max: 12
 
 gains:
   scale_kp: true            # Scale controller stiffness with the speed the method
@@ -81,7 +88,7 @@ gains:
                             # Inert for every method but PACE: `deploy_args` propagates
                             # a peak only when the method has `max_speed`, and none of
                             # none/bspline/demospeedup do, so their factor stays 1.0.
-  kp_exp: 1.5               # Linear in speed, not quadratic. The C++ controller's own
+  kp_exp: 1.0               # Linear in speed, not quadratic. The C++ controller's own
                             # convention is quadratic (kp ~ s**2 keeps the closed-loop
                             # natural frequency proportional to speed), and 2.0 is
                             # crisp_gym's default -- but that squares the risk as well
@@ -101,6 +108,15 @@ gains:
                             # (d = 2*sqrt(k)), so damping follows the new stiffness on
                             # its own and the scaler deliberately never pushes a d for
                             # an auto axis.
+  kd_ratio: 1.5             # Damping relative to the controller's auto d = 2*sqrt(k).
+                            # kd reads 0 on this rig (auto), which is critical damping
+                            # for a unit mass; with the arm's ~15 kg effective mass the
+                            # ratio is nearer 0.25, and the 17:39 run overshot the
+                            # commanded z by 35 mm after a fast seam. 1.5 pushes an
+                            # explicit kd = 1.5 * 2*sqrt(kp_eff) alongside kp at every
+                            # segment, so it still rises with speed, and puts auto
+                            # back at teardown. 1.0 leaves the axes on auto.
+
 gripper:
   hold_s: 0.7               # Splice mode. After the SENT gripper command closes, every
                             # row dwells at demo cadence (50 ms per raw frame) for this
