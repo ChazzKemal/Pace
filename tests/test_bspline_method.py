@@ -1037,3 +1037,74 @@ class TestPredictBeforeEnd:
         held.decode_batch(matrices, sequential=True)
         full.decode_batch(matrices, sequential=True)
         assert not np.allclose(held._anchors[0], full._anchors[0])
+
+
+class TestFixedRateDecodeStep:
+    """The step-level half of `rate`: what a control loop actually receives."""
+
+    def matrix(self, splines, episode=0, frame=5):
+        return torch.from_numpy(splines.parameters(episode, frame).astype(np.float32))
+
+    def span(self, splines, episode=0, frame=5):
+        m = splines.parameters(episode, frame)
+        return float(m[-(DEGREE + 1), 0] - m[DEGREE, 0])
+
+    def test_the_row_count_follows_the_span(self, splines):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        step = BSplineDecodeStep(rate=2.0)
+        for frame in (5, 40, 90):
+            out = step({TransitionKey.ACTION: self.matrix(splines, 0, frame), TransitionKey.COMPLEMENTARY_DATA: {}})
+            expected = int(np.floor(self.span(splines, 0, frame) / 2.0 + 1e-6)) + 1
+            assert out[TransitionKey.ACTION].shape == (expected, 10)
+
+    def test_the_realised_rate_is_the_configured_one(self, splines):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        out = BSplineDecodeStep(rate=1.5)({
+            TransitionKey.ACTION: self.matrix(splines), TransitionKey.COMPLEMENTARY_DATA: {}
+        })
+        assert float(out[TransitionKey.COMPLEMENTARY_DATA]["bspline_rate"][0]) == pytest.approx(1.5)
+
+    def test_the_hold_back_is_measured_in_seconds_through_the_rate(self, splines):
+        """0.06 s at 20 fps is 1.2 source frames: two rows at rate 1, one row at rate 2."""
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        def rows(rate, hold):
+            out = BSplineDecodeStep(rate=rate, fps=20.0, predict_before_end=hold)({
+                TransitionKey.ACTION: self.matrix(splines), TransitionKey.COMPLEMENTARY_DATA: {}
+            })
+            return out[TransitionKey.ACTION].shape[0]
+
+        assert rows(1.0, 0.0) - rows(1.0, 0.06) == 2
+        assert rows(2.0, 0.0) - rows(2.0, 0.06) == 1
+
+    def test_the_config_carries_the_rate_and_rebuilds_from_it(self, splines):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        step = BSplineDecodeStep(rate=1.9)
+        config = step.get_config()
+        assert config["rate"] == 1.9
+        rebuilt = BSplineDecodeStep(**config)
+        m = self.matrix(splines)
+        torch.testing.assert_close(
+            rebuilt({TransitionKey.ACTION: m, TransitionKey.COMPLEMENTARY_DATA: {}})[TransitionKey.ACTION],
+            step({TransitionKey.ACTION: m, TransitionKey.COMPLEMENTARY_DATA: {}})[TransitionKey.ACTION],
+        )
+
+    def test_the_method_passes_it_through(self):
+        (step,) = BSplineMethod(rate=1.0).postprocessor_steps()
+        assert step.rate == 1.0
+        assert BSplineMethod().postprocessor_steps()[0].rate is None
+
+    def test_two_speed_knobs_at_once_are_refused(self):
+        with pytest.raises(ValueError, match="two speed knobs"):
+            BSplineMethod(rate=1.0, num_actions=8)
+
+    def test_a_non_positive_rate_is_refused(self):
+        from pace_bench.methods.bspline.processor import BSplineDecodeStep
+
+        with pytest.raises(ValueError, match="rate must be"):
+            BSplineMethod(rate=0.0)
+        with pytest.raises(ValueError, match="rate must be"):
+            BSplineDecodeStep(rate=-1.0)

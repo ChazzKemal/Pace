@@ -524,3 +524,38 @@ class TestConfigRoundTrip:
 
         with pytest.raises(ValueError, match=r"known:"):
             BSplineDecodeStep(layout="nope")
+
+
+class TestFixedRateAlignment:
+    """Under `rate` the spacing is the speed, so alignment can only shorten a chunk --
+    and a successful alignment means the arm already stands at the aligned point, so
+    the first command is one step past it, not the point itself."""
+
+    def step(self):
+        return BSplineDecodeStep(rate=1.6, layout=resolve_layout("cart7", 7), align=True)
+
+    def test_a_declined_alignment_walks_the_whole_span(self):
+        s = self.step()
+        m = batched(pose_matrix())          # knots 1.6 apart: span 14.4 -> 10 rows at rate 1.6
+        first = s.decode_batch(m)[0]
+        # Same matrix again: the anchor is the previous tail, past the search window,
+        # so alignment declines and the chunk starts at its own beginning.
+        second = s.decode_batch(m)[0]
+        assert first.shape[1] == second.shape[1] == 10
+
+    def test_an_arm_already_one_step_in_is_not_sent_back(self):
+        from pace_bench.methods.bspline.spline import decode_chunk
+
+        s = self.step()
+        m = pose_matrix()
+        s.decode_batch(batched(m))
+        walked = decode_chunk(m, 1, rate=1.6)          # spline-space samples, one per step
+        s._anchors[0] = walked[1].copy()               # the arm stands one step along
+        again = s.decode_batch(batched(m))[0][0].numpy()
+        # One step already walked plus the aligned point itself: two rows fewer.
+        assert again.shape[0] == 10 - 2
+        # And the first command is the *next* step, not the pose the arm is at.
+        anchor_cart7 = resolve_layout("cart7", 7).from_spline(walked[1:2])[0]
+        assert not np.allclose(again[0], anchor_cart7, atol=1e-6)
+        expected_first = resolve_layout("cart7", 7).from_spline(walked[2:3])[0]
+        np.testing.assert_allclose(again[0], expected_first, atol=1e-6)

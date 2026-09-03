@@ -336,24 +336,38 @@ def decode_chunk(
     relative_knots: bool = False,
     align_to: np.ndarray | None = None,
     compare_dim: int | None = None,
+    rate: float | None = None,
 ) -> np.ndarray:
-    """Evaluate one parameter matrix into ``(num_actions, dim)`` actions.
+    """Evaluate one parameter matrix into ``(executed, dim)`` actions.
 
-    The curve is sampled uniformly across the chunk's valid span, which runs from
-    ``knots[degree]`` to ``knots[-(degree + 1)]``. ``num_actions`` is the whole
-    speed knob and is free at inference: the span is a fixed stretch of demonstrated
-    motion, so asking for fewer samples covers it in fewer executed steps.
+    The chunk's valid span runs from ``knots[degree]`` to ``knots[-(degree + 1)]``, a
+    fixed stretch of demonstrated motion measured in source frames. Two ways to walk it:
+
+    * ``rate`` -- source frames advanced per executed action, the same for every chunk.
+      The curve is sampled at ``start, start + rate, ...`` up to the end of the span,
+      so the row count follows the span. ``rate=1`` replays the demonstration at its
+      recorded pace and ``rate=n`` is the paper's ``a_exec(t) = a(nt)``; it is also
+      upstream's deployment semantics, a clock advanced by ``dt * speed`` along the
+      curve. This is the knob that makes "1x" mean one thing.
+    * ``num_actions`` -- the same sample count for every chunk, spread uniformly over
+      the span. Then the realised rate is ``span / (num_actions - 1)`` and varies with
+      the chunk: knot density adapts to how fast the demonstration moved, so a precise
+      stretch is slowed and a transit is sped up (0.7x to 3.1x across LIBERO windows at
+      16 points, 1.8x on average). Kept for the recorded runs; ``rate`` wins when given.
 
     ``align_to`` is the last action commanded from the *previous* chunk. Given one, the
     curve is not sampled from its own beginning but from the point matching where the
     arm already is (:func:`align_start`), which is how upstream avoids a jump at every
-    chunk boundary without blending anything.
+    chunk boundary without blending anything. Under ``rate`` a successful alignment
+    means the arm already stands at the aligned point, so the first command is one
+    step past it rather than the point itself; a declined alignment starts at the
+    curve's own beginning, which the arm has yet to reach.
 
     Alignment shortens the span, and the row count follows rather than the spacing:
-    ``num_actions`` is a *speed*, so holding it fixed over a shorter span would make the
-    realised rate a function of tracking error and let a 1x run drift chunk to chunk.
-    Emitting fewer rows instead costs nothing -- the deploy loop takes the chunk's
-    length from the pipeline's output.
+    the spacing is the *speed*, so holding the count fixed over a shorter span would
+    make the realised rate a function of tracking error and let a 1x run drift chunk
+    to chunk. Emitting fewer rows instead costs nothing -- the deploy loop takes the
+    chunk's length from the pipeline's output.
     """
     parameters = np.asarray(parameters, dtype=np.float64)
     if relative_knots:
@@ -370,15 +384,32 @@ def decode_chunk(
     if not end > start:
         raise ValueError(f"chunk spans no time: knots run [{start}, {end}]")
     curve = BSpline(knots, control_points, degree, extrapolate=False)
-    count = int(num_actions)
-    if align_to is not None and count > 1:
-        rate = (end - start) / (count - 1)
-        start, _error = align_start(curve, align_to, start, end, compare_dim=compare_dim)
-        count = max(2, int(round((end - start) / rate)) + 1)
-    if count <= 1:
-        samples = np.asarray([start], dtype=np.float64)
+    if rate is not None:
+        rate = float(rate)
+        if not rate > 0:
+            raise ValueError(f"rate must be > 0 source frames per action, got {rate}")
+        first = start
+        if align_to is not None:
+            start, error = align_start(curve, align_to, start, end, compare_dim=compare_dim)
+            # `align_start` hands back the curve's own start when it declines, and the
+            # error says which happened: within tolerance, the arm stands at `start`.
+            first = start + rate if error <= ALIGN_ERROR_THRESHOLD else start
+        if first > end:
+            # Less than one step of span left: finish it, then re-plan.
+            samples = np.asarray([end], dtype=np.float64)
+        else:
+            count = int(np.floor((end - first) / rate + 1e-9)) + 1
+            samples = first + rate * np.arange(count, dtype=np.float64)
     else:
-        samples = np.linspace(start, end, count, dtype=np.float64)
+        count = int(num_actions)
+        if align_to is not None and count > 1:
+            spacing = (end - start) / (count - 1)
+            start, _error = align_start(curve, align_to, start, end, compare_dim=compare_dim)
+            count = max(2, int(round((end - start) / spacing)) + 1)
+        if count <= 1:
+            samples = np.asarray([start], dtype=np.float64)
+        else:
+            samples = np.linspace(start, end, count, dtype=np.float64)
     # Take the last sample as a limit from the left. A chunk at the episode tail is
     # padded by repeating its final knot, so `end` sits at the bottom of a run of
     # identical knots -- a zero-length span, where every basis function is zero and

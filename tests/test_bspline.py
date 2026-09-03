@@ -296,3 +296,74 @@ class TestMonotonicKnots:
         decoded = decode_chunk(parameters, 12)
         assert np.isfinite(decoded).all()
         assert decoded.shape == (12, path.shape[1])
+
+
+class TestFixedRateDecode:
+    """`rate` walks every chunk at the same source frames per executed action, so the
+    row count follows the span. It is the paper's `a_exec(t) = a(nt)` and upstream's
+    deployment clock; `num_actions` is a count that only reads as a speed on average."""
+
+    def chunks(self, path):
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        return chunk_parameters(spline, CHUNK, stride=1)
+
+    def test_the_samples_are_one_rate_apart_and_the_count_follows_the_span(self, path):
+        from scipy.interpolate import BSpline
+
+        for parameters in self.chunks(path)[:12]:
+            knots = parameters[:, 0]
+            start, end = knots[DEGREE], knots[-(DEGREE + 1)]
+            for rate in (1.0, 2.5):
+                decoded = decode_chunk(parameters, 99, rate=rate)
+                count = int(np.floor((end - start) / rate + 1e-9)) + 1
+                assert decoded.shape[0] == count
+                curve = BSpline(knots, parameters[: -(DEGREE + 1), 1:], DEGREE, extrapolate=False)
+                # A step that lands exactly on the end of a tail-padded chunk sits on a
+                # zero-length knot span, where the raw curve is the all-zero vector; the
+                # decode takes that endpoint as a limit from the left (see the padded
+                # tests above), so the reference must too.
+                t = np.minimum(start + rate * np.arange(count), np.nextafter(end, start))
+                np.testing.assert_allclose(decoded, curve(t), atol=1e-9)
+
+    def test_num_actions_is_ignored_once_a_rate_is_given(self, path):
+        parameters = self.chunks(path)[4]
+        np.testing.assert_allclose(
+            decode_chunk(parameters, 3, rate=2.0), decode_chunk(parameters, 40, rate=2.0)
+        )
+
+    def test_a_rate_that_divides_the_span_reproduces_the_uniform_decode(self, path):
+        """Where the two knobs agree they must agree exactly: the same points."""
+        parameters = self.chunks(path)[4]
+        knots = parameters[:, 0]
+        span = knots[-(DEGREE + 1)] - knots[DEGREE]
+        n = 7
+        np.testing.assert_allclose(
+            decode_chunk(parameters, n), decode_chunk(parameters, n, rate=span / (n - 1)), atol=1e-9
+        )
+
+    def test_one_source_frame_per_action_replays_the_demonstration(self, path):
+        """At rate 1 the decode is the fit sampled at every frame of the span, so the
+        error against the recorded path is the fit's tolerance, not the decode's."""
+        spline, _ = fit_episode(path, max_error=MAX_ERROR)
+        parameters = chunk_parameters(spline, CHUNK, stride=1)[6]
+        knots = parameters[:, 0]
+        start = int(round(knots[DEGREE]))
+        decoded = decode_chunk(parameters, 1, rate=1.0)
+        frames = start + np.arange(decoded.shape[0])
+        assert np.abs(decoded - path[frames]).max() < MAX_ERROR + 1e-6
+
+    def test_a_span_shorter_than_one_step_yields_its_start(self, path):
+        """Unaligned, the arm has yet to reach the curve, so the one command is its
+        beginning; the aligned case, where the arm already stands on it, is covered in
+        test_bspline_align."""
+        parameters = self.chunks(path)[4]
+        knots = parameters[:, 0]
+        span = knots[-(DEGREE + 1)] - knots[DEGREE]
+        decoded = decode_chunk(parameters, 1, rate=span * 3)
+        assert decoded.shape[0] == 1
+        np.testing.assert_allclose(decoded[0], decode_chunk(parameters, 1)[0], atol=1e-9)
+
+    def test_a_non_positive_rate_is_refused(self, path):
+        parameters = self.chunks(path)[0]
+        with pytest.raises(ValueError, match="rate must be"):
+            decode_chunk(parameters, 8, rate=0.0)

@@ -278,11 +278,14 @@ def main(cfg: LiberoEvalConfig) -> None:
         # step that expects a parameter matrix. The attached one wins: `num_actions` is
         # the speed lever and belongs to this run, not to the checkpoint, which baked
         # in whatever it trained at.
+        def speed_knob(step) -> str:
+            rate = getattr(step, "rate", None)
+            return f"rate={rate}" if rate is not None else f"num_actions={step.num_actions}"
+
         for step in drop_steps(postprocessor, "BSplineDecodeStep"):
             logger.info(
-                "dropped checkpoint-side bspline_decode (num_actions=%s); this run "
-                "decodes at num_actions=%s",
-                step.num_actions, decode.num_actions,
+                "dropped checkpoint-side bspline_decode (%s); this run decodes at %s",
+                speed_knob(step), speed_knob(decode),
             )
 
         # Its actuation is upstream's: a constant arm-kp multiple, kd and gripper left

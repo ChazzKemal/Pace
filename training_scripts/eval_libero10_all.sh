@@ -112,6 +112,32 @@ run_arm() {
                          --method.arrangement=xvla_ee6d20 --method.chunk_size=10
                          --method.degree=3 --method.max_error=0.01 --method.fps=20
                          --method.num_actions=16) ;;
+      # Fixed-rate readings. `--method.rate` walks every predicted curve at exactly that
+      # many source frames per executed step, so the count of actions follows the span
+      # and every chunk runs at the same speed: 1.0 is the demonstration's own pace,
+      # 1.9 sits beside DemoSpeedup's measured 1.91x. The 16-point arms above run each
+      # chunk at its own speed -- 0.7x to 3.1x across LIBERO windows, 1.8x on average --
+      # which is why "1.82x" up there is an average and not a setting.
+      bspline_v2_1x)   args=(--policy_path="$BSPLINE_V2" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.rate=1.0) ;;
+      bspline_v2_1.9x) args=(--policy_path="$BSPLINE_V2" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.rate=1.9) ;;
+      bspline_v2_posemb_1x)   args=(--policy_path="$BSPLINE_V2_POSEMB" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.rate=1.0) ;;
+      bspline_v2_posemb_1.9x) args=(--policy_path="$BSPLINE_V2_POSEMB" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.rate=1.9) ;;
       # The second B-spline arm, and the only difference that matters is what it was
       # allowed to learn: 16 rows of xVLA's positional embedding, which the frozen arm
       # above had to reuse as pretrained. That changes the action space too -- the

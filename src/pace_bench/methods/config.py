@@ -454,12 +454,20 @@ class BSplineMethod(MethodConfig):
     #: already-16-row config, still knows where the non-action rows came from. Not meant
     #: to be set by hand.
     source_chunk: int | None = None
-    #: Actions decoded from one predicted spline, at inference. The speed lever, and a
-    #: decode-time choice needing no retraining: the curve covers a fixed stretch of
-    #: demonstrated motion, so fewer samples cover it in fewer executed steps. The
-    #: realised factor varies per chunk with the predicted span and is published as
-    #: `bspline_rate`. Defaults to the matrix width, i.e. roughly demonstration speed.
+    #: Actions decoded from one predicted spline, at inference: the same count for every
+    #: chunk, spread over whatever span the policy predicted. A decode-time choice
+    #: needing no retraining, but a count is only a speed on average -- knot density
+    #: follows the demonstration, so at 16 points a LIBERO window runs anywhere from
+    #: 0.7x to 3.1x, 1.8x on average, and the realised factor has to be read back from
+    #: `bspline_rate`. Defaults to the matrix width. Exclusive with `rate`.
     num_actions: int | None = None
+    #: Source frames of demonstration advanced per executed action, the same for every
+    #: chunk: 1.0 replays the demonstration at its recorded pace, 1.9 sits beside
+    #: DemoSpeedup's measured 1.91x. The number of actions a chunk yields then follows
+    #: its span. This is the paper's ``a_exec(t) = a(nt)`` and upstream's deployment
+    #: semantics -- a clock advanced by ``dt * speed`` -- and the knob a speed sweep
+    #: should move. Exclusive with `num_actions`.
+    rate: float | None = None
     #: Resume each chunk at the point on its curve matching where the arm already is,
     #: instead of at the curve's own start. Upstream's time-alignment, and on by
     #: default there too (`disable_time_align=False`). Without it every chunk boundary
@@ -489,6 +497,14 @@ class BSplineMethod(MethodConfig):
             raise ValueError(f"chunk_size must be >= 2, got {self.chunk_size}")
         if self.degree < 1:
             raise ValueError(f"degree must be >= 1, got {self.degree}")
+        if self.rate is not None and not self.rate > 0:
+            raise ValueError(f"rate must be > 0 source frames per action, got {self.rate}")
+        if self.rate is not None and self.num_actions is not None:
+            raise ValueError(
+                "--method.rate and --method.num_actions are two speed knobs for the same "
+                "decode; set one. rate walks every chunk at a fixed pace, num_actions "
+                "samples every chunk at a fixed count."
+            )
         # Registering here rather than at any one call site is deliberate: xVLA
         # resolves its action space while the model is being built, so *every* path
         # that ends in a policy -- training and evaluation both -- has to have
@@ -795,6 +811,7 @@ class BSplineMethod(MethodConfig):
         return [
             BSplineDecodeStep(
                 num_actions=self.num_actions or self.width,
+                rate=self.rate,
                 degree=self.degree,
                 relative_knots=self.relative_knots,
                 align=self.align,

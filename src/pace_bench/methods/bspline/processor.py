@@ -236,13 +236,13 @@ class BSplineDecodeStep(ProcessorStep):
     control points, which no robot can execute. This evaluates that curve and maps it
     back to the dataset's own action space.
 
-    ``num_actions`` is the speed lever, and it is a *decode-time* choice needing no
-    retraining -- the paper's ``a_exec(t) = a(nt)``. The curve covers a fixed stretch
-    of demonstrated motion; asking for fewer samples covers that stretch in fewer
-    executed steps. The realised factor is published per sample as ``bspline_rate``
-    (source frames advanced per executed action), because it is a property of the
-    predicted span and so varies from chunk to chunk rather than being the constant
-    the config asks for.
+    The speed lever is a *decode-time* choice needing no retraining -- the paper's
+    ``a_exec(t) = a(nt)`` -- and it comes in two forms. ``rate`` walks every curve at
+    the same number of source frames per executed action, so the executed count
+    follows the span and ``rate=1`` is the demonstration's own pace. ``num_actions``
+    samples every curve at the same count instead, so the realised rate varies with
+    the span the policy predicted; it is published per sample as ``bspline_rate``
+    either way, and under ``rate`` it is simply the configured rate.
 
     Runs *after* the unnormalizer: it needs parameters in their own units, since the
     knot column is a time in source frames and the control points are poses.
@@ -259,10 +259,17 @@ class BSplineDecodeStep(ProcessorStep):
         fps: float = 20.0,
         predict_before_end: float = 0.0,
         knot_scale: float | None = None,
+        rate: float | None = None,
     ):
         if num_actions < 1:
             raise ValueError(f"num_actions must be >= 1, got {num_actions}")
+        if rate is not None and not float(rate) > 0:
+            raise ValueError(f"rate must be > 0 source frames per action, got {rate}")
         self.num_actions = num_actions
+        #: Source frames per executed action, the same for every chunk. Wins over
+        #: `num_actions` when set: one is a speed, the other a count that only reads
+        #: as a speed on average.
+        self.rate = None if rate is None else float(rate)
         self.degree = degree
         self.relative_knots = relative_knots
         # Names, not objects, arrive when the step is rebuilt from a checkpoint's
@@ -347,10 +354,11 @@ class BSplineDecodeStep(ProcessorStep):
                 relative_knots=self.relative_knots,
                 align_to=self._anchors[row] if aligning else None,
                 compare_dim=self.compare_dim,
+                rate=self.rate,
             )
             samples_per_row.append(samples)
             span = matrix[-(self.degree + 1), 0] - matrix[self.degree, 0]
-            rates.append(span / max(self.num_actions - 1, 1))
+            rates.append(self.rate if self.rate is not None else span / max(self.num_actions - 1, 1))
 
         # How many of each row's actions actually get executed. Alignment shortens a
         # row by however far along its curve the arm already was, so rows can differ in
@@ -407,6 +415,7 @@ class BSplineDecodeStep(ProcessorStep):
         # the least constrained part of the fit -- instead of re-planning before it.
         return {
             "num_actions": self.num_actions,
+            "rate": self.rate,
             "degree": self.degree,
             "relative_knots": self.relative_knots,
             "align": self.align,
