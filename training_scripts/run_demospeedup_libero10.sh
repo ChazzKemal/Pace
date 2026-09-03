@@ -13,10 +13,11 @@
 #                                                   visual rows put back where the
 #                                                   pretrained table had them
 #   E  method=bspline      as C                     lr 1e-4, LoRA r 16; stopped at its
-#                                                   10k checkpoint, not a comparison
-#                                                   member
-#   F  method=bspline      as E, 40k steps          + the gripper command ramped over
-#                                                   9 frames before the fit
+#                                                   10k checkpoint, documented below,
+#                                                   no run line
+#   F  method=bspline      as C, LoRA r 16, 40k     + pad mask + gripper command ramped
+#                                                   over 9 frames before the fit; the
+#                                                   only arm this queue still runs
 #
 # PACE needs no arm: it runs at eval time on arm A's weights.
 #
@@ -275,60 +276,45 @@ run ds_libero10_bspline_v2_posemb xvla_bspline_v2_posemb \
     --method.unfreeze_pos_emb_rows=16 --method.realign_pos_emb=true
 
 # ---------------------------------------------------------------------------
-# F: arm E's recipe with the gripper command ramped before the fit
-# (--method.gripper_ramp=9). Runs BEFORE E's continuation below, because it is the
-# experiment being asked for; E resumes from its 10k checkpoint afterwards.
+# E: the B-spline head given capacity and budget. `ds_libero10_bspline_v3`, lr 1e-4,
+# LoRA r 16, launched for 40k and stopped at 11.5k on 2026-09-03; its 10k checkpoint
+# is what showed the fixes work (see below) and it is not continued -- no `run` line,
+# so the queue never touches it. Provenance is in outputs/train/ds_libero10_bspline_v3.
 #
-# Both train under the pad mask (xvla_action.py, 2ff898d): the noised action has slots
-# 11-19 zeroed, so the pretrained head's stray logit in slot 19 no longer feeds back
-# through the denoising loop. That fix alone took E's 10k checkpoint from 0% to real
-# successes at rate 1.0 (task 0: 45%, task 1: 15% on the first two tasks measured),
-# so F is E-with-mask plus one more change:
+# What its 10k checkpoint established, on the same training frames as the baseline:
+#   * at lr 1e-4 the head learns -- one-step prediction from pure noise 2.18 cm per
+#     coordinate against v2's 3.12 -- but its ten-step generation came out at 5.04 cm,
+#     because the pretrained head's stray slot-19 logit was fed back through the
+#     denoising loop. Zeroing the pad slots in the noised action (xvla_action.py,
+#     2ff898d) brought generation back to 2.18 cm and took the checkpoint from 0% to
+#     45 / 15 / 85 / 25 / 55 / 20 % on tasks 0-5 at rate 1.0 before the eval was cut.
 #
-# LIBERO's gripper is a 0/1 command. Fitting that step pins knots one frame apart on
-# both sides of every edge and the least-squares curve overshoots to ~1.1, so the
-# gripper control points the policy regresses carry a step and an overshoot no other
-# channel has. A zero-phase Hann ramp over 9 frames (0.45 s) keeps every 0.5 crossing
-# on its recorded frame -- the env thresholds at 0.5, so what is executed is identical
-# -- and on episode 0 halves the near-edge knots (26 -> 14 of 65) and removes the
-# overshoot. Upstream's own data has a continuous teleop setpoint here, never a step;
-# this is the closest LIBERO gets to that setting.
-ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
-run ds_libero10_bspline_v3_ramp xvla_bspline_v3_ramp \
+# ---------------------------------------------------------------------------
+# F: the pad mask and the gripper ramp from step 0, at the original learning rate.
+# The only arm in the queue that runs; everything above is complete and skipped.
+#
+#   lr 1e-5 (the default)   as arms A-D -- E's 1e-4 is what made the trunk sensitive
+#                           to the slot-19 feedback in the first place, and the mask
+#                           now removes the feedback rather than relying on a low lr
+#                           to tolerate it
+#   ARM_PEFT_R=16           E's adapter rank; alpha follows, so alpha/rank stays 1
+#   ARM_STEPS=40000         E's budget, cosine stretched to span it
+#   pad mask                on by construction for every xVLA B-spline arm since 2ff898d
+#   --method.gripper_ramp=9 LIBERO's gripper is a 0/1 command; fitting that step pins
+#                           knots one frame apart on both sides of every edge and the
+#                           least-squares curve overshoots to ~1.1, so the gripper
+#                           control points carry a step and an overshoot no other
+#                           channel has. A zero-phase Hann ramp over 9 frames (0.45 s)
+#                           keeps every 0.5 crossing on its recorded frame -- the env
+#                           thresholds at 0.5, so what is executed is identical -- and
+#                           on episode 0 halves the near-edge knots (26 -> 14 of 65)
+#                           and removes the overshoot. Upstream's own data has a
+#                           continuous teleop setpoint here, never a step.
+ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
+run ds_libero10_bspline_v4 xvla_bspline_v4 \
     --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
     --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
     --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01 \
     --method.gripper_ramp=9
 
-# ---------------------------------------------------------------------------
-# E: arm C given the capacity and the budget its head turned out to need.
-# Stopped at step 11.5k on 2026-09-03 and NOT continued (user decision): its 10k
-# checkpoint is the artefact, evaluated under the pad mask, and F supersedes it. The
-# 10k budget below is what makes the skip guard call it done; the 40k it was launched
-# with is recorded in its train_config.json.
-# Arms C and D both finished at a position term of ~0.65 (500 x MSE), which is 3.6 cm
-# per coordinate on the control points against the dense baseline's 0.84 cm on the
-# same training frames; the gripper coefficient and the knot were off by similar
-# factors, and the decoded curves missed the demonstrations by 4.7 cm on average.
-# D's trainable positional rows changed none of it -- its loss tracked C's to within
-# a percent at every checkpoint -- so the lever left is optimisation, not indexing.
-# What the checkpoint's own head had, and this arm gives back:
-#
-#   ARM_LR=1e-4          the checkpoint's own optimizer_lr (1e-5 was a tenth of it,
-#                        and the head moved 2.1 units where it had to relearn two
-#                        channel meanings, against the baseline's 0.43 to fine-tune)
-#   ARM_PEFT_R=16        double the adapter rank; alpha follows, so alpha/rank stays 1
-#   ARM_STEPS=40000      double the budget, and the cosine stretched to span it --
-#                        the checkpoint's 30k decay would otherwise flatline at
-#                        2.5e-6 for the last quarter of the run
-#
-# Everything else is C: knot in slot 10, ee6d_bspline loss, frozen pretrained pos_emb.
-# NOT a member of the equal-budget comparison; it asks whether the representation can
-# be learned by this trunk at all before anything is concluded from arm C's 0%.
-ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=10000 \
-run ds_libero10_bspline_v3 xvla_bspline_v3 \
-    --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
-    --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
-    --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
-
-echo "=== all six trainings done ==="
+echo "=== queue done ==="
