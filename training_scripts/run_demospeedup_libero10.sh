@@ -15,6 +15,9 @@
 #   E  method=bspline      as C                     lr 1e-4, LoRA r 16, 40k steps: the
 #                                                   head's capacity and budget, not a
 #                                                   comparison member
+#   F  method=bspline      as E                     + the gripper command ramped over
+#                                                   9 frames before the fit; runs
+#                                                   before E's continuation
 #
 # PACE needs no arm: it runs at eval time on arm A's weights.
 #
@@ -273,7 +276,38 @@ run ds_libero10_bspline_v2_posemb xvla_bspline_v2_posemb \
     --method.unfreeze_pos_emb_rows=16 --method.realign_pos_emb=true
 
 # ---------------------------------------------------------------------------
+# F: arm E's recipe with the gripper command ramped before the fit
+# (--method.gripper_ramp=9). Runs BEFORE E's continuation below, because it is the
+# experiment being asked for; E resumes from its 10k checkpoint afterwards.
+#
+# Both train under the pad mask (xvla_action.py, 2ff898d): the noised action has slots
+# 11-19 zeroed, so the pretrained head's stray logit in slot 19 no longer feeds back
+# through the denoising loop. That fix alone took E's 10k checkpoint from 0% to real
+# successes at rate 1.0 (task 0: 45%, task 1: 15% on the first two tasks measured),
+# so F is E-with-mask plus one more change:
+#
+# LIBERO's gripper is a 0/1 command. Fitting that step pins knots one frame apart on
+# both sides of every edge and the least-squares curve overshoots to ~1.1, so the
+# gripper control points the policy regresses carry a step and an overshoot no other
+# channel has. A zero-phase Hann ramp over 9 frames (0.45 s) keeps every 0.5 crossing
+# on its recorded frame -- the env thresholds at 0.5, so what is executed is identical
+# -- and on episode 0 halves the near-edge knots (26 -> 14 of 65) and removes the
+# overshoot. Upstream's own data has a continuous teleop setpoint here, never a step;
+# this is the closest LIBERO gets to that setting.
+ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
+run ds_libero10_bspline_v3_ramp xvla_bspline_v3_ramp \
+    --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
+    --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
+    --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01 \
+    --method.gripper_ramp=9
+
+# ---------------------------------------------------------------------------
 # E: arm C given the capacity and the budget its head turned out to need.
+# Interrupted at step 11.5k on 2026-09-03 to evaluate its 10k checkpoint; the queue
+# resumes it from there. Its first 10k steps trained without the pad mask, the rest
+# with it -- the mask only changes what the noised pad slots hold (zeros instead of
+# noise), which the trunk adapts to quickly, but F is the arm trained under it from
+# step 0.
 # Arms C and D both finished at a position term of ~0.65 (500 x MSE), which is 3.6 cm
 # per coordinate on the control points against the dense baseline's 0.84 cm on the
 # same training frames; the gripper coefficient and the knot were off by similar
@@ -298,22 +332,5 @@ run ds_libero10_bspline_v3 xvla_bspline_v3 \
     --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
     --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
     --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
-
-# ---------------------------------------------------------------------------
-# F: arm C with the gripper command ramped before the fit (--method.gripper_ramp=9).
-# The one variable that separates this arm from C. LIBERO's gripper is a 0/1 command;
-# fitting that step pins knots one frame apart on both sides of every edge and the
-# least-squares curve overshoots to ~1.1, so the gripper control points the policy
-# regresses carry a step and an overshoot no other channel has. A zero-phase Hann
-# ramp over 9 frames (0.45 s) keeps every 0.5 crossing on its recorded frame -- the
-# env thresholds at 0.5, so what is executed is identical -- and on episode 0 halves
-# the near-edge knots (26 -> 14 of 65) and removes the overshoot. Upstream's own data
-# has a continuous teleop setpoint here, never a step; this is the closest LIBERO
-# gets to that setting.
-run ds_libero10_bspline_v2_ramp xvla_bspline_v2_ramp \
-    --policy.action_mode=ee6d_bspline \
-    --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
-    --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01 \
-    --method.gripper_ramp=9
 
 echo "=== all six trainings done ==="
