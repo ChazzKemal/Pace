@@ -76,6 +76,9 @@ BSPLINE=outputs/train/ds_libero10_bspline/checkpoints/last/pretrained_model
 # difference is the loss weight on slot 9, so the two are directly comparable.
 BSPLINE_V2=outputs/train/ds_libero10_bspline_v2/checkpoints/last/pretrained_model
 POSEMB=outputs/train/ds_libero10_bspline_uniform_posemb/checkpoints/last/pretrained_model
+# Arm D of the training queue: v2 with pos_emb rows 0-15 trained and the visual rows
+# realigned. Same decode flags as v2 -- only the weights differ.
+BSPLINE_V2_POSEMB=outputs/train/ds_libero10_bspline_v2_posemb/checkpoints/last/pretrained_model
 
 run_arm() {
     local arm=$1
@@ -98,6 +101,13 @@ run_arm() {
                          --method.degree=3 --method.max_error=0.01 --method.fps=20
                          --method.num_actions=16) ;;
       bspline_v2)  args=(--policy_path="$BSPLINE_V2" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.num_actions=16) ;;
+      # `restore` in run_libero loads the realigned, trained table from
+      # pos_emb.safetensors; the flags are v2's because the fit and the decode are.
+      bspline_v2_posemb) args=(--policy_path="$BSPLINE_V2_POSEMB" --n_action_steps=16
                          --method.type=bspline --method.layout=ee6d20
                          --method.arrangement=xvla_ee6d20 --method.chunk_size=10
                          --method.degree=3 --method.max_error=0.01 --method.fps=20

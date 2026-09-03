@@ -438,6 +438,22 @@ class BSplineMethod(MethodConfig):
     #: N index the visual tokens and stay pretrained. Changes the trainable set, so an
     #: arm using it is a diagnostic run rather than a member of the comparison.
     unfreeze_pos_emb_rows: int = 0
+    #: Keep xVLA's visual and text tokens on the positional rows they were pretrained
+    #: with. The table is indexed by absolute sequence position and the action segment
+    #: comes first, so shrinking the chunk from the pretrained 30 to the matrix's 16
+    #: rows slides every one of the 250 non-action tokens 14 rows down a table that is
+    #: not smooth (cosine 0.10 between a row and the row 14 above it, 0.007 for random
+    #: pairs). This moves the rows those tokens were pretrained with to where the tokens
+    #: now sit -- see `methods/bspline/pos_emb.py`. Off by default so the recorded arms
+    #: keep their semantics; on for the positional-embedding experiments, where leaving
+    #: the visual rows on the wrong codes would confound what is being measured.
+    realign_pos_emb: bool = False
+    #: The chunk the checkpoint was pretrained with, recorded automatically by
+    #: `adjust_policy` before it sets the chunk to the matrix width and serialized with
+    #: the rest of the config -- so a resumed run, which parses its own checkpoint's
+    #: already-16-row config, still knows where the non-action rows came from. Not meant
+    #: to be set by hand.
+    source_chunk: int | None = None
     #: Actions decoded from one predicted spline, at inference. The speed lever, and a
     #: decode-time choice needing no retraining: the curve covers a fixed stretch of
     #: demonstrated motion, so fewer samples cover it in fewer executed steps. The
@@ -580,11 +596,17 @@ class BSplineMethod(MethodConfig):
                     f"(2**len(down_dims), down_dims={tuple(down_dims)}). Use "
                     f"--method.chunk_size from {usable[:6]}..."
                 )
+        # Recorded before the chunk is overwritten, and only on the first apply: a
+        # resumed run is parsed from its own checkpoint's train_config.json, whose chunk
+        # is already the matrix width, and recording that would make `realign_pos_emb`
+        # believe nothing ever moved.
+        if self.source_chunk is None:
+            self.source_chunk = int(getattr(policy_cfg, fields.chunk))
         setattr(policy_cfg, fields.chunk, self.width)
         setattr(policy_cfg, fields.executed, self.width)
         logging.info(
-            "B-spline: set %s and %s to %d (policy type %r)",
-            fields.chunk, fields.executed, self.width, policy_cfg.type,
+            "B-spline: set %s and %s to %d (policy type %r, was %d)",
+            fields.chunk, fields.executed, self.width, policy_cfg.type, self.source_chunk,
         )
         self._adjust_action_normalization(policy_cfg)
 
@@ -641,7 +663,13 @@ class BSplineMethod(MethodConfig):
             )
 
     def adjust_built_policy(self, policy) -> None:
-        """Unfreeze the action rows of `pos_emb`, and load one back if the run has one.
+        """Realign and/or unfreeze `pos_emb`, then load a saved one back if the run has it.
+
+        Order matters. Realignment permutes the *base* checkpoint's table, which is what
+        every run starts from, PEFT resume included. The restore then overwrites it with
+        the table the checkpoint actually trained -- already realigned, already trained --
+        so a resumed run continues from where it was rather than from a freshly shifted
+        pretrained table.
 
         The restore is not optional bookkeeping. A resumed run rebuilds the policy from
         its checkpoint, and a PEFT checkpoint carries adapter tensors and
@@ -650,11 +678,20 @@ class BSplineMethod(MethodConfig):
         table, reporting nothing wrong. It is a no-op on a first run, where
         `pretrained_path` is a hub id with no such file beside it.
         """
-        if self.unfreeze_pos_emb_rows <= 0:
+        if self.unfreeze_pos_emb_rows <= 0 and not self.realign_pos_emb:
             return
-        from pace_bench.methods.bspline.pos_emb import restore, unfreeze
+        from pace_bench.methods.bspline.pos_emb import realign, restore, unfreeze
 
-        unfreeze(policy, self.unfreeze_pos_emb_rows)
+        if self.realign_pos_emb:
+            if self.source_chunk is None:
+                raise ValueError(
+                    "--method.realign_pos_emb needs the chunk the checkpoint was pretrained "
+                    "with, which adjust_policy records as `source_chunk` before it changes "
+                    "the chunk -- and it has not run on this config."
+                )
+            realign(policy, source_rows=self.source_chunk, rows=self.width)
+        if self.unfreeze_pos_emb_rows > 0:
+            unfreeze(policy, self.unfreeze_pos_emb_rows)
         checkpoint = _pretrained_path(policy)
         if checkpoint:
             restore(policy, checkpoint)

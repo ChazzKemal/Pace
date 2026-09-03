@@ -11,7 +11,20 @@ for the same 16 rows). The rows also stop being homogeneous, since the first `de
 last `degree + 1` of them are the window's boundary rows rather than interior control
 points.
 
-Two things stop this being a config flag, and the second one is the dangerous one.
+The table is one tensor for the *whole* sequence, and that is a second problem. xVLA lays
+its tokens out as ``[action rows | VLM tokens | auxiliary visual tokens]`` and adds
+``pos_emb[:seq_len]`` across all of them, so the row a visual token lands on is
+``chunk_size + its offset``. `lerobot/xvla-libero` was pretrained at chunk 30; a B-spline
+matrix is 16 rows, so every one of the 250 visual and text tokens reads a row 14 below
+the one it was pretrained with. The pretrained table is nowhere near smooth enough for
+that to be harmless -- the cosine between a row and the row 14 above it is 0.10, against
+0.007 for random pairs -- so the visual tokens are effectively handed random positional
+codes, and freezing "the visual rows" freezes the wrong ones. (DemoSpeedup's chunk-15 arm
+has the same shift.) :func:`realign` undoes it by moving the rows the non-action tokens
+were pretrained with down to where those tokens now sit.
+
+Two things stop the trainable slice being a config flag, and the second one is the
+dangerous one.
 
 1. **PEFT cannot target it.** `--peft.full_training_modules` becomes PEFT's
    `modules_to_save`, which wraps `nn.Module`s. `pos_emb` is a bare `nn.Parameter` and
@@ -26,8 +39,10 @@ Two things stop this being a config flag, and the second one is the dangerous on
    `action_decoder`, `soft_prompt_hub`). So simply flipping `requires_grad` gives a run
    that trains the embedding, reports the improved loss, and then writes a checkpoint
    without it. Evaluation would silently load the original frozen table and the whole
-   experiment would read as a null result. `unfreeze` therefore wraps `save_pretrained`,
-   and `restore` is its other half.
+   experiment would read as a null result. `unfreeze` and `realign` therefore both wrap
+   `save_pretrained`, and `restore` is their other half -- a realigned table is lost at
+   evaluation exactly as a trained one would be, since the policy is rebuilt from the
+   base checkpoint with the shift back in place.
 
 Only the action rows are trained. The remaining rows index the Florence-2 visual tokens,
 whose consumption is otherwise frozen; letting those drift would change something this is
@@ -48,6 +63,9 @@ logger = logging.getLogger(__name__)
 #: Written beside the adapter, because the adapter cannot carry it.
 FILENAME = "pos_emb.safetensors"
 KEY = "pos_emb"
+#: Set on a policy whose `save_pretrained` already writes the table, so wrapping it a
+#: second time (realign, then unfreeze) does not write the file twice.
+_PERSISTED = "_pos_emb_persisted"
 
 
 def find(policy) -> tuple[str | None, torch.nn.Parameter | None]:
@@ -58,14 +76,69 @@ def find(policy) -> tuple[str | None, torch.nn.Parameter | None]:
     return None, None
 
 
+def realign(policy, source_rows: int, rows: int) -> torch.nn.Parameter:
+    """Keep every non-action token on the positional row it was pretrained with.
+
+    Args:
+        policy: A constructed policy owning an xVLA transformer.
+        source_rows: The action-segment length the table was pretrained with -- the
+            checkpoint's own `chunk_size`, before the method changed it.
+        rows: The action-segment length this run trains with.
+
+    The table stays a permutation of itself. Rows ``0..min(rows, source_rows)-1`` are
+    untouched; the rows the non-action tokens were pretrained with are moved so they
+    start at ``rows``, which is where those tokens now begin; the rows that displaces go
+    to the end of the table, past anything a sequence reaches. When the segment grows
+    instead, the new action rows are taken from that unused tail. Persisted beside the
+    adapter like a trained table, for the reason given in the module docstring.
+
+    Returns:
+        The parameter, realigned.
+    """
+    name, param = find(policy)
+    if param is None:
+        raise ValueError(
+            "no `pos_emb` parameter on this policy -- --method.realign_pos_emb only "
+            "applies to xVLA, whose action expert owns one."
+        )
+    length = param.shape[1]
+    if not (0 < rows <= length and 0 < source_rows <= length):
+        raise ValueError(
+            f"cannot realign pos_emb from a {source_rows}-row to a {rows}-row action "
+            f"segment: the table holds {length} rows."
+        )
+    if rows != source_rows:
+        old = param.detach().clone()
+        if rows < source_rows:
+            new = torch.cat([old[:, :rows], old[:, source_rows:], old[:, rows:source_rows]], dim=1)
+        else:
+            extra = rows - source_rows
+            new = torch.cat(
+                [old[:, :source_rows], old[:, length - extra :], old[:, source_rows : length - extra]],
+                dim=1,
+            )
+        with torch.no_grad():
+            param.copy_(new)
+    _persist(policy, param)
+    moved = length - max(rows, source_rows)
+    logger.info(
+        "B-spline: realigned %s (%s) for a %d-row action segment pretrained at %d rows -- "
+        "%d non-action rows now sit at %d.. as they did at %d..; saved beside the adapter "
+        "as %s",
+        KEY, name, rows, source_rows, moved, rows, source_rows, FILENAME,
+    )
+    return param
+
+
 def unfreeze(policy, rows: int) -> torch.nn.Parameter:
     """Train `pos_emb[:, :rows]`, freeze the rest, and make the result persist.
 
     Args:
         policy: A constructed policy owning an xVLA transformer.
         rows: How many leading positions to train -- the action segment, which is the
-            policy's chunk. Rows past it index visual tokens and stay exactly as
-            pretrained.
+            policy's chunk. Rows past it index visual tokens and stay frozen, on whatever
+            row they were given: see :func:`realign` for why that is not automatically
+            the row they were pretrained with.
 
     Returns:
         The parameter, now trainable.
@@ -103,8 +176,11 @@ def _persist(policy, param: torch.nn.Parameter) -> None:
     """Write `pos_emb` next to every checkpoint this policy saves.
 
     Wraps the bound method rather than the class, so nothing else in the process is
-    affected and a policy without the flag saves exactly as before.
+    affected and a policy without the flag saves exactly as before. Idempotent: a
+    policy that is realigned and then unfrozen is wrapped once.
     """
+    if getattr(policy, _PERSISTED, False):
+        return
     original = policy.save_pretrained
 
     def save_pretrained(save_directory, *args, **kwargs):
@@ -115,6 +191,7 @@ def _persist(policy, param: torch.nn.Parameter) -> None:
         return result
 
     policy.save_pretrained = save_pretrained
+    setattr(policy, _PERSISTED, True)
 
 
 def restore(policy, directory) -> bool:
@@ -143,4 +220,4 @@ def restore(policy, directory) -> bool:
     return True
 
 
-__all__ = ["FILENAME", "find", "restore", "unfreeze"]
+__all__ = ["FILENAME", "find", "realign", "restore", "unfreeze"]

@@ -9,6 +9,9 @@
 #   B  method=demospeedup  window 60 -> chunk 15    targets retimed 2x/4x by label
 #   C  method=bspline      chunk 30 -> a 16x11      spline parameters, no labels
 #                          parameter matrix
+#   D  method=bspline      as C                     + pos_emb rows 0-15 trained and the
+#                                                   visual rows put back where the
+#                                                   pretrained table had them
 #
 # PACE needs no arm: it runs at eval time on arm A's weights.
 #
@@ -235,4 +238,30 @@ run ds_libero10_bspline_v2 xvla_bspline_v2 \
     --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
     --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
 
-echo "=== all three trainings done ==="
+# ---------------------------------------------------------------------------
+# D: arm C with the positional embedding allowed to learn what its rows now index.
+# Same base, same budget, same loss and arrangement as C (knot in slot 10, so the
+# pretrained head's slots 0-9 keep their meaning); two things differ, both about
+# `pos_emb`, and both are what this arm measures:
+#
+#   --method.unfreeze_pos_emb_rows=16  rows 0-15, the action segment, train. They were
+#                                      pretrained to mean "timestep k of a dense chunk"
+#                                      and now mean "control point k".
+#   --method.realign_pos_emb=true      the 250 visual/text tokens are put back on the
+#                                      rows they were pretrained with. The chunk went
+#                                      from 30 to 16, which slides every non-action
+#                                      token 14 rows down a table where a row and the
+#                                      row 14 above it are nearly orthogonal; without
+#                                      this the frozen "visual rows" are the wrong ones.
+#
+# Supersedes `ds_libero10_bspline_uniform_posemb`, which unfroze the same rows but
+# also switched to the knot-first arrangement and a uniform normalized loss -- three
+# changes at once, and the knot-first one misaligns every slot of the pretrained head
+# it starts from. Its evaluation was void anyway (see run_libero's unnormalizer note).
+run ds_libero10_bspline_v2_posemb xvla_bspline_v2_posemb \
+    --policy.action_mode=ee6d_bspline \
+    --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
+    --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01 \
+    --method.unfreeze_pos_emb_rows=16 --method.realign_pos_emb=true
+
+echo "=== all four trainings done ==="
