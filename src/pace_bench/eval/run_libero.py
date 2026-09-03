@@ -156,6 +156,26 @@ def drop_steps(pipeline, name_fragment: str) -> list:
     return dropped
 
 
+def strip_parameter_unnormalizer(postprocessor, stats: dict | None) -> list:
+    """Drop the checkpoint's unnormalizer once B-spline decoding has consumed it.
+
+    `attach_bspline` restores the parameters to natural units *before* evaluating the
+    curve, because the knot column has to be a time in frames for the decode to mean
+    anything. Upstream's rollout then hands whatever `select_action` returns to the
+    checkpoint's postprocessor -- whose unnormalizer holds the statistics of the
+    *parameter matrix*, a 20-wide knot-first mean/std, and applies them to a 20-wide
+    ee6d action. Column 0 of those statistics is the knot (mean 16.95, std 19.3), so
+    the arm's x target became ``16.95 + 19.3 * x``: every command landed ~15 m away and
+    the arm was driven off the table before the second query.
+
+    Invisible on an IDENTITY checkpoint, where the step is the identity -- which is
+    every xVLA arm but `--method.normalize_parameters=true`. Returns what was dropped.
+    """
+    if not stats:
+        return []
+    return drop_steps(postprocessor, "Unnormalizer")
+
+
 def build_speed_step(cfg: LiberoEvalConfig, stats: dict | None) -> PaceSpeedStep:
     """The method's postprocessor step, or an inert one when no method is selected.
 
@@ -282,6 +302,12 @@ def main(cfg: LiberoEvalConfig) -> None:
             # returns for them, and the unnormalizer is then a no-op.
             action_stats=None if stats is None else stats.get("action"),
         )
+        for step in strip_parameter_unnormalizer(postprocessor, stats):
+            logger.info(
+                "dropped checkpoint-side %s: the parameters are unnormalized before "
+                "decode, so the decoded actions are already in natural units",
+                type(step).__name__,
+            )
         logger.info(
             "method=%s | %s | kp x%.2f | parameters %s",
             cfg.method.type, decode.get_config(), cfg.method.stiffness_kp_scale,

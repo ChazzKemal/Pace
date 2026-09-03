@@ -158,3 +158,42 @@ class TestBothStepsRoundTripTheirConfig:
             assert rebuilt.get_config() == config, (
                 f"{type(step).__name__} does not survive its own config"
             )
+
+
+class TestTheCheckpointUnnormalizerIsNotAppliedTwice:
+    """`attach_bspline` unnormalizes the parameters *before* decoding, and upstream's
+    rollout then hands the decoded action to the checkpoint's postprocessor. On a
+    MEAN_STD checkpoint that postprocessor holds the statistics of the parameter
+    matrix -- knot-first, so column 0 is the knot at mean 16.95 / std 19.3 -- and
+    applying them to an ee6d action sent the arm's x target to 16.95 + 19.3 * x.
+
+    Measured on `ds_libero10_bspline_uniform_posemb`: the decoded step-0 command
+    (-0.067, -0.073, 0.815) reached the controller as (15.67, -0.05, 0.18).
+    """
+
+    class _Pipeline:
+        def __init__(self, steps):
+            self.steps = list(steps)
+
+    class UnnormalizerProcessorStep:  # name is what `drop_steps` matches on
+        pass
+
+    class DeviceProcessorStep:
+        pass
+
+    def test_dropped_when_the_parameters_were_unnormalized_before_decode(self):
+        from pace_bench.eval.run_libero import strip_parameter_unnormalizer
+
+        post = self._Pipeline([self.UnnormalizerProcessorStep(), self.DeviceProcessorStep()])
+        dropped = strip_parameter_unnormalizer(post, {"mean": np.zeros(20), "std": np.ones(20)})
+        assert [type(s).__name__ for s in dropped] == ["UnnormalizerProcessorStep"]
+        assert [type(s).__name__ for s in post.steps] == ["DeviceProcessorStep"]
+
+    def test_kept_on_an_identity_checkpoint(self):
+        """Every other xVLA arm: no statistics, the step is the identity, nothing to drop
+        -- and nothing must be, since the pipeline is otherwise upstream's."""
+        from pace_bench.eval.run_libero import strip_parameter_unnormalizer
+
+        post = self._Pipeline([self.UnnormalizerProcessorStep(), self.DeviceProcessorStep()])
+        assert strip_parameter_unnormalizer(post, None) == []
+        assert len(post.steps) == 2
