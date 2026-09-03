@@ -12,12 +12,11 @@
 #   D  method=bspline      as C                     + pos_emb rows 0-15 trained and the
 #                                                   visual rows put back where the
 #                                                   pretrained table had them
-#   E  method=bspline      as C                     lr 1e-4, LoRA r 16, 40k steps: the
-#                                                   head's capacity and budget, not a
-#                                                   comparison member
-#   F  method=bspline      as E                     + the gripper command ramped over
-#                                                   9 frames before the fit; runs
-#                                                   before E's continuation
+#   E  method=bspline      as C                     lr 1e-4, LoRA r 16; stopped at its
+#                                                   10k checkpoint, not a comparison
+#                                                   member
+#   F  method=bspline      as E, 40k steps          + the gripper command ramped over
+#                                                   9 frames before the fit
 #
 # PACE needs no arm: it runs at eval time on arm A's weights.
 #
@@ -303,11 +302,10 @@ run ds_libero10_bspline_v3_ramp xvla_bspline_v3_ramp \
 
 # ---------------------------------------------------------------------------
 # E: arm C given the capacity and the budget its head turned out to need.
-# Interrupted at step 11.5k on 2026-09-03 to evaluate its 10k checkpoint; the queue
-# resumes it from there. Its first 10k steps trained without the pad mask, the rest
-# with it -- the mask only changes what the noised pad slots hold (zeros instead of
-# noise), which the trunk adapts to quickly, but F is the arm trained under it from
-# step 0.
+# Stopped at step 11.5k on 2026-09-03 and NOT continued (user decision): its 10k
+# checkpoint is the artefact, evaluated under the pad mask, and F supersedes it. The
+# 10k budget below is what makes the skip guard call it done; the 40k it was launched
+# with is recorded in its train_config.json.
 # Arms C and D both finished at a position term of ~0.65 (500 x MSE), which is 3.6 cm
 # per coordinate on the control points against the dense baseline's 0.84 cm on the
 # same training frames; the gripper coefficient and the knot were off by similar
@@ -327,7 +325,7 @@ run ds_libero10_bspline_v3_ramp xvla_bspline_v3_ramp \
 # Everything else is C: knot in slot 10, ee6d_bspline loss, frozen pretrained pos_emb.
 # NOT a member of the equal-budget comparison; it asks whether the representation can
 # be learned by this trunk at all before anything is concluded from arm C's 0%.
-ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
+ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=10000 \
 run ds_libero10_bspline_v3 xvla_bspline_v3 \
     --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
     --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
