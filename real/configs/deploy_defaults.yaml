@@ -9,11 +9,23 @@
 # argparse defaults -- those are conservative (no blending, Python sender, no startup
 # delay) and would quietly produce a different run from the one with 256 sessions
 # behind it.
+#
+# Where runs go. crisp_gym hardcodes the run folder to
+# ~/.cache/huggingface/lerobot/deploy_runs/<ts>_<tag> (session.py:390; there is no
+# flag). To keep runs with the rest of this repo's outputs, that directory is a
+# symlink on the rig rather than a code change:
+#
+#     mv ~/.cache/huggingface/lerobot/deploy_runs outputs/eval_real/runs
+#     ln -s "$(pwd)/outputs/eval_real/runs" ~/.cache/huggingface/lerobot/deploy_runs
+#
+# report.py and chunk_trace.py open the cache path and follow the link. The
+# alternative -- owning `phase_video_and_delay` and rooting it at `out:` -- is ~40
+# lines and is the right move if the rig ever gets a second user.
 
 policy_path: ""             # supply with --policy_path
 env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
 fps: 20.0
-n_action_steps: 50          # executed per query. The bound is LeRobot's own,
+n_action_steps: 28          # executed per query. The bound is LeRobot's own,
                             # n_action_steps <= horizon - n_obs_steps + 1, which for
                             # the ACT arms (chunk_size 100, n_obs_steps 1) is 100.
                             # Fewer replans than 32 did, and more inference budget.
@@ -31,18 +43,98 @@ sender:
   rt_priority: 0
 
 blend:
-  overlap: 4                # hold back 4 frames, fold into the next chunk's head
+  overlap: 8                # hold back 4 frames, fold into the next chunk's head
   mode: hermite             # bridges position AND velocity; linear only averages
   skip: 0
 
 loop:
   overlap_threshold: 6      # inference budget = 6 x dt_eff = 300 ms at 20 Hz
+  mode: splice              # One row ahead of the arm, a replan every `replan_every`
+                            # rows, the new chunk spliced in at the row it predicted
+                            # FOR THAT MOMENT behind a short cubic bridge. Measured on
+                            # the 2026-09-02 runs, the producer loop ("queue") appended
+                            # each chunk behind overlap_threshold+2 rows of queue, so
+                            # its first verbatim row ran 12 rows (406 ms) after the
+                            # observation; here it is commit_rows+bridge_rows+1 rows.
+                            # overlap_threshold and blend.* are unused in this mode.
+                            # Both senders work -- nothing is ever retracted from the
+                            # sender, only from the plan -- so sender.cpp is the A/B
+                            # switch; frames.csv slack/overshoot decide.
+  replan_every: 0           # H: rows between observations. 0 = auto, which is
+                            # n_action_steps - commit_rows - 1 (30 here): every
+                            # kept row past the discarded head is executed -- 1
+                            # committed, bridge_rows of bridge, the rest verbatim --
+                            # and the next splice lands where the plan ends. A
+                            # positive value replans sooner: fresher observations,
+                            # but bridge_rows of every H rows are interpolation.
+  commit_rows: 1            # h_c: rows after the observation never retracted -- the
+                            # one the sender is holding. 2 only delays the seam.
+  bridge_rows: 4            # h_b: bridge length. Replay of the recorded predictions:
+                            # 3 is the knee for the median seam, 4 also halves peak
+                            # acceleration on the worst ones at one row of latency.
+  bridge: cubic             # C1 with both tangents per executed row. quintic (C2)
+                            # is available and did not beat it on the replay.
 
 gains:
-  scale_kp: false           # writes controller parameters on the robot; opt in
+  scale_kp: false            # Scale controller stiffness with the speed the method
+                            # actually commands: kp = kp_base * s_eff**kp_exp, pushed
+                            # at each integer-cycle segment boundary and restored in
+                            # teardown.
+                            #
+                            # On because the runs of 2026-09-01 measured what leaving
+                            # it off costs. kp_base here is 400 N/m (translation) --
+                            # soft -- and at a realised 1.48x the arm tracked its
+                            # target ~620 ms late and reached only 62% of the commanded
+                            # x-range. Off, kp stays at its 1x value however fast the
+                            # method drives the arm, which is the case `deploy_args`
+                            # already warns about in prose: "the arm lags and cuts
+                            # corners at exactly the speeds the method exists to reach".
+                            #
+                            # Inert for every method but PACE: `deploy_args` propagates
+                            # a peak only when the method has `max_speed`, and none of
+                            # none/bspline/demospeedup do, so their factor stays 1.0.
+  kp_exp: 1.0               # Linear in speed, not quadratic. The C++ controller's own
+                            # convention is quadratic (kp ~ s**2 keeps the closed-loop
+                            # natural frequency proportional to speed), and 2.0 is
+                            # crisp_gym's default -- but that squares the risk as well
+                            # as the stiffness, and this is the first run on this rig
+                            # that writes gains at all. At 1.0 the peak factor is just
+                            # max_speed: 1.5x -> kp 400 -> 600 N/m, comfortably under
+                            # both the controller YAML's 5000 cap and crisp_gym's
+                            # --kp-scale-warn=3.0, so no warning fires and the step is
+                            # small enough to judge from one run.
+                            #
+                            # Raise toward 2.0 once 1.0 is shown to help: the report's
+                            # amplitude-ratio and lag numbers are the comparison, and
+                            # at max_speed 1.5 even kp_exp 2.0 only reaches 900 N/m.
+                            #
+                            # kd is untouched either way -- it reads 0.0 on this rig,
+                            # which the C++ controller treats as auto-damping
+                            # (d = 2*sqrt(k)), so damping follows the new stiffness on
+                            # its own and the scaler deliberately never pushes a d for
+                            # an auto axis.
+  kp_pos: 500              # Absolute translation stiffness (N/m) for this run,
+                            # written to the controller at bring-up BEFORE the scaler
+                            # reads its base, and put back at teardown -- the same
+                            # SetParameters write reset_crisp_kp.py does, from here
+                            # instead of the bringup YAML. null leaves the controller
+                            # at whatever it has (400 from crisp_controllers.yaml).
+                            # e.g. 500 -> 500 N/m; with scale_kp on the run peaks at
+                            # 500 * max_speed**kp_exp. Override per run with
+                            # --gains.kp_pos 500.
+  kp_rot: null              # Rotation (Nm/rad). null follows kp_pos at the YAML's own
+                            # 100/400 ratio: kp_pos 500 -> 125. kd is never written;
+                            # it is auto (2*sqrt(k)) on this rig and follows kp.
 
 gripper:
-  slowdown_frames: 5        # nominal speed across a grasp; the 85 mm stroke needs
+  hold_s: 0.7               # Splice mode. After the SENT gripper command closes, every
+                            # row dwells at demo cadence (50 ms per raw frame) for this
+                            # long, and PACE keeps every frame for the same window
+                            # after a predicted gripper movement instead of striding.
+                            # Sized to the jaw stroke (>= 0.57 s at the driver max).
+                            # The 17:00 run on 2026-09-02 held 250 ms and was back at
+                            # 2.9x with the cup still open. Queue mode ignores this.
+  slowdown_frames: 5        # queue mode only. nominal speed across a grasp; the 85 mm stroke needs
                             # ~0.57 s even at the driver maximum and cannot be
                             # sped up. NOTE: historical runs used 0.
   invert: false

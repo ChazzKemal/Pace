@@ -175,6 +175,9 @@ class PaceMethod(MethodConfig):
     #: Steps kept after the command settles, while the jaws are still travelling.
     #: Mirrors the deploy path's `gripper_slowdown_frames`; keep the two equal.
     gripper_stride_exempt_frames: int = 5
+    #: |delta gripper| above which the command counts as moving. 1e-3 is right for a
+    #: recorded channel and far too tight for a predicted one -- see pace.speed.GRIP_EPS.
+    gripper_stride_eps: float = 0.02
 
     n_lookahead: int = 0
     lookahead_agg: str = "min"

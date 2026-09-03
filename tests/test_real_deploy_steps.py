@@ -234,3 +234,57 @@ class TestExemptionWindow:
         from pace_bench.real.configs import resolve_config
         shipped = resolve_config("real/configs/deploy_defaults.yaml")["gripper"]["slowdown_frames"]
         assert PaceMethod().gripper_stride_exempt_frames == shipped
+
+
+class TestGripperThreshold:
+    """The threshold has to clear a *predicted* gripper channel, not a recorded one.
+
+    Measured on the stackcups PACE run of 2026-09-01: the policy emits a continuously
+    jittering gripper spanning -0.0197 to 1.0271, with |delta| at 4.9e-4 median and
+    1.6e-3 at p90. crisp_gym's 1e-3 -- right for the binary recorded channel -- fires
+    on 22.6% of steps there, and each firing protects 5 more, so the exemption blankets
+    the chunk and striding silently stops. The run logged K=46 of 50 rows executed
+    where stride 2 should give ~25.
+    """
+
+    def noisy_chunk(self, k=60, edge=30):
+        """A gripper channel with the measured noise profile and one real close."""
+        import torch
+        rng = torch.Generator().manual_seed(0)
+        a = torch.zeros(1, k, 7)
+        a[0, :, 0] = torch.linspace(0.0, 1.0, k)
+        g = torch.ones(k)
+        g[edge:] = 0.0
+        g += torch.randn(k, generator=rng) * 7e-4      # measured median |delta|
+        a[0, :, GRIP_COL] = g
+        return a
+
+    def kept(self, eps):
+        from pace_bench.methods.pace.speed import stride_indices
+        cfg = PaceMethod(action_stride=2, gripper_stride_exempt=True,
+                         gripper_stride_eps=eps).to_pace_config()
+        return len(stride_indices(self.noisy_chunk(), cfg))
+
+    def test_the_old_threshold_defeats_striding(self):
+        # Regression: 1e-3 exempts far more than the grasp on a real policy's output.
+        assert self.kept(1e-3) > 45, "noise should swamp the exemption at 1e-3"
+
+    def test_the_default_leaves_striding_intact(self):
+        # 60 rows at stride 2 is 30, plus the grasp and its window.
+        assert self.kept(0.02) <= 40
+
+    def test_the_default_still_catches_the_real_close(self):
+        from pace_bench.methods.pace.speed import stride_indices
+        cfg = PaceMethod(action_stride=2, gripper_stride_exempt=True,
+                         gripper_stride_eps=0.02).to_pace_config()
+        got = stride_indices(self.noisy_chunk(), cfg)
+        assert 29 in got and 30 in got, "the transition itself must survive"
+
+    def test_the_plateau_is_flat(self):
+        # 0.02 and 0.10 behave the same on real data -- the transitions are ~0.46, far
+        # above either, and the noise is far below. Anything in between is equivalent.
+        assert self.kept(0.02) == self.kept(0.10)
+
+    def test_the_default_is_not_crisp_gyms_recorded_channel_value(self):
+        from pace_bench.methods.pace.speed import GRIP_EPS
+        assert GRIP_EPS == 0.02
