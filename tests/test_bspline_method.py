@@ -554,9 +554,12 @@ class TestUniformBSplineActionSpace:
         pred[:, :, 11:] = -7.0
         torch.testing.assert_close(sum(space.compute_loss(pred, target).values()), before)
 
-    def test_nothing_is_masked_or_squashed(self):
+    def test_no_parameter_is_masked_and_nothing_is_squashed(self):
         """Unlike the stock ee6d space: no channel here is a 0/1 command, so there is no
-        gripper to mask out of the flow input and no logit to sigmoid on the way out."""
+        gripper to mask out of the flow input and no logit to sigmoid on the way out.
+        The only thing `preprocess` touches is the nine pad slots past the parameters,
+        which the pretrained head writes into and the generation loop would otherwise
+        feed back (see tests/test_xvla_pad_mask.py)."""
         space = self.space()
         assert space.gripper_idx == ()
         action = torch.randn(2, 16, 20)
@@ -564,7 +567,8 @@ class TestUniformBSplineActionSpace:
         proprio = torch.randn(2, 20)
         p_out, a_out = space.preprocess(proprio.clone(), action.clone())
         torch.testing.assert_close(p_out, proprio)
-        torch.testing.assert_close(a_out, action)
+        torch.testing.assert_close(a_out[..., :11], action[..., :11])
+        assert torch.equal(a_out[..., 11:], torch.zeros(2, 16, 9))
 
     def test_a_matrix_narrower_than_the_parameter_count_is_refused(self):
         space = self.space()

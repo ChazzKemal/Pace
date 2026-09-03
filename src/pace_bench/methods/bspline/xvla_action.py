@@ -43,6 +43,10 @@ class EE6DBSplineActionSpace(BaseActionSpace):
     POS_IDX = (0, 1, 2)
     ROT_IDX = (3, 4, 5, 6, 7, 8)
     KNOT_IDX = (10,)
+    #: Slots that hold nothing. Zeroed in the noised action (see `preprocess`), because
+    #: the pretrained head still writes there and the generation loop would feed that
+    #: back into the trunk.
+    PAD_IDX = tuple(range(11, 20))
 
     #: 10.0, which is upstream's own value for an MSE gripper -- `agibot_ee6d`
     #: ("using MSE for all components") sets exactly this, while the 1.0 that stock
@@ -95,7 +99,7 @@ class EE6DBSplineActionSpace(BaseActionSpace):
         }
 
     def preprocess(self, proprio, action, mode="train"):
-        """Unmasked, unlike the stock ee6d space -- and this is not a small difference.
+        """Slot 9 stays unmasked, unlike the stock ee6d space; the pad slots are zeroed.
 
         Upstream zeroes slot 9 of the *noisy* action (`modeling_xvla.py:223` in
         training, `:262` at every denoising step) while scoring the unmasked target.
@@ -112,13 +116,34 @@ class EE6DBSplineActionSpace(BaseActionSpace):
         never committed to open or closed, so nothing was ever grasped and the arm
         scored 0% on every LIBERO-10 task while its regression losses looked converged.
 
+        Slots 11-19 are the opposite case, and the reason this method exists. They hold
+        nothing -- the arranged matrix ends at the knot in slot 10 -- so `compute_loss`
+        scores none of them, and the pretrained head keeps writing what it always did
+        there: slot 19 was the second arm's gripper logit, and every checkpoint on this
+        path emits about -23 in it. In training that is invisible, since the noised
+        target has zeros there. At generation the model's own output is what gets
+        noised for the next step, so from the second denoising step on the trunk reads
+        a -20 in a slot where it only ever saw noise, and the prediction drifts.
+        Measured on `ds_libero10_bspline_v3` at 10k steps, on training frames: one-step
+        prediction from pure noise 2.18 cm per coordinate, ten-step generation 5.04 cm;
+        with slot 19 zeroed in the feedback, generation 2.18 cm, and the knot from 0.94 s
+        back to 0.25 s. Zeroing the pad in the noised input, in training and at every
+        denoising step, makes the two distributions the same and takes the head's pad
+        outputs out of the loop. Checkpoints trained before this mask existed are still
+        evaluated with it, since the same measurement shows it helps them too (v2:
+        3.59 -> 3.24 cm) -- though that checkpoint's gripper coefficient moved the other
+        way (0.45 -> 0.77), which is one more reason the arm trained under the mask is
+        the one to read.
+
         `proprio` keeps its mask: that channel really is the gripper's *state*, a 0/1
         reading, and hiding it is upstream's choice about observation leakage rather
         than anything to do with the action space.
         """
         proprio_m = proprio.clone()
         proprio_m[..., self.gripper_idx] = 0.0
-        return proprio_m, action
+        action_m = action.clone()
+        action_m[..., self.PAD_IDX] = 0.0
+        return proprio_m, action_m
 
     def postprocess(self, action: torch.Tensor) -> torch.Tensor:
         """Returned as regressed -- no sigmoid, unlike the stock ee6d space.
@@ -189,9 +214,11 @@ class UniformBSplineActionSpace(BaseActionSpace):
     channels is the price of not rebuilding those tables; an 11-wide action space is the
     cleaner end state and needs a load hook to drop the two mismatched tensors.
 
-    Neither `preprocess` nor `postprocess` is overridden, and both defaults are right here:
-    nothing in this matrix is a gripper *command*, so there is no channel to mask and no
-    logit to squash.
+    `postprocess` is not overridden: nothing in this matrix is a gripper *command*, so
+    there is no logit to squash. `preprocess` zeroes the pad slots in the noised action
+    for the reason given on `EE6DBSplineActionSpace.preprocess` -- the pretrained head
+    writes into them, the loss never reads them, and the generation loop would feed
+    them back.
     """
 
     dim_action = 20
@@ -204,10 +231,16 @@ class UniformBSplineActionSpace(BaseActionSpace):
     GRIP_IDX = (10,)
     #: Real parameter channels. The rest of `dim_action` is pad.
     N_PARAMS = 11
+    PAD_IDX = tuple(range(N_PARAMS, 20))
 
     def __init__(self):
         super().__init__()
         self.mse = nn.MSELoss()
+
+    def preprocess(self, proprio, action, mode="train"):
+        action_m = action.clone()
+        action_m[..., self.PAD_IDX] = 0.0
+        return proprio, action_m
 
     def compute_loss(self, pred, target):
         """One uniform MSE over channels 0..10, reported in four parts.
