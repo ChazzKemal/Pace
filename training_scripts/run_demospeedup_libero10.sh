@@ -15,7 +15,7 @@
 #   E  method=bspline      as C                     lr 1e-4, LoRA r 16; stopped at its
 #                                                   10k checkpoint, documented below,
 #                                                   no run line
-#   F  method=bspline      as C, LoRA r 16, 40k     + pad mask + gripper command ramped
+#   F  method=bspline      as E (lr 1e-4, r 16, 40k) + pad mask + gripper command ramped
 #                                                   over 9 frames before the fit; the
 #                                                   only arm this queue still runs
 #
@@ -290,13 +290,15 @@ run ds_libero10_bspline_v2_posemb xvla_bspline_v2_posemb \
 #     45 / 15 / 85 / 25 / 55 / 20 % on tasks 0-5 at rate 1.0 before the eval was cut.
 #
 # ---------------------------------------------------------------------------
-# F: the pad mask and the gripper ramp from step 0, at the original learning rate.
+# F: the pad mask and the gripper ramp from step 0, on arm E's recipe.
 # The only arm in the queue that runs; everything above is complete and skipped.
 #
-#   lr 1e-5 (the default)   as arms A-D -- E's 1e-4 is what made the trunk sensitive
-#                           to the slot-19 feedback in the first place, and the mask
-#                           now removes the feedback rather than relying on a low lr
-#                           to tolerate it
+#   ARM_LR=1e-4             E's learning rate, the checkpoint's own optimizer_lr and
+#                           ten times arms A-D's. It is what let E's head learn (2.18 cm
+#                           one-step against v2's 3.12 on the same frames); the slot-19
+#                           sensitivity it also brought is removed by the mask, not by
+#                           a lower lr. (A 1e-5 variant was started 18:00 and killed at
+#                           18:08 on the user's decision.)
 #   ARM_PEFT_R=16           E's adapter rank; alpha follows, so alpha/rank stays 1
 #   ARM_STEPS=40000         E's budget, cosine stretched to span it
 #   pad mask                on by construction for every xVLA B-spline arm since 2ff898d
@@ -310,7 +312,7 @@ run ds_libero10_bspline_v2_posemb xvla_bspline_v2_posemb \
 #                           on episode 0 halves the near-edge knots (26 -> 14 of 65)
 #                           and removes the overshoot. Upstream's own data has a
 #                           continuous teleop setpoint here, never a step.
-ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
+ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
 run ds_libero10_bspline_v4 xvla_bspline_v4 \
     --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
     --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \

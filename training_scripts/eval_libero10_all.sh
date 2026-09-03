@@ -81,9 +81,9 @@ POSEMB=outputs/train/ds_libero10_bspline_uniform_posemb/checkpoints/last/pretrai
 BSPLINE_V2_POSEMB=outputs/train/ds_libero10_bspline_v2_posemb/checkpoints/last/pretrained_model
 # Arm E: v2 at lr 1e-4, LoRA r 16, 40k steps. Same decode flags as v2.
 BSPLINE_V3=outputs/train/ds_libero10_bspline_v3/checkpoints/last/pretrained_model
-# Arm F: lr 1e-5 as arms A-D, LoRA r 16, 40k steps, pad mask, gripper command ramped
-# over 9 frames before the fit. The ramp changes only the training target; decode
-# flags are the B-spline arms'.
+# Arm F: arm E's recipe (lr 1e-4, LoRA r 16, 40k steps) under the pad mask, with the
+# gripper command ramped over 9 frames before the fit. The ramp changes only the
+# training target; decode flags are the B-spline arms'.
 BSPLINE_V4=outputs/train/ds_libero10_bspline_v4/checkpoints/last/pretrained_model
 
 run_arm() {
