@@ -9,6 +9,18 @@
 # argparse defaults -- those are conservative (no blending, Python sender, no startup
 # delay) and would quietly produce a different run from the one with 256 sessions
 # behind it.
+#
+# Where runs go. crisp_gym hardcodes the run folder to
+# ~/.cache/huggingface/lerobot/deploy_runs/<ts>_<tag> (session.py:390; there is no
+# flag). To keep runs with the rest of this repo's outputs, that directory is a
+# symlink on the rig rather than a code change:
+#
+#     mv ~/.cache/huggingface/lerobot/deploy_runs outputs/eval_real/runs
+#     ln -s "$(pwd)/outputs/eval_real/runs" ~/.cache/huggingface/lerobot/deploy_runs
+#
+# report.py and chunk_trace.py open the cache path and follow the link. The
+# alternative -- owning `phase_video_and_delay` and rooting it at `out:` -- is ~40
+# lines and is the right move if the rig ever gets a second user.
 
 policy_path: ""             # supply with --policy_path
 env_config: ur10e_ridgeback_dual_cam_deploy_env_rotvec_nogrip
@@ -64,7 +76,7 @@ loop:
                             # is available and did not beat it on the replay.
 
 gains:
-  scale_kp: true            # Scale controller stiffness with the speed the method
+  scale_kp: false            # Scale controller stiffness with the speed the method
                             # actually commands: kp = kp_base * s_eff**kp_exp, pushed
                             # at each integer-cycle segment boundary and restored in
                             # teardown.
@@ -101,6 +113,18 @@ gains:
                             # (d = 2*sqrt(k)), so damping follows the new stiffness on
                             # its own and the scaler deliberately never pushes a d for
                             # an auto axis.
+  kp_pos: 500              # Absolute translation stiffness (N/m) for this run,
+                            # written to the controller at bring-up BEFORE the scaler
+                            # reads its base, and put back at teardown -- the same
+                            # SetParameters write reset_crisp_kp.py does, from here
+                            # instead of the bringup YAML. null leaves the controller
+                            # at whatever it has (400 from crisp_controllers.yaml).
+                            # e.g. 500 -> 500 N/m; with scale_kp on the run peaks at
+                            # 500 * max_speed**kp_exp. Override per run with
+                            # --gains.kp_pos 500.
+  kp_rot: null              # Rotation (Nm/rad). null follows kp_pos at the YAML's own
+                            # 100/400 ratio: kp_pos 500 -> 125. kd is never written;
+                            # it is auto (2*sqrt(k)) on this rig and follows kp.
 
 gripper:
   hold_s: 0.7               # Splice mode. After the SENT gripper command closes, every

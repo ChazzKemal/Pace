@@ -9,7 +9,13 @@ well-formed and empty rather than an error. These run on a laptop, the same barg
 import numpy as np
 import pytest
 
-from pace_bench.real.record import command_table, pose_table
+from pace_bench.real.record import (
+    KP_POS_KEYS,
+    KP_ROT_KEYS,
+    command_table,
+    kp_targets,
+    pose_table,
+)
 
 
 def replay_row(frame_index=0, action=(0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 1.0), s_eff=1.5):
@@ -80,3 +86,26 @@ class TestPoseTable:
     def test_the_achieved_pose_has_no_gripper_column(self):
         fields, _ = pose_table([(0.0, 0.0, np.zeros(6, dtype=np.float32))])
         assert "ach_grip" not in fields
+
+
+class TestKpTargets:
+    """What a deploy-time kp selection writes: six stiffnesses, never a damping."""
+
+    def test_rotation_follows_translation_at_the_yaml_ratio(self):
+        t = dict(kp_targets(500.0))
+        assert [t[k] for k in KP_POS_KEYS] == [500.0] * 3
+        assert [t[k] for k in KP_ROT_KEYS] == pytest.approx([125.0] * 3)
+        assert len(t) == 6 and not any(".d_" in k for k in t)
+
+    def test_explicit_rotation_wins(self):
+        t = dict(kp_targets(500.0, 80.0))
+        assert [t[k] for k in KP_ROT_KEYS] == [80.0] * 3
+
+    def test_unset_writes_nothing(self):
+        assert kp_targets(None) == []
+
+    def test_nonpositive_is_refused(self):
+        with pytest.raises(ValueError):
+            kp_targets(0.0)
+        with pytest.raises(ValueError):
+            kp_targets(500.0, -1.0)

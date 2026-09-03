@@ -58,6 +58,8 @@ from pace_bench.real.record import (
     ChunkClock,
     PoseSampler,
     read_cartesian_gains,
+    restore_cartesian_kp,
+    set_cartesian_kp,
     write_commands,
     write_inference,
     write_manifest,
@@ -132,6 +134,16 @@ class GainsConfig:
     scale_kp: bool = False
     kp_exp: float = 2.0
     kd_exp: float = 1.0
+    #: Absolute translation stiffness (N/m) for this run, written to the controller
+    #: at bring-up BEFORE the scaler reads its base and put back at teardown -- the
+    #: SetParameters write `reset_crisp_kp.py` does, driven from here instead of the
+    #: bringup YAML. None leaves the controller at whatever it has (400 from
+    #: crisp_controllers.yaml). With scale_kp on, the run peaks at
+    #: kp_pos * max_speed**kp_exp.
+    kp_pos: float | None = None
+    #: Rotation (Nm/rad). None follows kp_pos at the YAML's own 100/400 ratio, so
+    #: kp_pos 500 -> 125. kd is never written: it is auto (2*sqrt(k)) on this rig.
+    kp_rot: float | None = None
 
 
 @dataclass
@@ -541,7 +553,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
     n_obs, n_act = src.n_obs, src.n_act
 
     scaler = sender = rec = None
-    sampler = clock = None
+    sampler = clock = kp_before = None
     video_recorders: list = []
     splices: list = []
     started_mono = time.monotonic()
@@ -550,6 +562,11 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         session.phase_home(env, args)
         logger.info("phase_home took %.1f s", time.monotonic() - _t)
         session.phase_switch_controller(env, args)
+        # This run's stiffness, before the scaler reads its base: with kp_pos set,
+        # scale_kp scales from the requested value, not from what the controller was
+        # left at. Raises if the write does not land -- see set_cartesian_kp.
+        kp_before = set_cartesian_kp(args.controller_node, cfg.gains.kp_pos,
+                                     cfg.gains.kp_rot)
         scaler = session.phase_scaler(env, args)
         # Read once, after the controller is live and before anything moves. This is
         # the coefficient that turns the tracking error recorded below into a force:
@@ -582,7 +599,7 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         started_at, out_dir, video_recorders = session.phase_video_and_delay(
             env, args, n_obs, n_act)
         write_manifest(out_dir, cfg=cfg, method=method, deployed_path=pretrained,
-                       gains=gains)
+                       gains=gains, gains_before=kp_before)
         dump_run_config(cfg, out_dir)
 
         rec = RunRecord(out_dir=out_dir, run_started_at=started_at, duration_s=0.0,
@@ -626,6 +643,10 @@ def run_on_robot(cfg: RealEvalConfig, steps: list, args, method=None) -> None:
         # Gains go back the moment the arm has stopped -- before the artifact
         # writes, which can take seconds, and long before rclpy.shutdown().
         restore_gains(scaler)
+        # ...and then past our own selection, to what the controller had before the
+        # run, so the next one does not inherit it. Order matters: the scaler restores
+        # to ITS base, which is our value.
+        restore_cartesian_kp(args.controller_node, kp_before)
         # Stop the video recorders once the arm has stopped, not before -- the drain
         # above is still real motion. `stop()` sends SIGINT, which is what makes the
         # mp4 valid: rclcpp shutdown -> node destructor -> cv::VideoWriter release ->

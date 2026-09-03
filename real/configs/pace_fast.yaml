@@ -4,10 +4,10 @@ _include: deploy_defaults.yaml
 
 method:
   type: pace
-  max_speed: 1.5            # also sizes the gain scaler when gains.scale_kp is on
-  min_speed: 1.5
+  max_speed: 3.5            # also sizes the gain scaler when gains.scale_kp is on
+  min_speed: 1.0
   clamp_deg: 5.0
-  n_lookahead: 2
+  n_lookahead: 5
   action_stride: 2          # execute every 2nd predicted action...
   gripper_stride_exempt: true
                             # ...except where the gripper is moving, which is never

@@ -138,6 +138,116 @@ def read_cartesian_gains(env, controller_node: str, *, scaler=None,
                 logger.exception("gains readback: helper node teardown")
 
 
+#: The controller YAML's rotation-to-translation stiffness ratio: k_rot 100 over
+#: k_pos 400 in tum09_bringup/config/crisp_controllers.yaml. A kp selection that
+#: names only the translation keeps this shape, so the arm is tuned the way the rig
+#: already is, just stiffer.
+KP_ROT_RATIO = 0.25
+KP_POS_KEYS = ("task.k_pos_x", "task.k_pos_y", "task.k_pos_z")
+KP_ROT_KEYS = ("task.k_rot_x", "task.k_rot_y", "task.k_rot_z")
+
+
+def kp_targets(kp_pos: float | None, kp_rot: float | None = None,
+               ) -> list[tuple[str, float]]:
+    """The six stiffness parameters a deploy-time kp selection writes.
+
+    Damping is deliberately absent. ``d_*`` is auto on this rig (``-1`` in the YAML,
+    read back as ``0.0``), the controller derives ``2*sqrt(k)`` per axis from
+    whatever kp is in force, and an explicit kd was tried on 2026-09-02 and
+    reverted. Writing kp alone keeps the controller critically damped at the new
+    stiffness without this process having to know its inertia model.
+    """
+    if kp_pos is None:
+        return []
+    if kp_pos <= 0:
+        raise ValueError(f"gains.kp_pos must be positive, got {kp_pos}")
+    rot = float(kp_pos) * KP_ROT_RATIO if kp_rot is None else float(kp_rot)
+    if rot <= 0:
+        raise ValueError(f"gains.kp_rot must be positive, got {rot}")
+    return ([(k, float(kp_pos)) for k in KP_POS_KEYS]
+            + [(k, rot) for k in KP_ROT_KEYS])
+
+
+def set_cartesian_kp(controller_node: str, kp_pos: float | None,
+                     kp_rot: float | None = None, *, timeout: float = 10.0,
+                     ) -> dict[str, float] | None:
+    """Write an absolute stiffness to the live controller. Returns what was there.
+
+    The same ``SetParameters`` round-trip ``tum09_custom/reset_crisp_kp.py`` makes,
+    with the values coming from the run config instead of the bringup YAML. It runs
+    *before* ``phase_scaler``, so ``ReplayScaler`` reads these as its base and
+    ``scale_kp`` scales from the requested stiffness rather than from whatever the
+    previous run left behind -- which, before the Ctrl-C fix, was the previous run's
+    peak: the 13:10 run on 2026-09-02 started from 713 N/m believing it was 400.
+
+    Raises when the write does not land. A run asked to test 500 N/m must not proceed
+    at 400 and report otherwise; that is the one bring-up diagnostic worth failing on.
+    Returns None without touching anything when ``kp_pos`` is unset.
+    """
+    targets = kp_targets(kp_pos, kp_rot)
+    if not targets:
+        return None
+    from crisp_gym.deploy.gains import _get_params_batch, _set_params_batch
+    from rclpy.node import Node as RclpyNode
+
+    helper = RclpyNode("pace_kp_writer", namespace="")
+    try:
+        names = [n for n, _ in targets]
+        before = _get_params_batch(helper, controller_node, names, timeout)
+        if before is None:
+            raise RuntimeError(
+                f"{controller_node} did not answer get_parameters within {timeout:.0f}s; "
+                "cannot set kp for this run")
+        failures = _set_params_batch(helper, controller_node, targets, timeout)
+        if failures:
+            raise RuntimeError(f"{controller_node} refused the kp write: {failures}")
+        was = {n: float(v) for n, v in zip(names, before) if v is not None}
+        logger.info("kp set for this run: pos %.0f -> %.0f N/m, rot %.0f -> %.0f Nm/rad",
+                    was.get(KP_POS_KEYS[0], float("nan")), targets[0][1],
+                    was.get(KP_ROT_KEYS[0], float("nan")), targets[3][1])
+        return was
+    finally:
+        try:
+            helper.destroy_node()
+        except Exception:
+            logger.exception("kp writer: helper node teardown")
+
+
+def restore_cartesian_kp(controller_node: str, before: dict[str, float] | None,
+                         *, timeout: float = 10.0) -> None:
+    """Put the pre-run stiffness back. Teardown: never raises, but is loud.
+
+    Runs after ``ReplayScaler.restore`` (which returns the controller to *our* base),
+    so the next run starts from the YAML values, not from this run's selection.
+    """
+    if not before:
+        return
+    try:
+        import rclpy
+        from crisp_gym.deploy.gains import _set_params_batch
+        from rclpy.node import Node as RclpyNode
+
+        if not rclpy.ok():
+            logger.error("rclpy context is down; kp CANNOT be restored from here. "
+                         "Run `ros2 run tum09_custom reset_crisp_kp.py` before the next run.")
+            return
+        helper = RclpyNode("pace_kp_restorer", namespace="")
+        try:
+            failures = _set_params_batch(helper, controller_node, list(before.items()),
+                                         timeout)
+        finally:
+            helper.destroy_node()
+        if failures:
+            logger.error("kp restore refused: %s -- run `ros2 run tum09_custom "
+                         "reset_crisp_kp.py`", failures)
+        else:
+            logger.info("kp restored to pre-run values: pos %.0f, rot %.0f",
+                        before.get(KP_POS_KEYS[0], float("nan")),
+                        before.get(KP_ROT_KEYS[0], float("nan")))
+    except Exception:
+        logger.exception("kp restore failed; run `ros2 run tum09_custom reset_crisp_kp.py`")
+
+
 class PoseSampler:
     """Where the arm actually is, on a uniform clock of its own.
 
@@ -460,7 +570,8 @@ def _dependency_provenance(module_path: Path, own_root: Path) -> dict:
 
 
 def write_manifest(out_dir: Path, *, cfg, method, deployed_path: str,
-                   gains: dict | None = None) -> Path | None:
+                   gains: dict | None = None,
+                   gains_before: dict | None = None) -> Path | None:
     """Write ``manifest.json``: which checkpoint this run actually executed.
 
     The gap this closes is the one that makes 661 existing run folders hard to trust.
@@ -500,7 +611,14 @@ def write_manifest(out_dir: Path, *, cfg, method, deployed_path: str,
                         "bspline_low_v": cfg.gripper.bspline_low_v,
                         "hold_s": getattr(cfg.gripper, "hold_s", None)},
             "gains": {"scale_kp": cfg.gains.scale_kp, "kp_exp": cfg.gains.kp_exp,
-                      "kd_exp": cfg.gains.kd_exp},
+                      "kd_exp": cfg.gains.kd_exp,
+                      "kp_pos": getattr(cfg.gains, "kp_pos", None),
+                      "kp_rot": getattr(cfg.gains, "kp_rot", None)},
+            # What the controller had before this run wrote its kp selection (None
+            # when it wrote nothing), and what it was at once the selection and the
+            # scaler had both read/applied. With kp_pos set, the second is the base
+            # the scaler scales from.
+            "controller_gains_before_run": gains_before,
             "controller_gains_at_startup": gains,
             "git": {
                 "pace": _git_sha(pace_root),
