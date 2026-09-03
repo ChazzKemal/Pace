@@ -403,6 +403,12 @@ class BSplineMethod(MethodConfig):
     #: Fit tolerance, in the dataset's own action units, applied per element -- so a
     #: gripper edge constrains the knot search as hard as a position does.
     max_error: float = 0.01
+    #: Frames (odd) of zero-phase Hann smoothing applied to a 0/1 gripper command before
+    #: the fit, so the knot search meets a ramp instead of a step. The 0.5 crossing
+    #: stays on the recorded edge frame, so a thresholding environment executes the
+    #: same command; only the fit's knots and control points change. 0 leaves the
+    #: command as recorded. See `bspline.spline.ramp_gripper`.
+    gripper_ramp: int = 0
     #: Which columns of this dataset's action can be splined. See `bspline.layout`.
     layout: str = "cart7"
     #: How the parameter matrix's columns sit in the tensor the policy sees.
@@ -572,13 +578,15 @@ class BSplineMethod(MethodConfig):
         }
         started = time.perf_counter()
         splines = EpisodeSplines(
-            episode_actions, layout, self.chunk_size, self.degree, self.max_error
+            episode_actions, layout, self.chunk_size, self.degree, self.max_error,
+            gripper_ramp=self.gripper_ramp,
         )
         logging.info(
             "B-spline: fitted %d episodes in %.1f s, holding %.2f MB of splines "
-            "(layout %r, %d-dim action -> %d spline dims, matrix %dx%d)",
+            "(layout %r, %d-dim action -> %d spline dims, matrix %dx%d, gripper ramp %s)",
             len(episode_actions), time.perf_counter() - started, splines.nbytes() / 1e6,
             layout.name, raw_dim, layout.spline_dim, self.width, splines.channels,
+            f"{self.gripper_ramp} frames" if self.gripper_ramp else "off",
         )
         self._splines, self._episode_starts = splines, starts
         self._layout, self._arrangement = layout, arrangement

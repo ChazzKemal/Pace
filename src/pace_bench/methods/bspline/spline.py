@@ -74,6 +74,35 @@ def from_spline_actions(actions: np.ndarray) -> np.ndarray:
     return np.concatenate([actions[:, :3], rotvec, actions[:, 9:10]], axis=1)
 
 
+def ramp_gripper(command: np.ndarray, width: int) -> np.ndarray:
+    """Turn a 0/1 gripper command into a ramp the spline can follow, edges left in place.
+
+    A binary command is the one signal a cubic cannot reproduce: to bring a step within
+    ``max_error`` the knot search pins knots one frame apart on both sides of every edge
+    (LIBERO-10 episode 0: 26 of 65 interior knots within five frames of its three
+    edges) and the least-squares curve still overshoots to ~1.1 on either side -- which
+    is what put 8.8% of the gripper control points outside [0, 1]. Upstream never met
+    this: its teleop records a continuous setpoint that a human finger ramped.
+
+    The ramp is a zero-phase Hann smoothing over ``width`` frames (odd), so the 0.5
+    crossing stays on the original edge frame in both directions and an environment
+    that thresholds at 0.5 executes exactly the recorded command. Only the shoulders
+    change. ``width=9`` at 20 Hz halves the near-edge knots and removes the overshoot;
+    past ~13 the reduction comes from blurring timing rather than from removing the
+    step. 0 disables it.
+    """
+    command = np.asarray(command, dtype=np.float64)
+    if width <= 0:
+        return command.copy()
+    if width % 2 == 0:
+        raise ValueError(f"gripper ramp width must be odd so the crossing stays put, got {width}")
+    taps = np.hanning(width + 2)[1:-1]
+    taps /= taps.sum()
+    half = width // 2
+    padded = np.concatenate([np.full(half, command[0]), command, np.full(half, command[-1])])
+    return np.convolve(padded, taps, mode="valid")
+
+
 def fit_episode(
     actions: np.ndarray,
     max_error: float = MAX_ERROR,

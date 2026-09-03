@@ -42,6 +42,7 @@ from pace_bench.methods.bspline.spline import (
     decode_chunk,
     encode_relative_knots,
     fit_episode,
+    ramp_gripper,
 )
 
 ACTION_IS_PAD = f"{ACTION}_is_pad"
@@ -65,8 +66,10 @@ class EpisodeSplines:
         chunk_size: int,
         degree: int = DEGREE,
         max_error: float = MAX_ERROR,
+        gripper_ramp: int = 0,
     ):
         self.chunk_size = chunk_size
+        self.gripper_ramp = int(gripper_ramp)
         self.degree = degree
         self.width = chunk_size + 2 * degree
         self.channels = 1 + layout.spline_dim
@@ -75,9 +78,15 @@ class EpisodeSplines:
 
         missed = []
         for episode, actions in sorted(episode_actions.items()):
-            spline, converged = fit_episode(
-                layout.to_spline(actions), max_error=max_error, degree=degree
-            )
+            to_fit = layout.to_spline(actions)
+            if self.gripper_ramp > 0:
+                # The gripper is the last spline column in every layout here (see
+                # `BSplineDecodeStep.compare_dim`). Ramped before the fit, so the knot
+                # search never sees a step; decoded floats threshold back to the same
+                # command frames, so nothing downstream changes.
+                to_fit = to_fit.copy()
+                to_fit[:, -1] = ramp_gripper(to_fit[:, -1], self.gripper_ramp)
+            spline, converged = fit_episode(to_fit, max_error=max_error, degree=degree)
             if not converged:
                 missed.append(episode)
             chunks = chunk_parameters(spline, chunk_size, degree=degree, stride=1)

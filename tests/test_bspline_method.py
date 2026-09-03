@@ -15,7 +15,7 @@ from lerobot.utils.constants import ACTION
 
 from pace_bench.methods.bspline.layout import LAYOUTS, resolve_layout
 from pace_bench.methods.bspline.processor import ACTION_IS_PAD, BSplineChunkStep, EpisodeSplines
-from pace_bench.methods.bspline.spline import DEGREE, decode_relative_knots
+from pace_bench.methods.bspline.spline import DEGREE, decode_relative_knots, ramp_gripper
 from pace_bench.methods.config import BSplineMethod, NoMethod
 
 CHUNK = 10
@@ -1112,3 +1112,52 @@ class TestFixedRateDecodeStep:
             BSplineMethod(rate=0.0)
         with pytest.raises(ValueError, match="rate must be"):
             BSplineDecodeStep(rate=-1.0)
+
+
+class TestGripperRamp:
+    """A 0/1 command becomes a ramp the fit can follow; what the env executes is unchanged."""
+
+    @staticmethod
+    def command(length=200, edges=(60, 130)):
+        g = np.zeros(length)
+        state = 0.0
+        for f in range(length):
+            if f in edges:
+                state = 1.0 - state
+            g[f] = state
+        return g
+
+    def test_the_crossings_stay_on_the_recorded_edge_frames(self):
+        g = self.command()
+        for width in (5, 9, 13):
+            r = ramp_gripper(g, width)
+            assert r.min() >= 0.0 and r.max() <= 1.0
+            # Same first frame above 0.5 and same first frame at or below it, every edge.
+            np.testing.assert_array_equal(r > 0.5, g > 0.5)
+
+    def test_zero_is_off_and_even_widths_are_refused(self):
+        g = self.command()
+        np.testing.assert_array_equal(ramp_gripper(g, 0), g)
+        with pytest.raises(ValueError):
+            ramp_gripper(g, 8)
+
+    def test_the_fit_stops_overshooting_and_spends_fewer_knots(self):
+        """The two things the ramp is for, measured on the fit itself."""
+        length = 200
+        actions = path(length=length, seed=3)
+        actions[:, -1] = self.command(length)
+        identity = LAYOUTS["identity"].__class__("identity", 10, lambda a: a, lambda a: a, 10)
+        step = EpisodeSplines({0: actions}, identity, CHUNK)
+        ramped = EpisodeSplines({0: actions}, identity, CHUNK, gripper_ramp=9)
+
+        def knots_and_extremes(splines):
+            chunks = splines.chunks[0]
+            knots = np.unique(np.concatenate([chunks[0, :, 0], chunks[1:, -1, 0]]))
+            gripper = chunks[:, : -(DEGREE + 1), -1]
+            return len(knots), gripper.min(), gripper.max()
+
+        n_step, lo_step, hi_step = knots_and_extremes(step)
+        n_ramp, lo_ramp, hi_ramp = knots_and_extremes(ramped)
+        assert hi_step > 1.02 or lo_step < -0.02, "the step fit should overshoot -- the premise"
+        assert -0.05 <= lo_ramp and hi_ramp <= 1.05, (lo_ramp, hi_ramp)  # step fit: [-0.36, 1.36]
+        assert n_ramp < n_step
