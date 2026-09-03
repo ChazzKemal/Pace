@@ -12,6 +12,9 @@
 #   D  method=bspline      as C                     + pos_emb rows 0-15 trained and the
 #                                                   visual rows put back where the
 #                                                   pretrained table had them
+#   E  method=bspline      as C                     lr 1e-4, LoRA r 16, 40k steps: the
+#                                                   head's capacity and budget, not a
+#                                                   comparison member
 #
 # PACE needs no arm: it runs at eval time on arm A's weights.
 #
@@ -61,14 +64,17 @@ DATASET=(--dataset.repo_id=local/libero_10_ee6d
          --dataset.video_backend=pyav)
 # LoRA on all linear layers; the action heads are DomainAwareLinear (nn.Embedding),
 # which LoRA cannot target, so they are fully trained instead.
-PEFT=(--peft.method_type=LORA --peft.r=8 --peft.lora_alpha=8 --peft.target_modules=all-linear
+# Rank, alpha, learning rate and budget are per arm, defaulting to what arms A-D ran
+# with: alpha/rank = 1.0 and lr 1e-5, held low because flow matching compounds adapter
+# error over 10 denoising steps. An arm that needs more sets ARM_PEFT_R, ARM_PEFT_ALPHA,
+# ARM_LR or ARM_STEPS on its `run` line; `launch` and the skip guard both read them, so
+# a 40k arm is judged done at 40k and a 20k arm at 20k.
+PEFT_TARGETS=(--peft.method_type=LORA --peft.target_modules=all-linear
       --peft.full_training_modules='["transformer.soft_prompt_hub","transformer.action_encoder","transformer.action_decoder"]')
-# alpha/rank = 1.0 and lr 1e-5: flow matching compounds adapter error over 10
-# denoising steps, so both are held low.
 STEPS=20000
 COMMON=("--policy.path=$POLICY_PATH"
-        --policy.device=cuda --policy.push_to_hub=false --policy.optimizer_lr=1e-5
-        --batch_size=8 --steps=$STEPS --save_freq=5000 --log_freq=100
+        --policy.device=cuda --policy.push_to_hub=false
+        --batch_size=8 --save_freq=5000 --log_freq=100
         --num_workers=4 --seed=42
         --wandb.enable=true --wandb.project="${WANDB_PROJECT:-pace_benchmark_libero10}")
 
@@ -94,7 +100,7 @@ arm_state () {  # -> done | resume | fresh, on stdout
     local last="outputs/train/$1/checkpoints/last" step
     if [ -d "$last" ]; then
         step=$(basename "$(readlink -f "$last")")
-        if [ "$((10#$step))" -ge "$STEPS" ]; then echo done; return; fi
+        if [ "$((10#$step))" -ge "${ARM_STEPS:-$STEPS}" ]; then echo done; return; fi
         if [ -f "$last/training_state/training_step.json" ]; then echo resume; return; fi
     fi
     echo fresh
@@ -128,7 +134,9 @@ launch () {  # launch <name> <job> <state> <extra args...>
         # (project pace_benchmark_<task>). It is kept separate from the output dir so
         # renaming runs never orphans an existing checkpoint.
         "$PY" -m pace_bench.train.run_train \
-            "${DATASET[@]}" "${PEFT[@]}" "${COMMON[@]}" "$@" \
+            "${DATASET[@]}" "${PEFT_TARGETS[@]}" "${COMMON[@]}" \
+            --peft.r="${ARM_PEFT_R:-8}" --peft.lora_alpha="${ARM_PEFT_ALPHA:-8}" \
+            --policy.optimizer_lr="${ARM_LR:-1e-5}" --steps="${ARM_STEPS:-$STEPS}" "$@" \
             --output_dir="outputs/train/${name}" --job_name="${job}" \
             2>&1 | tee -a "logs/${name}.log" || true
     fi
@@ -152,11 +160,11 @@ run () {  # run <dir> <wandb run name> <extra args...>
         fi
         attempt=$((attempt + 1))
         if [ "$attempt" -gt "$MAX_ATTEMPTS" ]; then
-            echo "FAILED: ${name} stuck at $(step_of "$name")/$STEPS after $MAX_ATTEMPTS attempts"; exit 1
+            echo "FAILED: ${name} stuck at $(step_of "$name")/${ARM_STEPS:-$STEPS} after $MAX_ATTEMPTS attempts"; exit 1
         fi
         before=$(step_of "$name")
         case "$state" in
-            resume) echo "=== [attempt $attempt/$MAX_ATTEMPTS] ${name} at $before/$STEPS -- resuming ===" ;;
+            resume) echo "=== [attempt $attempt/$MAX_ATTEMPTS] ${name} at $before/${ARM_STEPS:-$STEPS} -- resuming ===" ;;
             fresh)  echo "=== [attempt $attempt/$MAX_ATTEMPTS] training ${name} from scratch ==="; rm -rf "outputs/train/${name}" ;;
         esac
         launch "$name" "$job" "$state" "$@"
@@ -264,4 +272,31 @@ run ds_libero10_bspline_v2_posemb xvla_bspline_v2_posemb \
     --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01 \
     --method.unfreeze_pos_emb_rows=16 --method.realign_pos_emb=true
 
-echo "=== all four trainings done ==="
+# ---------------------------------------------------------------------------
+# E: arm C given the capacity and the budget its head turned out to need.
+# Arms C and D both finished at a position term of ~0.65 (500 x MSE), which is 3.6 cm
+# per coordinate on the control points against the dense baseline's 0.84 cm on the
+# same training frames; the gripper coefficient and the knot were off by similar
+# factors, and the decoded curves missed the demonstrations by 4.7 cm on average.
+# D's trainable positional rows changed none of it -- its loss tracked C's to within
+# a percent at every checkpoint -- so the lever left is optimisation, not indexing.
+# What the checkpoint's own head had, and this arm gives back:
+#
+#   ARM_LR=1e-4          the checkpoint's own optimizer_lr (1e-5 was a tenth of it,
+#                        and the head moved 2.1 units where it had to relearn two
+#                        channel meanings, against the baseline's 0.43 to fine-tune)
+#   ARM_PEFT_R=16        double the adapter rank; alpha follows, so alpha/rank stays 1
+#   ARM_STEPS=40000      double the budget, and the cosine stretched to span it --
+#                        the checkpoint's 30k decay would otherwise flatline at
+#                        2.5e-6 for the last quarter of the run
+#
+# Everything else is C: knot in slot 10, ee6d_bspline loss, frozen pretrained pos_emb.
+# NOT a member of the equal-budget comparison; it asks whether the representation can
+# be learned by this trunk at all before anything is concluded from arm C's 0%.
+ARM_LR=1e-4 ARM_PEFT_R=16 ARM_PEFT_ALPHA=16 ARM_STEPS=40000 \
+run ds_libero10_bspline_v3 xvla_bspline_v3 \
+    --policy.action_mode=ee6d_bspline --policy.scheduler_decay_steps=40000 \
+    --method.type=bspline --method.layout=ee6d20 --method.arrangement=xvla_ee6d20 \
+    --method.fps=20 --method.chunk_size=10 --method.degree=3 --method.max_error=0.01
+
+echo "=== all five trainings done ==="

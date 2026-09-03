@@ -79,6 +79,8 @@ POSEMB=outputs/train/ds_libero10_bspline_uniform_posemb/checkpoints/last/pretrai
 # Arm D of the training queue: v2 with pos_emb rows 0-15 trained and the visual rows
 # realigned. Same decode flags as v2 -- only the weights differ.
 BSPLINE_V2_POSEMB=outputs/train/ds_libero10_bspline_v2_posemb/checkpoints/last/pretrained_model
+# Arm E: v2 at lr 1e-4, LoRA r 16, 40k steps. Same decode flags as v2.
+BSPLINE_V3=outputs/train/ds_libero10_bspline_v3/checkpoints/last/pretrained_model
 
 run_arm() {
     local arm=$1
@@ -134,6 +136,21 @@ run_arm() {
                          --method.degree=3 --method.max_error=0.01 --method.fps=20
                          --method.rate=1.0) ;;
       bspline_v2_posemb_1.9x) args=(--policy_path="$BSPLINE_V2_POSEMB" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.rate=1.9) ;;
+      bspline_v3)      args=(--policy_path="$BSPLINE_V3" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.num_actions=16) ;;
+      bspline_v3_1x)   args=(--policy_path="$BSPLINE_V3" --n_action_steps=16
+                         --method.type=bspline --method.layout=ee6d20
+                         --method.arrangement=xvla_ee6d20 --method.chunk_size=10
+                         --method.degree=3 --method.max_error=0.01 --method.fps=20
+                         --method.rate=1.0) ;;
+      bspline_v3_1.9x) args=(--policy_path="$BSPLINE_V3" --n_action_steps=16
                          --method.type=bspline --method.layout=ee6d20
                          --method.arrangement=xvla_ee6d20 --method.chunk_size=10
                          --method.degree=3 --method.max_error=0.01 --method.fps=20
